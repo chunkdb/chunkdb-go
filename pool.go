@@ -342,6 +342,16 @@ func (p *Pool) SetChunkState(ctx context.Context, cx, cy int64, state ChunkState
 	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunkState(ctx, cx, cy, state) })
 }
 
+// SetChunkBin runs [Client.SetChunkBin] on a leased client.
+func (p *Pool) SetChunkBin(ctx context.Context, cx, cy int64, payload []byte) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunkBin(ctx, cx, cy, payload) })
+}
+
+// SetChunkBinState runs [Client.SetChunkBinState] on a leased client.
+func (p *Pool) SetChunkBinState(ctx context.Context, cx, cy int64, state []byte) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunkBinState(ctx, cx, cy, state) })
+}
+
 // ChunkBin runs [Client.ChunkBin] on a leased client.
 func (p *Pool) ChunkBin(ctx context.Context, cx, cy int64) ([]byte, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) { return c.ChunkBin(ctx, cx, cy) })

@@ -371,6 +371,56 @@ func (c *Client) SetChunkState(ctx context.Context, cx, cy int64, state ChunkSta
 	return expectOK(frame, "CHUNKSET")
 }
 
+// SetChunkBin replaces the full chunk payload from raw packed bytes, the
+// layout [Client.ChunkBin] returns, and marks every block present. The server
+// must support CHUNKSETBIN (chunkdb 1.3+).
+func (c *Client) SetChunkBin(ctx context.Context, cx, cy int64, payload []byte) error {
+	release, err := c.acquireSlot(ctx, "CHUNKSETBIN")
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	geo, err := c.chunkGeometry(ctx)
+	if err != nil {
+		return err
+	}
+	if len(payload) != geo.chunkPayloadBytes {
+		return requestErrorf("CHUNKSETBIN", "CHUNKSETBIN payload must be %d bytes", geo.chunkPayloadBytes)
+	}
+	frame, err := c.execPayload(ctx, payload, "CHUNKSETBIN", coord(cx), coord(cy), strconv.Itoa(len(payload)))
+	if err != nil {
+		return err
+	}
+	return expectOK(frame, "CHUNKSETBIN")
+}
+
+// SetChunkBinState replaces the full chunk payload and presence bitmap from
+// raw bytes laid out as [payload bytes][presence bytes], the layout
+// [Client.ChunkBinState] returns. The server must support CHUNKSETBIN
+// (chunkdb 1.3+).
+func (c *Client) SetChunkBinState(ctx context.Context, cx, cy int64, state []byte) error {
+	release, err := c.acquireSlot(ctx, "CHUNKSETBIN")
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	geo, err := c.chunkGeometry(ctx)
+	if err != nil {
+		return err
+	}
+	expected := geo.chunkPayloadBytes + geo.presenceBytes
+	if len(state) != expected {
+		return requestErrorf("CHUNKSETBIN", "CHUNKSETBIN STATE payload must be %d bytes", expected)
+	}
+	frame, err := c.execPayload(ctx, state, "CHUNKSETBIN", coord(cx), coord(cy), "STATE", strconv.Itoa(len(state)))
+	if err != nil {
+		return err
+	}
+	return expectOK(frame, "CHUNKSETBIN")
+}
+
 // ChunkBin reads the full chunk payload as raw packed bytes.
 func (c *Client) ChunkBin(ctx context.Context, cx, cy int64) ([]byte, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKBIN")

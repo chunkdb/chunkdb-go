@@ -542,6 +542,55 @@ func TestIntegrationChunkOperations(t *testing.T) {
 		}
 	})
 
+	t.Run("binary write round-trips the transfer layouts", func(t *testing.T) {
+		payload := make([]byte, payloadBytes)
+		for i := range payload {
+			payload[i] = byte(i*37 + 11)
+		}
+		if err := client.SetChunkBin(ctx, 9, 5, payload); err != nil {
+			t.Fatalf("SetChunkBin: %v", err)
+		}
+		back, err := client.ChunkBin(ctx, 9, 5)
+		if err != nil {
+			t.Fatalf("ChunkBin: %v", err)
+		}
+		if string(back) != string(payload) {
+			t.Fatalf("ChunkBin after SetChunkBin = %x, want %x", back, payload)
+		}
+
+		state, err := client.ChunkBinState(ctx, 9, 5)
+		if err != nil {
+			t.Fatalf("ChunkBinState: %v", err)
+		}
+		if err := client.SetChunkBinState(ctx, 10, 5, state); err != nil {
+			t.Fatalf("SetChunkBinState: %v", err)
+		}
+		copied, err := client.ChunkBinState(ctx, 10, 5)
+		if err != nil {
+			t.Fatalf("ChunkBinState copy: %v", err)
+		}
+		if string(copied) != string(state) {
+			t.Fatal("SetChunkBinState did not reproduce the source state")
+		}
+
+		// An all-zero presence bitmap leaves the chunk absent.
+		absent := append(append([]byte{}, payload...), make([]byte, presenceBytes)...)
+		if err := client.SetChunkBinState(ctx, 11, 5, absent); err != nil {
+			t.Fatalf("SetChunkBinState absent: %v", err)
+		}
+		exists, err := client.ChunkExists(ctx, 11, 5)
+		if err != nil {
+			t.Fatalf("ChunkExists: %v", err)
+		}
+		if exists {
+			t.Fatal("chunk with an empty presence bitmap should be absent")
+		}
+
+		if err := client.SetChunkBin(ctx, 12, 5, payload[:1]); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("short payload: got %v, want ErrProtocol", err)
+		}
+	})
+
 	t.Run("compressed transfer matches uncompressed", func(t *testing.T) {
 		// A mostly-zero chunk exercises the codec's zero runs.
 		bits := []byte(strings.Repeat("0", geo.payloadBits))

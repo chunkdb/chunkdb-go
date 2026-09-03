@@ -3,7 +3,9 @@ package chunkdb
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -85,6 +87,17 @@ func (s *fakeServer) serve(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	for {
 		line, err := reader.ReadString('\n')
+		if err == nil && strings.HasPrefix(strings.ToUpper(line), "CHUNKSETBIN ") {
+			// The payload and its empty-line terminator follow the header;
+			// drain them so the next iteration sees the next request line.
+			fields := strings.Fields(line)
+			if n, convErr := strconv.Atoi(fields[len(fields)-1]); convErr == nil && n >= 0 {
+				buf := make([]byte, n+2)
+				if _, readErr := io.ReadFull(reader, buf); readErr != nil {
+					return
+				}
+			}
+		}
 		if err != nil {
 			return
 		}

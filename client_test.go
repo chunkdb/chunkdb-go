@@ -38,7 +38,7 @@ func genericHandler(_ *fakeServer, conn net.Conn, command string) {
 	switch verbOf(command) {
 	case "PING":
 		writeSimple(conn, "PONG")
-	case "SET", "UNSET", "MSET", "CHUNKSET", "WALFLUSH":
+	case "SET", "UNSET", "MSET", "CHUNKSET", "CHUNKSETBIN", "WALFLUSH":
 		writeSimple(conn, "OK")
 	case "EXISTS", "CHUNKEXISTS":
 		writeSimple(conn, "0")
@@ -263,6 +263,16 @@ func TestClientCommandEncoding(t *testing.T) {
 			name: "chunkbin state",
 			call: func() error { _, err := client.ChunkBinState(ctx, 1, 2); return err },
 			want: "CHUNKBIN 1 2 STATE",
+		},
+		{
+			name: "chunk set bin",
+			call: func() error { return client.SetChunkBin(ctx, 1, 2, []byte{0xAB, 0xCD}) },
+			want: "CHUNKSETBIN 1 2 2",
+		},
+		{
+			name: "chunk set bin state",
+			call: func() error { return client.SetChunkBinState(ctx, 1, 2, []byte{0xAB, 0xCD, 0x0F}) },
+			want: "CHUNKSETBIN 1 2 STATE 3",
 		},
 		{
 			name: "chunkbinc",

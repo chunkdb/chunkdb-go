@@ -386,9 +386,31 @@ func (c *Client) exec(ctx context.Context, command string, args ...string) (Fram
 }
 
 func (c *Client) execOn(ctx context.Context, established *conn, command string, args ...string) (Frame, error) {
+	return c.execPayloadOn(ctx, established, nil, command, args...)
+}
+
+// execPayload is exec for commands that carry raw bytes after the request
+// line (CHUNKSETBIN): the payload is written right after the line, followed by
+// an empty line, as one write so pipelined peers never see a partial request.
+func (c *Client) execPayload(ctx context.Context, payload []byte, command string, args ...string) (Frame, error) {
+	established, err := c.connection(ctx)
+	if err != nil {
+		return Frame{}, err
+	}
+	return c.execPayloadOn(ctx, established, payload, command, args...)
+}
+
+func (c *Client) execPayloadOn(ctx context.Context, established *conn, payload []byte, command string, args ...string) (Frame, error) {
 	line, err := SerializeCommand(append([]string{command}, args...)...)
 	if err != nil {
 		return Frame{}, err
+	}
+	if payload != nil {
+		wire := make([]byte, 0, len(line)+len(payload)+2)
+		wire = append(wire, line...)
+		wire = append(wire, payload...)
+		wire = append(wire, '\r', '\n')
+		line = wire
 	}
 
 	deadline := c.commandDeadline(ctx, command)

@@ -20,7 +20,7 @@ This package is intentionally small:
 - `chunk://` and `chunks://` URI support
 - `net` / `crypto/tls` transport
 - `Connect`, `ConnectURI`, `ConnectPool`, `NewClient`, `NewPool`
-- `Auth`, `Ping`, `Info`, `Get`, `ReadBlock`, `Exists`, `Set`, `Unset`, `MSet`, `MGet`, `ChunkExists`, `ReadChunk`, `SetChunk`, `SetChunkState`, `Chunk`, `ChunkBin`, `ChunkBinState`
+- `Auth`, `Ping`, `Info`, `Get`, `ReadBlock`, `Exists`, `Set`, `Unset`, `MSet`, `MGet`, `ChunkExists`, `ReadChunk`, `SetChunk`, `SetChunkState`, `SetChunkBin`, `SetChunkBinState`, `Chunk`, `ChunkBin`, `ChunkBinState`
 - batch `MSet` / `MGet` (single round-trip for many blocks) and configurable request pipelining for high-latency links
 - `context.Context` on every request, for per-call deadlines and cancellation
 - typed errors with `errors.Is` sentinels and protocol error codes
@@ -206,6 +206,9 @@ Package functions:
 - `Chunk(ctx, cx, cy)`
 - `ChunkBin(ctx, cx, cy)`
 - `ChunkBinState(ctx, cx, cy)`
+- `SetChunkBin(ctx, cx, cy, payload)` / `SetChunkBinState(ctx, cx, cy, state)` —
+  binary writes taking exactly the byte layouts `ChunkBin`/`ChunkBinState`
+  return, so large geometries round-trip without bit strings (server 1.3+)
 - `ChunkBinCompressed(ctx, cx, cy)` / `ChunkBinStateCompressed(ctx, cx, cy)` — same
   payloads as `ChunkBin`/`ChunkBinState`, transferred compressed and
   decompressed client-side
