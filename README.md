@@ -1,5 +1,7 @@
 # chunkdb-go
 
+[![CI](https://github.com/chunkdb/chunkdb-go/actions/workflows/ci.yml/badge.svg)](https://github.com/chunkdb/chunkdb-go/actions/workflows/ci.yml)
+
 Official Go client for [`chunkdb`](https://github.com/chunkdb/chunkdb).
 
 Targets the stable `chunkdb` 1.x protocol; see the engine's

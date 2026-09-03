@@ -32,7 +32,7 @@ import (
 //
 // Build one with, from the chunkdb repository:
 //
-//	cmake -S . -B build-js-tests -DCHUNKDB_ENABLE_TLS=ON && cmake --build build-js-tests
+//	cmake -S . -B build-js-tests -DCHUNKDB_WITH_TLS=ON && cmake --build build-js-tests --target chunkdb_server
 
 const testToken = "chunk-token"
 

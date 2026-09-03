@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build and Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Format check
+        run: |
+          fmt_out=$(gofmt -l .)
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # No chunkdb server binary here, so the integration tests skip
+        # themselves; the integration job below runs them against a real server.
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+  integration:
+    name: Integration (ubuntu-latest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out chunkdb-go
+        uses: actions/checkout@v5
+
+      - name: Check out chunkdb main
+        uses: actions/checkout@v5
+        with:
+          repository: chunkdb/chunkdb
+          ref: main
+          path: chunkdb
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install OpenSSL Development Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev openssl
+
+      - name: Build chunkdb server (TLS on)
+        # integration_test.go looks for $CHUNKDB_REPO_ROOT/build-js-tests/chunkdb_server.
+        run: |
+          cmake -S chunkdb -B chunkdb/build-js-tests \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCHUNKDB_BUILD_TESTS=OFF \
+            -DCHUNKDB_WITH_TLS=ON
+          cmake --build chunkdb/build-js-tests --parallel --target chunkdb_server
+
+      - name: Integration tests
+        env:
+          CHUNKDB_REPO_ROOT: ${{ github.workspace }}/chunkdb
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./... 2>&1 | tee test.log
+          # A missing binary makes the integration tests skip themselves; that
+          # must be a failure here, not a green job.
+          if grep -q "server binary not found" test.log; then
+            echo "integration tests were skipped: chunkdb server binary not found"
+            exit 1
+          fi
