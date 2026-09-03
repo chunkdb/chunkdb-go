@@ -6,7 +6,7 @@ This client follows [Semantic Versioning](https://semver.org/) and targets the
 stable `chunkdb` 1.x protocol; see the engine's
 [compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
 
-## Unreleased
+## 1.1.0 - 2026-09-03
 
 ### Added
 - `SetChunkBin(ctx, cx, cy, payload)` and `SetChunkBinState(ctx, cx, cy, state)`:
