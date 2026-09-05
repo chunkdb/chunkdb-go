@@ -1,7 +1,5 @@
 # chunkdb-go
 
-[![CI](https://github.com/chunkdb/chunkdb-go/actions/workflows/ci.yml/badge.svg)](https://github.com/chunkdb/chunkdb-go/actions/workflows/ci.yml)
-
 Official Go client for [`chunkdb`](https://github.com/chunkdb/chunkdb).
 
 Targets the stable `chunkdb` 1.x protocol; see the engine's
@@ -20,7 +18,15 @@ This package is intentionally small:
 - `chunk://` and `chunks://` URI support
 - `net` / `crypto/tls` transport
 - `Connect`, `ConnectURI`, `ConnectPool`, `NewClient`, `NewPool`
-- `Auth`, `Ping`, `Info`, `Get`, `ReadBlock`, `Exists`, `Set`, `Unset`, `MSet`, `MGet`, `ChunkExists`, `ReadChunk`, `SetChunk`, `SetChunkState`, `SetChunkBin`, `SetChunkBinState`, `Chunk`, `ChunkBin`, `ChunkBinState`
+- `Auth`, `Ping`, `Info`, `Get`, `ReadBlock`, `Exists`, `Set`, `Unset`, `MSet`, `MGet`, `ChunkExists`, `ReadChunk`, `SetChunk`, `SetChunkState`, `Chunk`, `ChunkBin`, `ChunkBinState`
+- binary chunk writes (`SetChunkBin`, `SetChunkBinState`) taking the same byte
+  layouts `ChunkBin` / `ChunkBinState` return (server 1.3+)
+- world reads: `ChunkScan`, `ChunkRange`, `ChunkRadius`
+- compressed chunk transfer (`ChunkBinCompressed`, `ChunkBinStateCompressed`),
+  decompressed and size-checked client-side
+- optimistic concurrency: `ChunkVersion`, `ChunkCompareAndSet`, and atomic
+  single-chunk `ChunkBatch` / `ChunkBatchIfVersion`
+- `WALFlush` durability barrier and `Metrics` (Prometheus text format)
 - batch `MSet` / `MGet` (single round-trip for many blocks) and configurable request pipelining for high-latency links
 - `context.Context` on every request, for per-call deadlines and cancellation
 - typed errors with `errors.Is` sentinels and protocol error codes
@@ -342,19 +348,3 @@ a chunk-state payload of the wrong length, an empty batch) fails with
 - `ChunkBinCompressed` and `ChunkBinStateCompressed` bound decompression by the
   geometry-derived expected size and reject any payload that declares or
   produces a different size
-
-## Local Development
-
-```bash
-go test ./...
-go test -race ./...
-```
-
-Integration tests run against a real server binary and are skipped when none is
-found. They look for it as:
-
-1. `$CHUNKDB_SERVER_BIN`
-2. `$CHUNKDB_REPO_ROOT/build-js-tests/chunkdb_server`
-3. `../chunkdb/build-js-tests/chunkdb_server`
-
-TLS fixtures are generated at test time, so no certificates are checked in.
