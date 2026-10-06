@@ -26,7 +26,7 @@ type PoolOptions struct {
 
 // Pool is a fixed-size set of [Client] connections leased per operation.
 //
-// It is the recommended way to run concurrent workloads: protocol v1 has no
+// It is the recommended way to run concurrent workloads: the protocol has no
 // request multiplexing, so parallelism comes from multiple sockets. A Pool is
 // safe for concurrent use.
 type Pool struct {
@@ -283,18 +283,8 @@ func (p *Pool) Info(ctx context.Context) (Info, error) {
 }
 
 // Get runs [Client.Get] on a leased client.
-func (p *Pool) Get(ctx context.Context, x, y int64) (string, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (string, error) { return c.Get(ctx, x, y) })
-}
-
-// ReadBlock runs [Client.ReadBlock] on a leased client.
-func (p *Pool) ReadBlock(ctx context.Context, x, y int64) (BlockState, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (BlockState, error) { return c.ReadBlock(ctx, x, y) })
-}
-
-// Exists runs [Client.Exists] on a leased client.
-func (p *Pool) Exists(ctx context.Context, x, y int64) (bool, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (bool, error) { return c.Exists(ctx, x, y) })
+func (p *Pool) Get(ctx context.Context, x, y int64) (BlockState, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (BlockState, error) { return c.Get(ctx, x, y) })
 }
 
 // Set runs [Client.Set] on a leased client.
@@ -313,8 +303,8 @@ func (p *Pool) MSet(ctx context.Context, blocks []Block) error {
 }
 
 // MGet runs [Client.MGet] on a leased client.
-func (p *Pool) MGet(ctx context.Context, blocks []BlockRef) ([]string, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]string, error) { return c.MGet(ctx, blocks) })
+func (p *Pool) MGet(ctx context.Context, blocks []BlockRef) ([]BlockState, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]BlockState, error) { return c.MGet(ctx, blocks) })
 }
 
 // ChunkExists runs [Client.ChunkExists] on a leased client.
@@ -322,56 +312,31 @@ func (p *Pool) ChunkExists(ctx context.Context, cx, cy int64) (bool, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (bool, error) { return c.ChunkExists(ctx, cx, cy) })
 }
 
-// ReadChunk runs [Client.ReadChunk] on a leased client.
-func (p *Pool) ReadChunk(ctx context.Context, cx, cy int64) (ChunkState, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ChunkState, error) { return c.ReadChunk(ctx, cx, cy) })
-}
-
-// Chunk runs [Client.Chunk] on a leased client.
-func (p *Pool) Chunk(ctx context.Context, cx, cy int64) (string, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (string, error) { return c.Chunk(ctx, cx, cy) })
-}
-
-// SetChunk runs [Client.SetChunk] on a leased client.
-func (p *Pool) SetChunk(ctx context.Context, cx, cy int64, bits string) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunk(ctx, cx, cy, bits) })
-}
-
-// SetChunkState runs [Client.SetChunkState] on a leased client.
-func (p *Pool) SetChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunkState(ctx, cx, cy, state) })
-}
-
-// SetChunkBin runs [Client.SetChunkBin] on a leased client.
-func (p *Pool) SetChunkBin(ctx context.Context, cx, cy int64, payload []byte) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunkBin(ctx, cx, cy, payload) })
-}
-
-// SetChunkBinState runs [Client.SetChunkBinState] on a leased client.
-func (p *Pool) SetChunkBinState(ctx context.Context, cx, cy int64, state []byte) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.SetChunkBinState(ctx, cx, cy, state) })
-}
-
-// ChunkBin runs [Client.ChunkBin] on a leased client.
-func (p *Pool) ChunkBin(ctx context.Context, cx, cy int64) ([]byte, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) { return c.ChunkBin(ctx, cx, cy) })
-}
-
-// ChunkBinState runs [Client.ChunkBinState] on a leased client.
-func (p *Pool) ChunkBinState(ctx context.Context, cx, cy int64) ([]byte, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) { return c.ChunkBinState(ctx, cx, cy) })
-}
-
-// ChunkBinCompressed runs [Client.ChunkBinCompressed] on a leased client.
-func (p *Pool) ChunkBinCompressed(ctx context.Context, cx, cy int64) ([]byte, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) { return c.ChunkBinCompressed(ctx, cx, cy) })
-}
-
-// ChunkBinStateCompressed runs [Client.ChunkBinStateCompressed] on a leased
-// client.
-func (p *Pool) ChunkBinStateCompressed(ctx context.Context, cx, cy int64) ([]byte, error) {
+// GetChunk runs [Client.GetChunk] on a leased client.
+func (p *Pool) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([]byte, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) {
-		return c.ChunkBinStateCompressed(ctx, cx, cy)
+		return c.GetChunk(ctx, cx, cy, opts)
+	})
+}
+
+// GetChunkState runs [Client.GetChunkState] on a leased client.
+func (p *Pool) GetChunkState(ctx context.Context, cx, cy int64, opts GetOptions) (ChunkState, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ChunkState, error) {
+		return c.GetChunkState(ctx, cx, cy, opts)
+	})
+}
+
+// PutChunk runs [Client.PutChunk] on a leased client.
+func (p *Pool) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opts PutOptions) (MutationResult, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
+		return c.PutChunk(ctx, cx, cy, payload, opts)
+	})
+}
+
+// PutChunkState runs [Client.PutChunkState] on a leased client.
+func (p *Pool) PutChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput, opts PutOptions) (MutationResult, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
+		return c.PutChunkState(ctx, cx, cy, state, opts)
 	})
 }
 
@@ -383,29 +348,22 @@ func (p *Pool) ChunkScan(ctx context.Context, limit int, cursor *CoordPair) (Sca
 }
 
 // ChunkRange runs [Client.ChunkRange] on a leased client.
-func (p *Pool) ChunkRange(ctx context.Context, cx0, cy0, cx1, cy1 int64) ([]RangeEntry, error) {
+func (p *Pool) ChunkRange(ctx context.Context, cx0, cy0, cx1, cy1 int64, opts GetOptions) ([]RangeEntry, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]RangeEntry, error) {
-		return c.ChunkRange(ctx, cx0, cy0, cx1, cy1)
+		return c.ChunkRange(ctx, cx0, cy0, cx1, cy1, opts)
 	})
 }
 
 // ChunkRadius runs [Client.ChunkRadius] on a leased client.
-func (p *Pool) ChunkRadius(ctx context.Context, cx, cy int64, radiusChunks int) ([]RangeEntry, error) {
+func (p *Pool) ChunkRadius(ctx context.Context, cx, cy int64, radiusChunks int, opts GetOptions) ([]RangeEntry, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]RangeEntry, error) {
-		return c.ChunkRadius(ctx, cx, cy, radiusChunks)
+		return c.ChunkRadius(ctx, cx, cy, radiusChunks, opts)
 	})
 }
 
 // ChunkVersion runs [Client.ChunkVersion] on a leased client.
 func (p *Pool) ChunkVersion(ctx context.Context, cx, cy int64) (uint64, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) { return c.ChunkVersion(ctx, cx, cy) })
-}
-
-// ChunkCompareAndSet runs [Client.ChunkCompareAndSet] on a leased client.
-func (p *Pool) ChunkCompareAndSet(ctx context.Context, cx, cy int64, expectedVersion uint64, state ChunkStateInput) (MutationResult, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.ChunkCompareAndSet(ctx, cx, cy, expectedVersion, state)
-	})
 }
 
 // ChunkBatch runs [Client.ChunkBatch] on a leased client.

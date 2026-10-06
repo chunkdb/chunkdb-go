@@ -7,7 +7,8 @@ import (
 )
 
 // Decoder and encoder for chunkdb's "zrle" zero-run-length codec used by the
-// CHUNKBINC wire command:
+// ZRLE option of the chunk commands (CHUNKGET, CHUNKPUT, CHUNKRANGE,
+// CHUNKRADIUS):
 //
 //	[0x01][u32le uncompressedSize][token...]
 //	token := 0x00 <uleb128 n>            n zero bytes

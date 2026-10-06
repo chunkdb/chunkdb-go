@@ -32,7 +32,11 @@ func (c *Client) Tables(ctx context.Context) ([]string, error) {
 	}
 	names := make([]string, 0, len(items))
 	for _, item := range items {
-		names = append(names, string(item))
+		name, err := bulkText(item, "TABLES")
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
 	}
 	return names, nil
 }
@@ -54,9 +58,10 @@ func (c *Client) TableInfo(ctx context.Context, name string) (TableInfo, error) 
 
 // Use selects the table for this client's connection, and for every
 // reconnect. An unknown name fails with [CodeNoTable] and keeps the current
-// table. Commands running concurrently with Use may run on either table.
+// table. Use waits for the requests in flight on this client and holds back
+// new ones until it completes, so each runs entirely on one table.
 func (c *Client) Use(ctx context.Context, name string) (TableInfo, error) {
-	release, err := c.acquireSlot(ctx, "USE")
+	release, err := c.acquireAllSlots(ctx, "USE")
 	if err != nil {
 		return TableInfo{}, err
 	}
@@ -80,24 +85,16 @@ func (c *Client) useOn(ctx context.Context, established *conn, name string) (Tab
 	if err != nil {
 		return TableInfo{}, err
 	}
-	blockCount := info.ChunkWidthBlocks * info.ChunkHeightBlocks
-	selected := geometry{
-		chunkPayloadBits:  blockCount * info.BlockBits,
-		chunkBlockCount:   blockCount,
-		chunkPayloadBytes: (blockCount*info.BlockBits + 7) / 8,
-		presenceBytes:     (blockCount + 7) / 8,
-	}
 	c.tableMu.Lock()
 	c.table = info.Name
 	c.tableMu.Unlock()
-	c.geoMu.Lock()
-	c.geo = &selected
-	c.geoMu.Unlock()
+	established.setGeometry(geometryOf(info))
 	return info, nil
 }
 
 // Table returns a new connected client on table name, with this client's
-// options. It has its own connection; close it when done.
+// options; its handshake names the table. It has its own connection; close it
+// when done.
 func (c *Client) Table(ctx context.Context, name string) (*Client, error) {
 	options := c.options
 	options.Table = name
@@ -197,7 +194,11 @@ func parseTableInfo(frame Frame, command string) (TableInfo, error) {
 	if err != nil {
 		return TableInfo{}, err
 	}
-	values := ParseInfo(payload)
+	return parseTableValues(ParseInfo(payload), command)
+}
+
+// parseTableValues reads the TABLEINFO lines, which USE and HELLO carry too.
+func parseTableValues(values map[string]string, command string) (TableInfo, error) {
 	info := TableInfo{
 		Name:    values["table"],
 		StoreID: values["store_id"],

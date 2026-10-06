@@ -27,8 +27,13 @@ type fakeServer struct {
 
 	mu       sync.Mutex
 	received []string
+	// puts holds every CHUNKPUT request exactly as it arrived: the request
+	// line, the payload, and the empty line after it.
+	puts     [][]byte
 	conns    []net.Conn
 	accepted int
+	// finished counts connections the client closed or the server dropped.
+	finished int
 	stopped  bool
 }
 
@@ -84,22 +89,33 @@ func (s *fakeServer) acceptLoop() {
 }
 
 func (s *fakeServer) serve(conn net.Conn) {
+	defer func() {
+		s.mu.Lock()
+		s.finished++
+		s.mu.Unlock()
+	}()
+
 	reader := bufio.NewReader(conn)
 	for {
 		line, err := reader.ReadString('\n')
-		if err == nil && strings.HasPrefix(strings.ToUpper(line), "CHUNKSETBIN ") {
-			// The payload and its empty-line terminator follow the header;
-			// drain them so the next iteration sees the next request line.
-			fields := strings.Fields(line)
-			if n, convErr := strconv.Atoi(fields[len(fields)-1]); convErr == nil && n >= 0 {
-				buf := make([]byte, n+2)
-				if _, readErr := io.ReadFull(reader, buf); readErr != nil {
-					return
-				}
-			}
-		}
 		if err != nil {
 			return
+		}
+		if strings.HasPrefix(strings.ToUpper(line), "CHUNKPUT ") {
+			// The payload and its empty-line terminator follow the header;
+			// read them so the next iteration sees the next request line.
+			fields := strings.Fields(line)
+			n, convErr := strconv.Atoi(fields[len(fields)-1])
+			if convErr != nil || n < 0 {
+				return
+			}
+			body := make([]byte, n+2)
+			if _, readErr := io.ReadFull(reader, body); readErr != nil {
+				return
+			}
+			s.mu.Lock()
+			s.puts = append(s.puts, append([]byte(line), body...))
+			s.mu.Unlock()
 		}
 		command := strings.TrimRight(line, "\r\n")
 
@@ -172,21 +188,75 @@ func (s *fakeServer) acceptedConns() int {
 	return s.accepted
 }
 
-// withAuth answers AUTH with +OK and forwards everything else to handle.
-func withAuth(handle func(*fakeServer, net.Conn, string)) func(*fakeServer, net.Conn, string) {
+func (s *fakeServer) finishedConns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finished
+}
+
+// lastPut returns the most recent CHUNKPUT request as it arrived on the wire.
+func (s *fakeServer) lastPut(t *testing.T) []byte {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.puts) == 0 {
+		t.Fatal("server received no CHUNKPUT")
+	}
+	return s.puts[len(s.puts)-1]
+}
+
+// helloLimits is the part of every fake HELLO reply before the table lines.
+const helloLimits = "protocol=2\nserver_version=test\ncapabilities=zrle\nmax_line_bytes=65536\n" +
+	"max_area_chunks=256\nmax_response_bytes=67108864\nmax_scan_limit=1024\nmax_batch_ops=1024\n"
+
+// defaultInfo is the fake server's default table. Chunks of 2x2 blocks of 4
+// bits keep the derived sizes small: 2 payload bytes and 1 presence byte.
+const defaultInfo = "table=default\nstore_id=ffeeddccbbaa99887766554433221100\nblock_bits=4\n" +
+	"chunk_width_blocks=2\nchunk_height_blocks=2\nlarge_chunk_width_chunks=8\n" +
+	"large_chunk_height_chunks=8\ndurability_mode=relaxed\ncheckpoint_updates=256\n" +
+	"checkpoint_wal_bytes=1048576\nwal_group_commit_updates=8\ncheckpoint_compression=none\n"
+
+const (
+	testChunkPayloadBytes = 2
+	testPresenceBytes     = 1
+)
+
+// fakeTables are the tables the fake HELLO and USE know.
+var fakeTables = map[string]string{"default": defaultInfo, "terrain": terrainInfo}
+
+// answerHello answers a HELLO line like a protocol 2 server holding
+// fakeTables, ignoring the token.
+func answerHello(conn net.Conn, command string) {
+	args := strings.Fields(command)
+	table := "default"
+	for i := 2; i+1 < len(args); i += 2 {
+		if args[i] == "TABLE" {
+			table = args[i+1]
+		}
+	}
+	info, ok := fakeTables[table]
+	if !ok {
+		writeServerError(conn, "ERR NO_TABLE table '"+table+"' does not exist")
+		return
+	}
+	writeBulkString(conn, helloLimits+info)
+}
+
+// withHello answers HELLO and forwards everything else to handle.
+func withHello(handle func(*fakeServer, net.Conn, string)) func(*fakeServer, net.Conn, string) {
 	return func(s *fakeServer, conn net.Conn, command string) {
-		if strings.HasPrefix(command, "AUTH ") {
-			writeSimple(conn, "OK")
+		if verbOf(command) == "HELLO" {
+			answerHello(conn, command)
 			return
 		}
 		handle(s, conn, command)
 	}
 }
 
-// respondWith answers AUTH with +OK and every other command with the same
-// canned response bytes.
+// respondWith answers HELLO and every other command with the same canned
+// response bytes.
 func respondWith(response string) func(*fakeServer, net.Conn, string) {
-	return withAuth(func(_ *fakeServer, conn net.Conn, _ string) {
+	return withHello(func(_ *fakeServer, conn net.Conn, _ string) {
 		_, _ = conn.Write([]byte(response))
 	})
 }
@@ -210,6 +280,10 @@ func writeBulk(conn net.Conn, payload []byte) {
 	_, _ = conn.Write([]byte("\r\n"))
 }
 
+func writeNull(conn net.Conn) {
+	_, _ = conn.Write([]byte("$-1\r\n"))
+}
+
 func writeBulkString(conn net.Conn, payload string) {
 	writeBulk(conn, []byte(payload))
 }
@@ -220,15 +294,3 @@ func writeArray(conn net.Conn, items ...string) {
 		writeBulkString(conn, item)
 	}
 }
-
-// infoPayload is the INFO response used by tests that need chunk geometry.
-// Two 2x2-block chunks of 4-bit blocks keep the derived sizes small:
-// 16 payload bits (2 bytes) and 4 presence bits (1 byte).
-const infoPayload = "chunkdb_version=1\nblock_bits=4\nchunk_width_blocks=2\nchunk_height_blocks=2\n"
-
-const (
-	testChunkPayloadBits  = 16
-	testChunkBlockCount   = 4
-	testChunkPayloadBytes = 2
-	testPresenceBytes     = 1
-)

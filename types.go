@@ -21,14 +21,10 @@ type Options struct {
 	// as its userinfo component.
 	URI string
 
-	Host  string
-	Port  int
+	Host string
+	Port int
+	// Token is sent as HELLO 2 AUTH <token> when a connection opens.
 	Token string
-
-	// DisableAutoAuth skips the implicit AUTH sent after connecting. By
-	// default the client authenticates automatically whenever a token is
-	// configured.
-	DisableAutoAuth bool
 
 	// ConnectTimeout bounds establishing the socket and completing the TLS
 	// handshake. Zero means [DefaultTimeout]; a negative value disables the
@@ -54,9 +50,9 @@ type Options struct {
 	// Zero and one both mean sequential request/response.
 	PipelineDepth int
 
-	// Table is the table the connection works on (chunkdb 2.0+), selected
-	// with USE after connecting and after every reconnect. Empty means the
-	// URI path (chunk://host:4242/terrain), then the server's default table.
+	// Table is the table the connection works on, named in HELLO when
+	// connecting and reconnecting. Empty means the URI path
+	// (chunk://host:4242/terrain), then the server's default table.
 	Table string
 }
 
@@ -85,8 +81,8 @@ type TableSpec struct {
 	Options                TableOptions
 }
 
-// TableInfo is the geometry, options and identity of a table, as TABLEINFO
-// and USE report them.
+// TableInfo is the geometry, options and identity of a table, as HELLO,
+// TABLEINFO and USE report them.
 type TableInfo struct {
 	Name string
 	// StoreID changes when a table is dropped and created again under the
@@ -102,7 +98,36 @@ type TableInfo struct {
 	Values map[string]string
 }
 
-// Info is the parsed result of the INFO command.
+// HelloInfo is the server's reply to the HELLO handshake that opens every
+// connection.
+type HelloInfo struct {
+	// Protocol is the protocol version, always 2.
+	Protocol      int
+	ServerVersion string
+	// Capabilities lists optional features, for example "zrle".
+	Capabilities []string
+	// MaxLineBytes bounds one request line.
+	MaxLineBytes int
+	// MaxAreaChunks is the most chunks one [Client.ChunkRange] or
+	// [Client.ChunkRadius] call may cover.
+	MaxAreaChunks int
+	// MaxResponseBytes caps a [Client.ChunkRange] or [Client.ChunkRadius]
+	// response.
+	MaxResponseBytes int
+	// MaxScanLimit is the largest [Client.ChunkScan] limit.
+	MaxScanLimit int
+	// MaxBatchOps is the most operations one [Client.ChunkBatch] may carry.
+	MaxBatchOps int
+	// Table is the connection's table at HELLO time, or nil when the
+	// connection has none (the server has no default table and none was
+	// named). [Client.Use] reports later selections.
+	Table *TableInfo
+	// Values holds every key/value line of the reply.
+	Values map[string]string
+}
+
+// Info is the parsed result of the INFO command: runtime statistics of the
+// selected table.
 type Info struct {
 	// Raw is the server payload exactly as received.
 	Raw string
@@ -110,28 +135,49 @@ type Info struct {
 	Values map[string]string
 }
 
-// BlockState is the result of [Client.ReadBlock].
+// BlockState is one block as read by [Client.Get] and [Client.MGet].
 //
-// Bits is empty when Exists is false; an explicitly stored all-zero block
-// reports Exists true with an all-zero Bits string.
+// An unset block reports Exists false and an empty Bits; an explicitly stored
+// all-zero block reports Exists true with an all-zero Bits string.
 type BlockState struct {
 	Exists bool
 	Bits   string
 }
 
-// ChunkState is the result of [Client.ReadChunk]. Exists reports whether any
-// block in the chunk is explicitly present.
+// ChunkState is a chunk's binary state, as read by [Client.GetChunkState].
+//
+// Payload holds the packed block bits: bit i of the chunk is
+// payload[i/8] >> (i%8) & 1. Presence holds one bit per block, laid out the
+// same way, set when the block is explicitly present. Exists reports whether
+// any presence bit is set.
 type ChunkState struct {
 	Exists   bool
-	Bits     string
-	Presence string
+	Payload  []byte
+	Presence []byte
 }
 
-// ChunkStateInput is the exact chunk state written by
-// [Client.SetChunkState] and [Client.ChunkCompareAndSet].
+// ChunkStateInput is the chunk state written by [Client.PutChunkState], in
+// the layout of [ChunkState].
 type ChunkStateInput struct {
-	Bits     string
-	Presence string
+	Payload  []byte
+	Presence []byte
+}
+
+// GetOptions configure a chunk read.
+type GetOptions struct {
+	// ZRLE transfers the chunk zrle-compressed. The client decompresses it
+	// and checks its size.
+	ZRLE bool
+}
+
+// PutOptions configure a chunk write.
+type PutOptions struct {
+	// IfVersion, when set, applies the write only if the chunk's current
+	// version equals it.
+	IfVersion *uint64
+	// ZRLE sends the chunk zrle-compressed when that is smaller than the raw
+	// bytes, and raw otherwise.
+	ZRLE bool
 }
 
 // Block is one item of a batch write.
@@ -162,12 +208,12 @@ type ScanResult struct {
 }
 
 // RangeEntry is one populated chunk returned by [Client.ChunkRange] or
-// [Client.ChunkRadius].
+// [Client.ChunkRadius], with its state in the layout of [ChunkState].
 type RangeEntry struct {
 	CX       int64
 	CY       int64
-	Bits     string
-	Presence string
+	Payload  []byte
+	Presence []byte
 }
 
 // BatchOpType selects the operation performed by a [BatchOperation].
@@ -199,12 +245,14 @@ func UnsetOp(x, y int64) BatchOperation {
 	return BatchOperation{Type: BatchUnset, X: x, Y: y}
 }
 
-// MutationResult is the result of a conditional chunk mutation.
+// MutationResult is the result of a chunk write ([Client.PutChunk],
+// [Client.PutChunkState], [Client.ChunkBatch]).
 //
-// Versions are opaque tokens: they change on every content mutation and
-// whenever the server reloads the chunk (eviction or restart). On a version
-// mismatch OK is false and Version is the chunk's current version; the stored
-// state is unchanged.
+// Version is the chunk's version after the write. Versions are opaque tokens:
+// they change on every content mutation and survive eviction and restart; a
+// write that does not change the chunk keeps its version. When a conditional
+// write's version does not match, OK is false and Version is the chunk's
+// current version; the chunk is unchanged.
 type MutationResult struct {
 	OK      bool
 	Version uint64

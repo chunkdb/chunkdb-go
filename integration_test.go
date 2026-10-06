@@ -216,39 +216,31 @@ func writeTLSFixture(t *testing.T) (certPath, keyPath string, caPEM []byte) {
 	return certPath, keyPath, caPEM
 }
 
-// serverGeometry is the chunk shape reported by INFO, used to build full-chunk
-// payloads of the right size.
+// serverGeometry is the chunk shape of the connection's table, from HELLO.
 type serverGeometry struct {
-	blockBits   int
-	blockCount  int
-	payloadBits int
-	width       int
-	height      int
+	blockBits     int
+	width         int
+	height        int
+	blockCount    int
+	payloadBytes  int
+	presenceBytes int
 }
 
 func readGeometry(t *testing.T, client *Client) serverGeometry {
 	t.Helper()
 
-	info, err := client.Info(t.Context())
-	if err != nil {
-		t.Fatalf("Info: %v", err)
+	info := client.ServerInfo()
+	if info == nil || info.Table == nil {
+		t.Fatalf("got ServerInfo %+v, want a table", info)
 	}
-
-	read := func(key string) int {
-		value, err := strconv.Atoi(info.Values[key])
-		if err != nil || value <= 0 {
-			t.Fatalf("INFO %s: got %q", key, info.Values[key])
-		}
-		return value
-	}
-
 	geo := serverGeometry{
-		blockBits: read("block_bits"),
-		width:     read("chunk_width_blocks"),
-		height:    read("chunk_height_blocks"),
+		blockBits: info.Table.BlockBits,
+		width:     info.Table.ChunkWidthBlocks,
+		height:    info.Table.ChunkHeightBlocks,
 	}
 	geo.blockCount = geo.width * geo.height
-	geo.payloadBits = geo.blockCount * geo.blockBits
+	geo.payloadBytes = (geo.blockCount*geo.blockBits + 7) / 8
+	geo.presenceBytes = (geo.blockCount + 7) / 8
 	return geo
 }
 
@@ -272,6 +264,26 @@ func (g serverGeometry) blockOrigin(cx, cy int64) (x, y int64) {
 	return cx * int64(g.width), cy * int64(g.height)
 }
 
+// denseBytes returns n bytes without zero runs, which zrle cannot shrink.
+func denseBytes(n int, seed byte) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = byte(i*37+int(seed)) | 0x01
+	}
+	return out
+}
+
+// sparsePayload returns a payload that is zero except for a few bytes.
+func (g serverGeometry) sparsePayload(seed byte) []byte {
+	out := make([]byte, g.payloadBytes)
+	out[0] = seed | 0x01
+	out[len(out)/2] = 0x5a
+	out[len(out)-1] = 0x80
+	return out
+}
+
+func allOnes(n int) []byte { return bytes.Repeat([]byte{0xff}, n) }
+
 func connectIntegration(t *testing.T, server *testServer, configure func(*Options)) *Client {
 	t.Helper()
 
@@ -288,6 +300,40 @@ func connectIntegration(t *testing.T, server *testServer, configure func(*Option
 	return client
 }
 
+func TestIntegrationServerInfo(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, nil)
+
+	info := client.ServerInfo()
+	if info == nil {
+		t.Fatal("got nil ServerInfo")
+	}
+	if info.Protocol != 2 || info.ServerVersion == "" || !slices.Contains(info.Capabilities, "zrle") {
+		t.Fatalf("got %+v", info)
+	}
+	if info.MaxLineBytes != 65536 || info.MaxAreaChunks != 256 || info.MaxResponseBytes != 64<<20 ||
+		info.MaxScanLimit != 1024 || info.MaxBatchOps != 1024 {
+		t.Fatalf("got limits %+v", info)
+	}
+	table := info.Table
+	if table == nil || table.Name != "default" || len(table.StoreID) != 32 || table.BlockBits <= 0 ||
+		table.ChunkWidthBlocks <= 0 || table.ChunkHeightBlocks <= 0 || table.Options.DurabilityMode != "relaxed" {
+		t.Fatalf("got table %+v", table)
+	}
+	if info.Values["protocol"] != "2" || info.Values["table"] != "default" {
+		t.Fatalf("got values %v", info.Values)
+	}
+
+	// INFO reports runtime statistics; geometry comes from HELLO.
+	stats, err := client.Info(t.Context())
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if stats.Values["table"] != "default" {
+		t.Fatalf("got INFO %q", stats.Raw)
+	}
+}
+
 func TestIntegrationBlockOperations(t *testing.T) {
 	server := startServer(t, serverConfig{})
 	client := connectIntegration(t, server, nil)
@@ -299,21 +345,12 @@ func TestIntegrationBlockOperations(t *testing.T) {
 	}
 
 	t.Run("unset block reads as absent", func(t *testing.T) {
-		state, err := client.ReadBlock(ctx, 0, 0)
-		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
-		}
-		if state.Exists {
-			t.Fatalf("got %+v, want an absent block", state)
-		}
-
-		// The low-level read still returns zero bits for an absent block.
-		bits, err := client.Get(ctx, 0, 0)
+		state, err := client.Get(ctx, 0, 0)
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if bits != geo.zeroBlock() {
-			t.Fatalf("got %q, want zero bits", bits)
+		if state != (BlockState{}) {
+			t.Fatalf("got %+v, want an unset block", state)
 		}
 	})
 
@@ -322,21 +359,12 @@ func TestIntegrationBlockOperations(t *testing.T) {
 		if err := client.Set(ctx, 1, 1, pattern); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
-
-		state, err := client.ReadBlock(ctx, 1, 1)
+		state, err := client.Get(ctx, 1, 1)
 		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
-		if !state.Exists || state.Bits != pattern {
+		if state != (BlockState{Exists: true, Bits: pattern}) {
 			t.Fatalf("got %+v, want %q", state, pattern)
-		}
-
-		present, err := client.Exists(ctx, 1, 1)
-		if err != nil {
-			t.Fatalf("Exists: %v", err)
-		}
-		if !present {
-			t.Fatal("got Exists false, want true")
 		}
 	})
 
@@ -344,11 +372,11 @@ func TestIntegrationBlockOperations(t *testing.T) {
 		if err := client.Set(ctx, 2, 1, geo.zeroBlock()); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
-		state, err := client.ReadBlock(ctx, 2, 1)
+		state, err := client.Get(ctx, 2, 1)
 		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
-		if !state.Exists || state.Bits != geo.zeroBlock() {
+		if state != (BlockState{Exists: true, Bits: geo.zeroBlock()}) {
 			t.Fatalf("got %+v, want an explicitly present zero block", state)
 		}
 	})
@@ -360,12 +388,12 @@ func TestIntegrationBlockOperations(t *testing.T) {
 		if err := client.Unset(ctx, 3, 1); err != nil {
 			t.Fatalf("Unset: %v", err)
 		}
-		state, err := client.ReadBlock(ctx, 3, 1)
+		state, err := client.Get(ctx, 3, 1)
 		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
 		if state.Exists {
-			t.Fatalf("got %+v, want an absent block after Unset", state)
+			t.Fatalf("got %+v, want an unset block after Unset", state)
 		}
 	})
 
@@ -374,20 +402,20 @@ func TestIntegrationBlockOperations(t *testing.T) {
 		if err := client.Set(ctx, -5, -7, pattern); err != nil {
 			t.Fatalf("Set: %v", err)
 		}
-		state, err := client.ReadBlock(ctx, -5, -7)
+		state, err := client.Get(ctx, -5, -7)
 		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
-		if !state.Exists || state.Bits != pattern {
+		if state != (BlockState{Exists: true, Bits: pattern}) {
 			t.Fatalf("got %+v, want %q", state, pattern)
 		}
 	})
 
 	t.Run("batch read and write", func(t *testing.T) {
-		first, second := geo.blockPattern(0), geo.blockPattern(1)
+		first := geo.blockPattern(0)
 		if err := client.MSet(ctx, []Block{
 			{X: 10, Y: 2, Bits: first},
-			{X: 11, Y: 2, Bits: second},
+			{X: 11, Y: 2, Bits: geo.zeroBlock()},
 		}); err != nil {
 			t.Fatalf("MSet: %v", err)
 		}
@@ -396,14 +424,9 @@ func TestIntegrationBlockOperations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("MGet: %v", err)
 		}
-		if len(values) != 3 {
-			t.Fatalf("got %d values, want 3", len(values))
-		}
-		if values[0] != first || values[1] != second {
-			t.Fatalf("got %q, want %q and %q", values, first, second)
-		}
-		if values[2] != geo.zeroBlock() {
-			t.Fatalf("got %q for an unset block, want zero bits", values[2])
+		want := []BlockState{{Exists: true, Bits: first}, {Exists: true, Bits: geo.zeroBlock()}, {}}
+		if !slices.Equal(values, want) {
+			t.Fatalf("got %+v, want %+v", values, want)
 		}
 	})
 
@@ -425,206 +448,228 @@ func TestIntegrationChunkOperations(t *testing.T) {
 	geo := readGeometry(t, client)
 	ctx := t.Context()
 
-	payloadBytes := (geo.payloadBits + 7) / 8
-	presenceBytes := (geo.blockCount + 7) / 8
-
-	t.Run("absent chunk", func(t *testing.T) {
+	t.Run("absent chunk reads as zeros", func(t *testing.T) {
 		present, err := client.ChunkExists(ctx, 100, 100)
+		if err != nil || present {
+			t.Fatalf("ChunkExists: %v, %v; want an absent chunk", present, err)
+		}
+		payload, err := client.GetChunk(ctx, 100, 100, GetOptions{})
+		if err != nil || !bytes.Equal(payload, make([]byte, geo.payloadBytes)) {
+			t.Fatalf("GetChunk: %d bytes, %v; want %d zero bytes", len(payload), err, geo.payloadBytes)
+		}
+		state, err := client.GetChunkState(ctx, 100, 100, GetOptions{})
 		if err != nil {
-			t.Fatalf("ChunkExists: %v", err)
+			t.Fatalf("GetChunkState: %v", err)
 		}
-		if present {
-			t.Fatal("got true, want an absent chunk")
-		}
-
-		state, err := client.ReadChunk(ctx, 100, 100)
-		if err != nil {
-			t.Fatalf("ReadChunk: %v", err)
-		}
-		if state.Exists {
-			t.Fatalf("got %+v, want an absent chunk", state)
-		}
-		if state.Bits != strings.Repeat("0", geo.payloadBits) {
-			t.Fatalf("got %d payload bits, want %d zero bits", len(state.Bits), geo.payloadBits)
-		}
-		if state.Presence != strings.Repeat("0", geo.blockCount) {
-			t.Fatalf("got presence %q, want all absent", state.Presence)
+		if state.Exists || !bytes.Equal(state.Payload, make([]byte, geo.payloadBytes)) ||
+			!bytes.Equal(state.Presence, make([]byte, geo.presenceBytes)) {
+			t.Fatalf("got %+v, want an absent chunk of zeros", state)
 		}
 	})
 
-	t.Run("full chunk replace", func(t *testing.T) {
-		bits := strings.Repeat("1", geo.payloadBits)
-		if err := client.SetChunk(ctx, 5, 5, bits); err != nil {
-			t.Fatalf("SetChunk: %v", err)
+	t.Run("bit layout matches block reads", func(t *testing.T) {
+		// Bit i of the chunk is payload[i/8] >> (i%8) & 1; block b holds bits
+		// b*block_bits .. (b+1)*block_bits-1, blocks in row-major order, and
+		// character j of the block's bit text is bit b*block_bits+j.
+		x, y := geo.blockOrigin(50, 50)
+		bits := []byte(geo.zeroBlock())
+		bits[0] = '1'
+		if err := client.Set(ctx, x+1, y+1, string(bits)); err != nil {
+			t.Fatalf("Set: %v", err)
 		}
-
-		state, err := client.ReadChunk(ctx, 5, 5)
+		state, err := client.GetChunkState(ctx, 50, 50, GetOptions{})
 		if err != nil {
-			t.Fatalf("ReadChunk: %v", err)
+			t.Fatalf("GetChunkState: %v", err)
 		}
-		if !state.Exists || state.Bits != bits {
-			t.Fatalf("got Exists=%v with %d bits, want the written payload", state.Exists, len(state.Bits))
+		block := geo.width + 1
+		bit := block * geo.blockBits
+		if state.Payload[bit/8]>>(bit%8)&1 != 1 || state.Presence[block/8]>>(block%8)&1 != 1 {
+			t.Fatalf("block %d bit not where documented: payload %x presence %x", block, state.Payload, state.Presence)
 		}
-		if state.Presence != strings.Repeat("1", geo.blockCount) {
-			t.Fatalf("got presence %q, want every block present", state.Presence)
-		}
+	})
 
-		raw, err := client.Chunk(ctx, 5, 5)
-		if err != nil {
-			t.Fatalf("Chunk: %v", err)
+	t.Run("payload round trip", func(t *testing.T) {
+		payload := denseBytes(geo.payloadBytes, 11)
+		result, err := client.PutChunk(ctx, 5, 5, payload, PutOptions{})
+		if err != nil || !result.OK {
+			t.Fatalf("PutChunk: %+v, %v", result, err)
 		}
-		if raw != bits {
-			t.Fatalf("got %d bits from Chunk, want the written payload", len(raw))
+		got, err := client.GetChunk(ctx, 5, 5, GetOptions{})
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("GetChunk: %x, %v; want %x", got, err, payload)
+		}
+		state, err := client.GetChunkState(ctx, 5, 5, GetOptions{})
+		if err != nil {
+			t.Fatalf("GetChunkState: %v", err)
+		}
+		if !state.Exists || !bytes.Equal(state.Payload, payload) || !bytes.Equal(state.Presence, allOnes(geo.presenceBytes)) {
+			t.Fatalf("got %+v, want the payload with every block present", state)
+		}
+		version, err := client.ChunkVersion(ctx, 5, 5)
+		if err != nil || version != result.Version {
+			t.Fatalf("ChunkVersion: %d, %v; want %d", version, err, result.Version)
 		}
 	})
 
 	t.Run("explicit zero chunk stays present", func(t *testing.T) {
-		if err := client.SetChunk(ctx, 6, 5, strings.Repeat("0", geo.payloadBits)); err != nil {
-			t.Fatalf("SetChunk: %v", err)
+		if _, err := client.PutChunk(ctx, 6, 5, make([]byte, geo.payloadBytes), PutOptions{}); err != nil {
+			t.Fatalf("PutChunk: %v", err)
 		}
-		state, err := client.ReadChunk(ctx, 6, 5)
-		if err != nil {
-			t.Fatalf("ReadChunk: %v", err)
-		}
-		if !state.Exists {
-			t.Fatal("got Exists false, want an explicitly present all-zero chunk")
+		state, err := client.GetChunkState(ctx, 6, 5, GetOptions{})
+		if err != nil || !state.Exists {
+			t.Fatalf("GetChunkState: %+v, %v; want an explicitly present all-zero chunk", state, err)
 		}
 	})
 
-	t.Run("mixed presence state", func(t *testing.T) {
-		bits := []byte(strings.Repeat("0", geo.payloadBits))
-		for i := range geo.blockBits {
-			bits[i] = '1'
+	t.Run("state round trip stores absent blocks as zero", func(t *testing.T) {
+		// Blocks 0 and 1 carry bits; only block 0 is present.
+		payload := make([]byte, geo.payloadBytes)
+		for bit := range 2 * geo.blockBits {
+			payload[bit/8] |= 1 << (bit % 8)
 		}
-		presence := []byte(strings.Repeat("0", geo.blockCount))
-		presence[0] = '1'
-
-		if err := client.SetChunkState(ctx, 7, 5, ChunkStateInput{
-			Bits:     string(bits),
-			Presence: string(presence),
-		}); err != nil {
-			t.Fatalf("SetChunkState: %v", err)
+		presence := make([]byte, geo.presenceBytes)
+		presence[0] = 0x01
+		if _, err := client.PutChunkState(ctx, 7, 5, ChunkStateInput{Payload: payload, Presence: presence}, PutOptions{}); err != nil {
+			t.Fatalf("PutChunkState: %v", err)
 		}
 
-		state, err := client.ReadChunk(ctx, 7, 5)
+		want := make([]byte, geo.payloadBytes)
+		for bit := range geo.blockBits {
+			want[bit/8] |= 1 << (bit % 8)
+		}
+		state, err := client.GetChunkState(ctx, 7, 5, GetOptions{})
 		if err != nil {
-			t.Fatalf("ReadChunk: %v", err)
+			t.Fatalf("GetChunkState: %v", err)
 		}
-		if state.Presence != string(presence) {
-			t.Fatalf("got presence %q, want %q", state.Presence, presence)
+		if !state.Exists || !bytes.Equal(state.Payload, want) || !bytes.Equal(state.Presence, presence) {
+			t.Fatalf("got payload %x presence %x, want %x and %x", state.Payload, state.Presence, want, presence)
 		}
-		if state.Bits != string(bits) {
-			t.Fatalf("got payload %q, want %q", state.Bits, bits)
+
+		x, y := geo.blockOrigin(7, 5)
+		values, err := client.MGet(ctx, []BlockRef{{X: x, Y: y}, {X: x + 1, Y: y}})
+		if err != nil {
+			t.Fatalf("MGet: %v", err)
+		}
+		if values[0] != (BlockState{Exists: true, Bits: strings.Repeat("1", geo.blockBits)}) || values[1].Exists {
+			t.Fatalf("got %+v", values)
 		}
 	})
 
-	t.Run("binary transfer", func(t *testing.T) {
-		bits := strings.Repeat("10", geo.payloadBits/2)
-		if err := client.SetChunk(ctx, 8, 5, bits); err != nil {
-			t.Fatalf("SetChunk: %v", err)
+	t.Run("empty presence leaves the chunk absent", func(t *testing.T) {
+		state := ChunkStateInput{Payload: denseBytes(geo.payloadBytes, 3), Presence: make([]byte, geo.presenceBytes)}
+		if _, err := client.PutChunkState(ctx, 8, 5, state, PutOptions{}); err != nil {
+			t.Fatalf("PutChunkState: %v", err)
 		}
-
-		packed, err := client.ChunkBin(ctx, 8, 5)
-		if err != nil {
-			t.Fatalf("ChunkBin: %v", err)
+		exists, err := client.ChunkExists(ctx, 8, 5)
+		if err != nil || exists {
+			t.Fatalf("ChunkExists: %v, %v; want absent", exists, err)
 		}
-		if len(packed) != payloadBytes {
-			t.Fatalf("got %d bytes, want %d", len(packed), payloadBytes)
-		}
-
-		state, err := client.ChunkBinState(ctx, 8, 5)
-		if err != nil {
-			t.Fatalf("ChunkBinState: %v", err)
-		}
-		if len(state) != payloadBytes+presenceBytes {
-			t.Fatalf("got %d bytes, want %d", len(state), payloadBytes+presenceBytes)
-		}
-		if string(state[:payloadBytes]) != string(packed) {
-			t.Fatal("the state payload prefix does not match ChunkBin")
+		read, err := client.GetChunkState(ctx, 8, 5, GetOptions{})
+		if err != nil || read.Exists || !bytes.Equal(read.Payload, make([]byte, geo.payloadBytes)) {
+			t.Fatalf("GetChunkState: %+v, %v; want an absent chunk of zeros", read, err)
 		}
 	})
 
-	t.Run("binary write round-trips the transfer layouts", func(t *testing.T) {
-		payload := make([]byte, payloadBytes)
-		for i := range payload {
-			payload[i] = byte(i*37 + 11)
-		}
-		if err := client.SetChunkBin(ctx, 9, 5, payload); err != nil {
-			t.Fatalf("SetChunkBin: %v", err)
-		}
-		back, err := client.ChunkBin(ctx, 9, 5)
-		if err != nil {
-			t.Fatalf("ChunkBin: %v", err)
-		}
-		if string(back) != string(payload) {
-			t.Fatalf("ChunkBin after SetChunkBin = %x, want %x", back, payload)
-		}
-
-		state, err := client.ChunkBinState(ctx, 9, 5)
-		if err != nil {
-			t.Fatalf("ChunkBinState: %v", err)
-		}
-		if err := client.SetChunkBinState(ctx, 10, 5, state); err != nil {
-			t.Fatalf("SetChunkBinState: %v", err)
-		}
-		copied, err := client.ChunkBinState(ctx, 10, 5)
-		if err != nil {
-			t.Fatalf("ChunkBinState copy: %v", err)
-		}
-		if string(copied) != string(state) {
-			t.Fatal("SetChunkBinState did not reproduce the source state")
-		}
-
-		// An all-zero presence bitmap leaves the chunk absent.
-		absent := append(append([]byte{}, payload...), make([]byte, presenceBytes)...)
-		if err := client.SetChunkBinState(ctx, 11, 5, absent); err != nil {
-			t.Fatalf("SetChunkBinState absent: %v", err)
-		}
-		exists, err := client.ChunkExists(ctx, 11, 5)
-		if err != nil {
-			t.Fatalf("ChunkExists: %v", err)
-		}
-		if exists {
-			t.Fatal("chunk with an empty presence bitmap should be absent")
-		}
-
-		if err := client.SetChunkBin(ctx, 12, 5, payload[:1]); !errors.Is(err, ErrProtocol) {
+	t.Run("client-side size errors keep the connection usable", func(t *testing.T) {
+		payload := denseBytes(geo.payloadBytes, 5)
+		if _, err := client.PutChunk(ctx, 9, 5, payload[:1], PutOptions{}); !errors.Is(err, ErrProtocol) {
 			t.Fatalf("short payload: got %v, want ErrProtocol", err)
 		}
+		if _, err := client.PutChunk(ctx, 9, 5, append(payload, 0), PutOptions{ZRLE: true}); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("long payload: got %v, want ErrProtocol", err)
+		}
+		if _, err := client.PutChunkState(ctx, 9, 5, ChunkStateInput{Payload: payload, Presence: []byte{1}}, PutOptions{}); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("short presence: got %v, want ErrProtocol", err)
+		}
+		if _, err := client.PutChunk(ctx, 9, 5, payload, PutOptions{}); err != nil {
+			t.Fatalf("PutChunk after the rejected writes: %v", err)
+		}
+		if got, err := client.GetChunk(ctx, 9, 5, GetOptions{}); err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("GetChunk: %v", err)
+		}
 	})
 
-	t.Run("compressed transfer matches uncompressed", func(t *testing.T) {
-		// A mostly-zero chunk exercises the codec's zero runs.
-		bits := []byte(strings.Repeat("0", geo.payloadBits))
-		for i := range geo.blockBits {
-			bits[i] = '1'
+	t.Run("zrle reads and writes", func(t *testing.T) {
+		cases := map[string]ChunkStateInput{
+			"sparse": {Payload: geo.sparsePayload(7), Presence: append([]byte{0x0f}, make([]byte, geo.presenceBytes-1)...)},
+			"dense":  {Payload: denseBytes(geo.payloadBytes, 9), Presence: allOnes(geo.presenceBytes)},
 		}
-		if err := client.SetChunk(ctx, 9, 5, string(bits)); err != nil {
-			t.Fatalf("SetChunk: %v", err)
+		cx := int64(20)
+		for name, state := range cases {
+			t.Run(name, func(t *testing.T) {
+				cx++
+				if _, err := client.PutChunkState(ctx, cx, 5, state, PutOptions{ZRLE: true}); err != nil {
+					t.Fatalf("PutChunkState: %v", err)
+				}
+				raw, err := client.GetChunkState(ctx, cx, 5, GetOptions{})
+				if err != nil {
+					t.Fatalf("GetChunkState: %v", err)
+				}
+				compressed, err := client.GetChunkState(ctx, cx, 5, GetOptions{ZRLE: true})
+				if err != nil {
+					t.Fatalf("GetChunkState ZRLE: %v", err)
+				}
+				if !bytes.Equal(compressed.Payload, raw.Payload) || !bytes.Equal(compressed.Presence, raw.Presence) {
+					t.Fatal("the ZRLE read differs from the raw read")
+				}
+				// Only present blocks keep their payload bits; the sparse
+				// payload's bits all lie in blocks 0..3 or are absent.
+				if !bytes.Equal(raw.Presence, state.Presence) {
+					t.Fatalf("got presence %x, want %x", raw.Presence, state.Presence)
+				}
+
+				cx++
+				if _, err := client.PutChunk(ctx, cx, 5, state.Payload, PutOptions{ZRLE: true}); err != nil {
+					t.Fatalf("PutChunk: %v", err)
+				}
+				for _, zrle := range []bool{false, true} {
+					got, err := client.GetChunk(ctx, cx, 5, GetOptions{ZRLE: zrle})
+					if err != nil || !bytes.Equal(got, state.Payload) {
+						t.Fatalf("GetChunk zrle=%v: %v; payload differs", zrle, err)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("conditional writes", func(t *testing.T) {
+		version, err := client.ChunkVersion(ctx, 30, 5)
+		if err != nil {
+			t.Fatalf("ChunkVersion: %v", err)
 		}
 
-		packed, err := client.ChunkBin(ctx, 9, 5)
+		state := ChunkStateInput{Payload: denseBytes(geo.payloadBytes, 1), Presence: allOnes(geo.presenceBytes)}
+		result, err := client.PutChunkState(ctx, 30, 5, state, PutOptions{IfVersion: &version})
 		if err != nil {
-			t.Fatalf("ChunkBin: %v", err)
+			t.Fatalf("PutChunkState: %v", err)
 		}
-		compressed, err := client.ChunkBinCompressed(ctx, 9, 5)
-		if err != nil {
-			t.Fatalf("ChunkBinCompressed: %v", err)
-		}
-		if string(compressed) != string(packed) {
-			t.Fatal("ChunkBinCompressed did not decode to the ChunkBin payload")
+		if !result.OK || result.Version == version {
+			t.Fatalf("got %+v, want the write to apply with a new version (was %d)", result, version)
 		}
 
-		state, err := client.ChunkBinState(ctx, 9, 5)
-		if err != nil {
-			t.Fatalf("ChunkBinState: %v", err)
+		// The stale version is rejected and the chunk is unchanged.
+		other := ChunkStateInput{Payload: denseBytes(geo.payloadBytes, 2), Presence: allOnes(geo.presenceBytes)}
+		for _, zrle := range []bool{false, true} {
+			stale, err := client.PutChunkState(ctx, 30, 5, other, PutOptions{IfVersion: &version, ZRLE: zrle})
+			if err != nil {
+				t.Fatalf("PutChunkState: %v", err)
+			}
+			if stale.OK || stale.Version != result.Version {
+				t.Fatalf("got %+v, want a mismatch reporting version %d", stale, result.Version)
+			}
 		}
-		compressedState, err := client.ChunkBinStateCompressed(ctx, 9, 5)
-		if err != nil {
-			t.Fatalf("ChunkBinStateCompressed: %v", err)
+		if _, err := client.PutChunk(ctx, 30, 5, other.Payload, PutOptions{IfVersion: &version}); err != nil {
+			t.Fatalf("PutChunk: %v", err)
 		}
-		if string(compressedState) != string(state) {
-			t.Fatal("ChunkBinStateCompressed did not decode to the ChunkBinState payload")
+		read, err := client.GetChunkState(ctx, 30, 5, GetOptions{})
+		if err != nil || !bytes.Equal(read.Payload, state.Payload) {
+			t.Fatalf("GetChunkState: %v; a rejected write changed the chunk", err)
+		}
+
+		// A write that does not change the chunk keeps its version.
+		same, err := client.PutChunkState(ctx, 30, 5, state, PutOptions{IfVersion: &result.Version})
+		if err != nil || !same.OK || same.Version != result.Version {
+			t.Fatalf("got %+v, %v; want the version %d unchanged", same, err, result.Version)
 		}
 	})
 }
@@ -636,10 +681,33 @@ func TestIntegrationWorldReads(t *testing.T) {
 	ctx := t.Context()
 
 	populated := []CoordPair{{CX: 0, CY: 0}, {CX: 0, CY: 1}, {CX: 1, CY: 0}, {CX: 2, CY: 2}}
-	bits := strings.Repeat("1", geo.payloadBits)
-	for _, coordinate := range populated {
-		if err := client.SetChunk(ctx, coordinate.CX, coordinate.CY, bits); err != nil {
-			t.Fatalf("SetChunk(%d,%d): %v", coordinate.CX, coordinate.CY, err)
+	for i, coordinate := range populated {
+		state := ChunkStateInput{Payload: geo.sparsePayload(byte(i)), Presence: make([]byte, geo.presenceBytes)}
+		state.Presence[i] = 0xff
+		if i%2 == 1 {
+			state = ChunkStateInput{Payload: denseBytes(geo.payloadBytes, byte(i)), Presence: allOnes(geo.presenceBytes)}
+		}
+		if _, err := client.PutChunkState(ctx, coordinate.CX, coordinate.CY, state, PutOptions{}); err != nil {
+			t.Fatalf("PutChunkState(%d,%d): %v", coordinate.CX, coordinate.CY, err)
+		}
+	}
+
+	checkEntries := func(t *testing.T, entries []RangeEntry, want []CoordPair) {
+		t.Helper()
+		if len(entries) != len(want) {
+			t.Fatalf("got %d entries, want %d", len(entries), len(want))
+		}
+		for i, entry := range entries {
+			if (CoordPair{CX: entry.CX, CY: entry.CY}) != want[i] {
+				t.Fatalf("entry %d: got (%d,%d), want %+v", i, entry.CX, entry.CY, want[i])
+			}
+			state, err := client.GetChunkState(ctx, entry.CX, entry.CY, GetOptions{})
+			if err != nil {
+				t.Fatalf("GetChunkState: %v", err)
+			}
+			if !bytes.Equal(entry.Payload, state.Payload) || !bytes.Equal(entry.Presence, state.Presence) {
+				t.Fatalf("chunk (%d,%d): the range entry differs from GetChunkState", entry.CX, entry.CY)
+			}
 		}
 	}
 
@@ -659,59 +727,50 @@ func TestIntegrationWorldReads(t *testing.T) {
 			}
 			cursor = page.NextCursor
 		}
-
-		if len(seen) != len(populated) {
+		if !slices.Equal(seen, populated) {
 			t.Fatalf("got %+v, want %+v", seen, populated)
 		}
-		for i, coordinate := range populated {
-			if seen[i] != coordinate {
-				t.Fatalf("entry %d: got %+v, want %+v", i, seen[i], coordinate)
-			}
-		}
 	})
 
-	t.Run("range returns populated chunks only", func(t *testing.T) {
-		entries, err := client.ChunkRange(ctx, 0, 0, 1, 1)
-		if err != nil {
-			t.Fatalf("ChunkRange: %v", err)
+	for _, zrle := range []bool{false, true} {
+		opts := GetOptions{ZRLE: zrle}
+		name := "raw"
+		if zrle {
+			name = "zrle"
 		}
-		if len(entries) != 3 {
-			t.Fatalf("got %d entries, want 3", len(entries))
-		}
-		for _, entry := range entries {
-			if entry.Bits != bits {
-				t.Fatalf("chunk (%d,%d): got %d payload bits, want %d", entry.CX, entry.CY, len(entry.Bits), geo.payloadBits)
-			}
-			if entry.Presence != strings.Repeat("1", geo.blockCount) {
-				t.Fatalf("chunk (%d,%d): got presence %q", entry.CX, entry.CY, entry.Presence)
-			}
-		}
-	})
 
-	t.Run("radius returns the disc", func(t *testing.T) {
-		entries, err := client.ChunkRadius(ctx, 0, 0, 1)
-		if err != nil {
-			t.Fatalf("ChunkRadius: %v", err)
-		}
-		if len(entries) != 3 {
-			t.Fatalf("got %d entries, want the three chunks within radius 1", len(entries))
-		}
-		for _, entry := range entries {
-			if entry.CX*entry.CX+entry.CY*entry.CY > 1 {
-				t.Fatalf("chunk (%d,%d) is outside radius 1", entry.CX, entry.CY)
+		t.Run("range returns populated chunks only/"+name, func(t *testing.T) {
+			entries, err := client.ChunkRange(ctx, 0, 0, 1, 1, opts)
+			if err != nil {
+				t.Fatalf("ChunkRange: %v", err)
 			}
-		}
-	})
+			checkEntries(t, entries, populated[:3])
+		})
 
-	t.Run("empty range", func(t *testing.T) {
-		entries, err := client.ChunkRange(ctx, 500, 500, 501, 501)
-		if err != nil {
-			t.Fatalf("ChunkRange: %v", err)
-		}
-		if len(entries) != 0 {
-			t.Fatalf("got %d entries, want none", len(entries))
-		}
-	})
+		t.Run("radius returns the disc/"+name, func(t *testing.T) {
+			entries, err := client.ChunkRadius(ctx, 0, 0, 1, opts)
+			if err != nil {
+				t.Fatalf("ChunkRadius: %v", err)
+			}
+			checkEntries(t, entries, populated[:3])
+
+			entries, err = client.ChunkRadius(ctx, 1, 1, 2, opts)
+			if err != nil {
+				t.Fatalf("ChunkRadius: %v", err)
+			}
+			checkEntries(t, entries, populated)
+		})
+
+		t.Run("empty range/"+name, func(t *testing.T) {
+			entries, err := client.ChunkRange(ctx, 500, 500, 501, 501, opts)
+			if err != nil {
+				t.Fatalf("ChunkRange: %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("got %d entries, want none", len(entries))
+			}
+		})
+	}
 }
 
 func TestIntegrationVersionedMutations(t *testing.T) {
@@ -721,40 +780,6 @@ func TestIntegrationVersionedMutations(t *testing.T) {
 	ctx := t.Context()
 
 	pattern := geo.blockPattern(0)
-
-	t.Run("compare and set", func(t *testing.T) {
-		version, err := client.ChunkVersion(ctx, 20, 20)
-		if err != nil {
-			t.Fatalf("ChunkVersion: %v", err)
-		}
-
-		state := ChunkStateInput{
-			Bits:     strings.Repeat("1", geo.payloadBits),
-			Presence: strings.Repeat("1", geo.blockCount),
-		}
-		result, err := client.ChunkCompareAndSet(ctx, 20, 20, version, state)
-		if err != nil {
-			t.Fatalf("ChunkCompareAndSet: %v", err)
-		}
-		if !result.OK {
-			t.Fatalf("got %+v, want the mutation to apply", result)
-		}
-		if result.Version == version {
-			t.Fatal("the version did not change after a content mutation")
-		}
-
-		// The stale version must now be rejected without changing state.
-		stale, err := client.ChunkCompareAndSet(ctx, 20, 20, version, state)
-		if err != nil {
-			t.Fatalf("ChunkCompareAndSet: %v", err)
-		}
-		if stale.OK {
-			t.Fatal("a stale version was accepted")
-		}
-		if stale.Version != result.Version {
-			t.Fatalf("got current version %d, want %d", stale.Version, result.Version)
-		}
-	})
 
 	t.Run("atomic batch", func(t *testing.T) {
 		x, y := geo.blockOrigin(21, 21)
@@ -769,12 +794,24 @@ func TestIntegrationVersionedMutations(t *testing.T) {
 			t.Fatalf("got %+v, want the batch to apply", result)
 		}
 
-		state, err := client.ReadBlock(ctx, x, y)
+		state, err := client.Get(ctx, x, y)
 		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
-		if !state.Exists || state.Bits != pattern {
+		if state != (BlockState{Exists: true, Bits: pattern}) {
 			t.Fatalf("got %+v, want the batched write", state)
+		}
+	})
+
+	t.Run("batch with the current version applies", func(t *testing.T) {
+		x, y := geo.blockOrigin(24, 24)
+		version, err := client.ChunkVersion(ctx, 24, 24)
+		if err != nil {
+			t.Fatalf("ChunkVersion: %v", err)
+		}
+		result, err := client.ChunkBatchIfVersion(ctx, 24, 24, version, []BatchOperation{SetOp(x, y, pattern)})
+		if err != nil || !result.OK || result.Version == version {
+			t.Fatalf("ChunkBatchIfVersion: %+v, %v", result, err)
 		}
 	})
 
@@ -784,7 +821,8 @@ func TestIntegrationVersionedMutations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ChunkVersion: %v", err)
 		}
-		if _, err := client.ChunkBatch(ctx, 22, 22, []BatchOperation{SetOp(x, y, pattern)}); err != nil {
+		applied, err := client.ChunkBatch(ctx, 22, 22, []BatchOperation{SetOp(x, y, pattern)})
+		if err != nil {
 			t.Fatalf("ChunkBatch: %v", err)
 		}
 
@@ -792,14 +830,14 @@ func TestIntegrationVersionedMutations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ChunkBatchIfVersion: %v", err)
 		}
-		if result.OK {
-			t.Fatal("a stale version was accepted")
+		if result.OK || result.Version != applied.Version {
+			t.Fatalf("got %+v, want a mismatch reporting version %d", result, applied.Version)
 		}
 
 		// The rejected batch must have left the block untouched.
-		state, err := client.ReadBlock(ctx, x, y)
+		state, err := client.Get(ctx, x, y)
 		if err != nil {
-			t.Fatalf("ReadBlock: %v", err)
+			t.Fatalf("Get: %v", err)
 		}
 		if !state.Exists {
 			t.Fatal("the rejected batch changed the chunk")
@@ -834,34 +872,45 @@ func TestIntegrationDurabilityAndMetrics(t *testing.T) {
 	if !strings.Contains(metrics, "chunkdb_") {
 		t.Fatalf("got metrics without any chunkdb_ series:\n%s", metrics)
 	}
-
-	info, err := client.Info(ctx)
-	if err != nil {
-		t.Fatalf("Info: %v", err)
-	}
-	if info.Values["chunkdb_version"] == "" {
-		t.Fatalf("got INFO without chunkdb_version: %q", info.Raw)
-	}
 }
 
 func TestIntegrationAuthFailure(t *testing.T) {
 	server := startServer(t, serverConfig{})
 
-	_, err := Connect(t.Context(), Options{
-		URI:            strings.Replace(server.uri, testToken, "wrong-token", 1),
-		ConnectTimeout: 5 * time.Second,
-		CommandTimeout: 5 * time.Second,
-	})
-	if !errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v, want ErrAuth", err)
+	cases := map[string]struct {
+		uri  string
+		code string
+	}{
+		"wrong token":   {strings.Replace(server.uri, testToken, "wrong-token", 1), "AUTH_FAILED"},
+		"missing token": {strings.Replace(server.uri, testToken+"@", "", 1), "AUTH_REQUIRED"},
 	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			client, err := NewClient(Options{
+				URI:            testCase.uri,
+				ConnectTimeout: 5 * time.Second,
+				CommandTimeout: 5 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			defer func() { _ = client.Close() }()
 
-	var typed *Error
-	if !errors.As(err, &typed) {
-		t.Fatalf("got %T, want *chunkdb.Error", err)
-	}
-	if typed.ServerCode != "AUTH_FAILED" {
-		t.Fatalf("got server code %q, want AUTH_FAILED", typed.ServerCode)
+			err = client.Connect(t.Context())
+			if !errors.Is(err, ErrAuth) {
+				t.Fatalf("got %v, want ErrAuth", err)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) {
+				t.Fatalf("got %T, want *chunkdb.Error", err)
+			}
+			if typed.ServerCode != testCase.code || typed.Phase != PhaseAuth {
+				t.Fatalf("got code %q phase %q, want %s in phase %s", typed.ServerCode, typed.Phase, testCase.code, PhaseAuth)
+			}
+			if client.ServerInfo() != nil {
+				t.Fatal("a failed handshake left ServerInfo set")
+			}
+		})
 	}
 }
 
@@ -898,8 +947,8 @@ func TestIntegrationPipelining(t *testing.T) {
 		t.Fatalf("got %d values, want %d", len(values), writes)
 	}
 	for i, value := range values {
-		if value != pattern {
-			t.Fatalf("block %d: got %q, want %q", i, value, pattern)
+		if value != (BlockState{Exists: true, Bits: pattern}) {
+			t.Fatalf("block %d: got %+v, want %q", i, value, pattern)
 		}
 	}
 }
@@ -921,15 +970,14 @@ func TestIntegrationPool(t *testing.T) {
 	defer func() { _ = pool.Close() }()
 
 	ctx := t.Context()
-	info, err := pool.Info(ctx)
-	if err != nil {
-		t.Fatalf("Info: %v", err)
+	var geo serverGeometry
+	if err := pool.WithClient(ctx, func(ctx context.Context, client *Client) error {
+		geo = readGeometry(t, client)
+		return client.Ping(ctx)
+	}); err != nil {
+		t.Fatalf("WithClient: %v", err)
 	}
-	blockBits, err := strconv.Atoi(info.Values["block_bits"])
-	if err != nil {
-		t.Fatalf("INFO block_bits: %v", err)
-	}
-	pattern := strings.Repeat("10", blockBits/2)
+	pattern := geo.blockPattern(0)
 
 	var group sync.WaitGroup
 	for i := range 32 {
@@ -944,19 +992,21 @@ func TestIntegrationPool(t *testing.T) {
 	group.Wait()
 
 	for i := range 32 {
-		state, err := pool.ReadBlock(ctx, int64(i), 60)
+		state, err := pool.Get(ctx, int64(i), 60)
 		if err != nil {
-			t.Fatalf("ReadBlock(%d): %v", i, err)
+			t.Fatalf("Get(%d): %v", i, err)
 		}
-		if !state.Exists || state.Bits != pattern {
+		if state != (BlockState{Exists: true, Bits: pattern}) {
 			t.Fatalf("block %d: got %+v, want %q", i, state, pattern)
 		}
 	}
 
-	if err := pool.WithClient(ctx, func(ctx context.Context, client *Client) error {
-		return client.Ping(ctx)
-	}); err != nil {
-		t.Fatalf("WithClient: %v", err)
+	payload := denseBytes(geo.payloadBytes, 4)
+	if _, err := pool.PutChunk(ctx, 3, 3, payload, PutOptions{ZRLE: true}); err != nil {
+		t.Fatalf("PutChunk: %v", err)
+	}
+	if got, err := pool.GetChunk(ctx, 3, 3, GetOptions{ZRLE: true}); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("GetChunk: %v", err)
 	}
 }
 
@@ -978,6 +1028,19 @@ func TestIntegrationTLS(t *testing.T) {
 
 		if err := client.Ping(ctx); err != nil {
 			t.Fatalf("Ping: %v", err)
+		}
+		if info := client.ServerInfo(); info == nil || info.Protocol != 2 {
+			t.Fatalf("got ServerInfo %+v", info)
+		}
+
+		geo := readGeometry(t, client)
+		state := ChunkStateInput{Payload: geo.sparsePayload(1), Presence: allOnes(geo.presenceBytes)}
+		if _, err := client.PutChunkState(ctx, 1, 1, state, PutOptions{ZRLE: true}); err != nil {
+			t.Fatalf("PutChunkState: %v", err)
+		}
+		read, err := client.GetChunkState(ctx, 1, 1, GetOptions{ZRLE: true})
+		if err != nil || !bytes.Equal(read.Payload, state.Payload) || !bytes.Equal(read.Presence, state.Presence) {
+			t.Fatalf("GetChunkState: %v; the state did not round-trip", err)
 		}
 	})
 
@@ -1010,14 +1073,15 @@ func TestIntegrationTLS(t *testing.T) {
 }
 
 func TestIntegrationTables(t *testing.T) {
-	// Up to three connections are open at once.
-	server := startServer(t, serverConfig{workers: 4})
+	// Up to four connections are open at once.
+	server := startServer(t, serverConfig{workers: 6})
 	client := connectIntegration(t, server, nil)
 	ctx := t.Context()
 
 	if client.CurrentTable() != "default" {
 		t.Fatalf("got %q, want default", client.CurrentTable())
 	}
+	defaultGeo := readGeometry(t, client)
 	if err := client.CreateTable(ctx, "terrain", TableSpec{
 		BlockBits: 4, ChunkWidthBlocks: 8, ChunkHeightBlocks: 2,
 		Options: TableOptions{DurabilityMode: "fsync-wal"},
@@ -1043,29 +1107,40 @@ func TestIntegrationTables(t *testing.T) {
 		t.Fatalf("got %+v", info)
 	}
 
-	// A handle is its own connection on the table.
+	// A handle is its own connection on the table, with the table's geometry
+	// from HELLO: 8x2 blocks of 4 bits are 8 payload and 2 presence bytes.
 	terrain, err := client.Table(ctx, "terrain")
 	if err != nil {
 		t.Fatalf("Table: %v", err)
 	}
 	defer terrain.Close()
+	if hello := terrain.ServerInfo(); hello == nil || hello.Table == nil || hello.Table.Name != "terrain" ||
+		hello.Table.StoreID != info.StoreID {
+		t.Fatalf("got ServerInfo %+v", hello)
+	}
+	if geo := readGeometry(t, terrain); geo.payloadBytes != 8 || geo.presenceBytes != 2 {
+		t.Fatalf("got geometry %+v", geo)
+	}
 	if err := terrain.Set(ctx, 1, 1, "1010"); err != nil {
 		t.Fatalf("Set on terrain: %v", err)
 	}
-	if err := client.Set(ctx, 1, 1, "1111000011110000"); err != nil {
+	if err := client.Set(ctx, 1, 1, defaultGeo.blockPattern(0)); err != nil {
 		t.Fatalf("Set on default: %v", err)
 	}
-	if bits, err := terrain.Get(ctx, 1, 1); err != nil || bits != "1010" {
-		t.Fatalf("Get on terrain: %q, %v", bits, err)
+	if block, err := terrain.Get(ctx, 1, 1); err != nil || block != (BlockState{Exists: true, Bits: "1010"}) {
+		t.Fatalf("Get on terrain: %+v, %v", block, err)
 	}
 
-	// Binary sizes follow the table's geometry: 8x2 blocks of 4 bits.
 	payload := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	if err := terrain.SetChunkBin(ctx, 3, 3, payload); err != nil {
-		t.Fatalf("SetChunkBin: %v", err)
+	if _, err := terrain.PutChunk(ctx, 3, 3, payload, PutOptions{}); err != nil {
+		t.Fatalf("PutChunk: %v", err)
 	}
-	if got, err := terrain.ChunkBin(ctx, 3, 3); err != nil || !bytes.Equal(got, payload) {
-		t.Fatalf("ChunkBin: %v, %v", got, err)
+	if got, err := terrain.GetChunk(ctx, 3, 3, GetOptions{}); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("GetChunk: %v, %v", got, err)
+	}
+	// The default table's sizes do not fit terrain.
+	if _, err := terrain.PutChunk(ctx, 3, 3, make([]byte, defaultGeo.payloadBytes), PutOptions{}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want a size error", err)
 	}
 
 	// The URI path selects the table too.
@@ -1074,16 +1149,32 @@ func TestIntegrationTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect by path: %v", err)
 	}
-	if bits, err := byPath.Get(ctx, 1, 1); err != nil || bits != "1010" {
-		t.Fatalf("Get by path: %q, %v", bits, err)
+	if hello := byPath.ServerInfo(); hello.Table == nil || hello.Table.Name != "terrain" {
+		t.Fatalf("got ServerInfo %+v", hello)
+	}
+	if block, err := byPath.Get(ctx, 1, 1); err != nil || block.Bits != "1010" {
+		t.Fatalf("Get by path: %+v, %v", block, err)
 	}
 	_ = byPath.Close()
 
+	// An unknown table fails the handshake.
+	if _, err := Connect(ctx, Options{URI: server.uri, Table: "nope"}); !errors.As(err, &serverErr) ||
+		serverErr.ServerCode != CodeNoTable {
+		t.Fatalf("got %v, want %s for an unknown table", err, CodeNoTable)
+	}
+
+	// Use switches the table and its geometry.
 	if _, err := client.Use(ctx, "terrain"); err != nil {
 		t.Fatalf("Use: %v", err)
 	}
-	if bits, err := client.Get(ctx, 1, 1); err != nil || bits != "1010" {
-		t.Fatalf("Get after Use: %q, %v", bits, err)
+	if block, err := client.Get(ctx, 1, 1); err != nil || block.Bits != "1010" {
+		t.Fatalf("Get after Use: %+v, %v", block, err)
+	}
+	if got, err := client.GetChunk(ctx, 3, 3, GetOptions{ZRLE: true}); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("GetChunk after Use: %v, %v", got, err)
+	}
+	if _, err := client.PutChunkState(ctx, 4, 4, ChunkStateInput{Payload: payload, Presence: []byte{0xff, 0xff}}, PutOptions{}); err != nil {
+		t.Fatalf("PutChunkState after Use: %v", err)
 	}
 	if err := client.SetTableOptions(ctx, "terrain", TableOptions{CheckpointUpdates: 3}); err != nil {
 		t.Fatalf("SetTableOptions: %v", err)
@@ -1105,5 +1196,87 @@ func TestIntegrationTables(t *testing.T) {
 	if _, err := Connect(ctx, Options{URI: sky}); !errors.As(err, &serverErr) ||
 		serverErr.ServerCode != CodeNoTable {
 		t.Fatalf("got %v, want %s for a dropped table in the URI", err, CodeNoTable)
+	}
+
+	// Without a default table, a connection that names none has no table
+	// until Use selects one.
+	if err := client.CreateTable(ctx, "sea", TableSpec{BlockBits: 8}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	if err := client.DropTable(ctx, "default"); err != nil {
+		t.Fatalf("DropTable default: %v", err)
+	}
+	bare := connectIntegration(t, server, nil)
+	if hello := bare.ServerInfo(); hello == nil || hello.Table != nil {
+		t.Fatalf("got ServerInfo %+v, want no table", hello)
+	}
+	if _, err := bare.GetChunk(ctx, 0, 0, GetOptions{}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want a request error without a table", err)
+	}
+	if _, err := bare.Use(ctx, "sea"); err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+	if got, err := bare.GetChunk(ctx, 0, 0, GetOptions{}); err != nil || len(got) != 16*16 {
+		t.Fatalf("GetChunk after Use: %d bytes, %v", len(got), err)
+	}
+}
+
+// Use while chunk writes are pipelined: each write runs entirely on the old
+// or the new table, so it either succeeds or fails the client-side size
+// check; none reaches the server framed for the wrong table, which would
+// make it close the connection under every request in flight.
+func TestIntegrationUseIsExclusiveWithPipelinedChunkWrites(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.PipelineDepth = 8 })
+	ctx := t.Context()
+	if err := client.CreateTable(ctx, "small", TableSpec{BlockBits: 1, ChunkWidthBlocks: 2, ChunkHeightBlocks: 2}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	payload := make([]byte, readGeometry(t, client).payloadBytes)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	const writers = 8
+	var group sync.WaitGroup
+	stop := make(chan struct{})
+	errs := make(chan error, 1024)
+	for w := range writers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for i := int64(0); ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := client.PutChunk(ctx, int64(w), i%16, payload, PutOptions{}); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	for round := range 20 {
+		table := "small"
+		if round%2 == 1 {
+			table = "default"
+		}
+		if _, err := client.Use(ctx, table); err != nil {
+			t.Fatalf("Use(%s): %v", table, err)
+		}
+	}
+	close(stop)
+	group.Wait()
+	close(errs)
+
+	for err := range errs {
+		var typed *Error
+		if !errors.As(err, &typed) || typed.Phase != PhaseRequest {
+			t.Fatalf("a pipelined write failed with %v, want only client-side size errors", err)
+		}
+	}
+	if err := client.Ping(ctx); err != nil {
+		t.Fatalf("Ping after the switches: %v", err)
 	}
 }

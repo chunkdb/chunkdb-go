@@ -2,18 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
-This client follows [Semantic Versioning](https://semver.org/) and targets the
-stable `chunkdb` 1.x protocol; see the engine's
+This client follows [Semantic Versioning](https://semver.org/). Version 1.x
+speaks the `chunkdb` 1.x protocol, version 2.x speaks protocol 2 (chunkdb
+2.0); see the engine's
 [compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
 
 ## Unreleased
+
+### Breaking
+- The module path is `github.com/chunkdb/chunkdb-go/v2`
+- Protocol 2 (chunkdb 2.0). Every connection starts with `HELLO 2`, carrying
+  the token and the table; a 1.x server is refused with an `ErrProtocol`
+  error. The reply is available as `ServerInfo()`, a `HelloInfo` (server
+  version, capabilities, limits, table geometry and options). A wrong or
+  missing token fails `Connect` with `ErrAuth` (`AUTH_FAILED` /
+  `AUTH_REQUIRED`), an unknown table with `CodeNoTable`. Removed: `Auth` and
+  `Options.DisableAutoAuth`
+- `Get` returns a `BlockState` (`Exists` false for an unset block) and `MGet`
+  a `[]BlockState`; `ReadBlock` and `Exists` are removed
+- chunks are binary only. `GetChunk` / `GetChunkState` replace `Chunk`,
+  `ReadChunk`, `ChunkBin`, `ChunkBinState`, `ChunkBinCompressed` and
+  `ChunkBinStateCompressed`; `PutChunk` / `PutChunkState` replace `SetChunk`,
+  `SetChunkState`, `SetChunkBin`, `SetChunkBinState` and
+  `ChunkCompareAndSet` (`PutOptions.IfVersion`). `ChunkState` and
+  `ChunkStateInput` hold `Payload` / `Presence` bytes. `GetOptions.ZRLE` and
+  `PutOptions.ZRLE` compress a read or write on the wire. Writes return a
+  `MutationResult`
+- `ChunkRange` / `ChunkRadius` take `GetOptions`, and `RangeEntry` holds
+  `Payload` / `Presence` bytes instead of bit strings
+- chunk sizes come from the connection's table (`HELLO`, `Use`) instead of
+  `INFO`; without a table, the chunk methods fail until `Use` selects one
+- `ReadFrame` returns `FrameNull` frames for `$-1`, and `Frame.Array` holds
+  frames (`FrameBulk` or `FrameNull`) instead of byte slices
+- `Pool` mirrors the new methods and drops the removed ones
 
 ### Added
 - Tables (chunkdb 2.0+): `CreateTable`, `DropTable`, `Tables`, `TableInfo`,
   `SetTableOptions` and `Use`, with the `TableSpec`, `TableOptions` and
   `TableInfo` types; `Table(ctx, name)` returns a new client on a table.
   `Options.Table` or the URI path (`chunk://host:4242/terrain`) selects the
-  table at connect, and every reconnect selects it again; `Pool` clients use
+  table at connect, and every reconnect names it again; `Pool` clients use
   the pool's table. `URI()` reports the selected table as its path,
   `CurrentTable()` reports it, and `URI.Table` / `TableFromPath` parse it.
   `CodeNoTable` and `CodeTableExists` name the new server error codes. Chunk

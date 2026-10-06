@@ -7,47 +7,6 @@ import (
 	"strings"
 )
 
-// Auth authenticates the connection. An empty token uses the token configured
-// in [Options]; the client sends AUTH automatically after connecting unless
-// [Options.DisableAutoAuth] is set.
-func (c *Client) Auth(ctx context.Context, token string) error {
-	release, err := c.acquireSlot(ctx, "AUTH")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	if token == "" {
-		token = c.opts.token()
-	}
-	if token == "" {
-		return &Error{
-			Kind:          KindAuth,
-			Phase:         PhaseAuth,
-			Command:       "AUTH",
-			Message:       "server error " + codeAuthFailed + ": token is required",
-			ServerCode:    codeAuthFailed,
-			ServerMessage: "token is required",
-		}
-	}
-
-	frame, err := c.exec(ctx, "AUTH", token)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "AUTH")
-}
-
-// authOn authenticates a connection that has not been published yet, so it
-// bypasses the pipeline slots held by the request that triggered the dial.
-func (c *Client) authOn(ctx context.Context, established *conn, token string) error {
-	frame, err := c.execOn(ctx, established, "AUTH", token)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "AUTH")
-}
-
 // Ping checks liveness of the connection.
 func (c *Client) Ping(ctx context.Context) error {
 	release, err := c.acquireSlot(ctx, "PING")
@@ -70,7 +29,8 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Info returns the server's configuration and runtime counters.
+// Info returns runtime statistics of the selected table. Geometry and options
+// come from [Client.ServerInfo], [Client.Use] and [Client.TableInfo].
 func (c *Client) Info(ctx context.Context) (Info, error) {
 	release, err := c.acquireSlot(ctx, "INFO")
 	if err != nil {
@@ -89,76 +49,24 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 	return Info{Raw: string(payload), Values: ParseInfo(payload)}, nil
 }
 
-// Get reads one block as bit text. An unset block reads back as zero bits; use
-// [Client.ReadBlock] to tell the two apart in one call.
-func (c *Client) Get(ctx context.Context, x, y int64) (string, error) {
+// Get reads one block. An unset block reports Exists false; an explicitly
+// stored all-zero block reports Exists true.
+func (c *Client) Get(ctx context.Context, x, y int64) (BlockState, error) {
 	release, err := c.acquireSlot(ctx, "GET")
 	if err != nil {
-		return "", err
+		return BlockState{}, err
 	}
 	defer release()
 
 	frame, err := c.exec(ctx, "GET", coord(x), coord(y))
 	if err != nil {
-		return "", err
+		return BlockState{}, err
 	}
-	payload, err := expectBulk(frame, "GET")
-	if err != nil {
-		return "", err
-	}
-	return string(payload), nil
+	return blockState(frame, "GET")
 }
 
-// ReadBlock reads one block along with its presence. It is the preferred
-// high-level read: an unset block reports Exists false, while an explicitly
-// stored all-zero block reports Exists true.
-func (c *Client) ReadBlock(ctx context.Context, x, y int64) (BlockState, error) {
-	release, err := c.acquireSlot(ctx, "READBLOCK")
-	if err != nil {
-		return BlockState{}, err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "EXISTS", coord(x), coord(y))
-	if err != nil {
-		return BlockState{}, err
-	}
-	present, err := expectBool(frame, "EXISTS")
-	if err != nil {
-		return BlockState{}, err
-	}
-	if !present {
-		return BlockState{}, nil
-	}
-
-	frame, err = c.exec(ctx, "GET", coord(x), coord(y))
-	if err != nil {
-		return BlockState{}, err
-	}
-	payload, err := expectBulk(frame, "GET")
-	if err != nil {
-		return BlockState{}, err
-	}
-	return BlockState{Exists: true, Bits: string(payload)}, nil
-}
-
-// Exists reports whether a block is explicitly present.
-func (c *Client) Exists(ctx context.Context, x, y int64) (bool, error) {
-	release, err := c.acquireSlot(ctx, "EXISTS")
-	if err != nil {
-		return false, err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "EXISTS", coord(x), coord(y))
-	if err != nil {
-		return false, err
-	}
-	return expectBool(frame, "EXISTS")
-}
-
-// Set writes one block. bits must contain only 0 and 1 and match the server's
-// configured block_bits.
+// Set writes one block. bits must contain only 0 and 1 and match the table's
+// block_bits.
 func (c *Client) Set(ctx context.Context, x, y int64, bits string) error {
 	release, err := c.acquireSlot(ctx, "SET")
 	if err != nil {
@@ -176,8 +84,8 @@ func (c *Client) Set(ctx context.Context, x, y int64, bits string) error {
 	return expectOK(frame, "SET")
 }
 
-// Unset clears explicit presence for one block. Later reads still return zero
-// bits.
+// Unset clears explicit presence for one block; a later [Client.Get] reports
+// it unset.
 func (c *Client) Unset(ctx context.Context, x, y int64) error {
 	release, err := c.acquireSlot(ctx, "UNSET")
 	if err != nil {
@@ -222,9 +130,9 @@ func (c *Client) MSet(ctx context.Context, blocks []Block) error {
 	return expectOK(frame, "MSET")
 }
 
-// MGet reads many blocks in one round-trip, returning one bit string per
+// MGet reads many blocks in one round-trip, returning one [BlockState] per
 // requested block in request order.
-func (c *Client) MGet(ctx context.Context, blocks []BlockRef) ([]string, error) {
+func (c *Client) MGet(ctx context.Context, blocks []BlockRef) ([]BlockState, error) {
 	release, err := c.acquireSlot(ctx, "MGET")
 	if err != nil {
 		return nil, err
@@ -232,7 +140,7 @@ func (c *Client) MGet(ctx context.Context, blocks []BlockRef) ([]string, error) 
 	defer release()
 
 	if len(blocks) == 0 {
-		return []string{}, nil
+		return []BlockState{}, nil
 	}
 	args := make([]string, 0, len(blocks)*2)
 	for _, block := range blocks {
@@ -247,12 +155,19 @@ func (c *Client) MGet(ctx context.Context, blocks []BlockRef) ([]string, error) 
 	if err != nil {
 		return nil, err
 	}
-
-	values := make([]string, 0, len(items))
-	for _, item := range items {
-		values = append(values, string(item))
+	if len(items) != len(blocks) {
+		return nil, protocolErrorf("MGET", "MGET returned %d items for %d blocks", len(items), len(blocks))
 	}
-	return values, nil
+
+	states := make([]BlockState, 0, len(items))
+	for _, item := range items {
+		state, err := blockState(item, "MGET")
+		if err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, nil
 }
 
 // ChunkExists reports whether any block in the chunk is explicitly present.
@@ -270,245 +185,143 @@ func (c *Client) ChunkExists(ctx context.Context, cx, cy int64) (bool, error) {
 	return expectBool(frame, "CHUNKEXISTS")
 }
 
-// ReadChunk reads the exact chunk state. It is the preferred high-level chunk
-// read.
-func (c *Client) ReadChunk(ctx context.Context, cx, cy int64) (ChunkState, error) {
-	release, err := c.acquireSlot(ctx, "CHUNK")
+// GetChunk reads the chunk's packed block payload (see [ChunkState] for the
+// layout). An absent chunk reads as zeros; use [Client.GetChunkState] or
+// [Client.ChunkExists] to tell it from an all-zero chunk.
+func (c *Client) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([]byte, error) {
+	release, err := c.acquireSlot(ctx, "CHUNKGET")
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	established, geo, err := c.chunkConnection(ctx, "CHUNKGET")
+	if err != nil {
+		return nil, err
+	}
+	args := []string{coord(cx), coord(cy)}
+	if opts.ZRLE {
+		args = append(args, "ZRLE")
+	}
+	frame, err := c.execOn(ctx, established, "CHUNKGET", args...)
+	if err != nil {
+		return nil, err
+	}
+	body, err := expectBulk(frame, "CHUNKGET")
+	if err != nil {
+		return nil, err
+	}
+	return decodeChunkBytes(body, geo.payloadBytes, opts.ZRLE, "CHUNKGET")
+}
+
+// GetChunkState reads the chunk's payload and presence bitmap. An absent chunk
+// reports Exists false with zero payload and presence.
+func (c *Client) GetChunkState(ctx context.Context, cx, cy int64, opts GetOptions) (ChunkState, error) {
+	release, err := c.acquireSlot(ctx, "CHUNKGET")
 	if err != nil {
 		return ChunkState{}, err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "CHUNK", coord(cx), coord(cy), "STATE")
+	established, geo, err := c.chunkConnection(ctx, "CHUNKGET")
 	if err != nil {
 		return ChunkState{}, err
 	}
-	payload, err := expectBulk(frame, "CHUNK")
+	args := []string{coord(cx), coord(cy), "STATE"}
+	if opts.ZRLE {
+		args = append(args, "ZRLE")
+	}
+	frame, err := c.execOn(ctx, established, "CHUNKGET", args...)
 	if err != nil {
 		return ChunkState{}, err
 	}
-	bits, presence, err := parseChunkStateText(string(payload), "CHUNK")
+	body, err := expectBulk(frame, "CHUNKGET")
 	if err != nil {
 		return ChunkState{}, err
 	}
-	return ChunkState{
-		Exists:   strings.ContainsRune(presence, '1'),
-		Bits:     bits,
-		Presence: presence,
-	}, nil
+	state, err := decodeChunkBytes(body, geo.stateBytes(), opts.ZRLE, "CHUNKGET")
+	if err != nil {
+		return ChunkState{}, err
+	}
+	payload, presence := splitChunkState(state, geo)
+	return ChunkState{Exists: anyBitSet(presence), Payload: payload, Presence: presence}, nil
 }
 
-// Chunk reads the full chunk payload as bit text. Absent chunks and unset
-// blocks read back as zero bits.
-func (c *Client) Chunk(ctx context.Context, cx, cy int64) (string, error) {
-	release, err := c.acquireSlot(ctx, "CHUNK")
+// PutChunk replaces the chunk's payload; every block becomes explicitly
+// present, including in an all-zero payload. payload must have exactly the
+// table's chunk payload size.
+//
+// With [PutOptions.IfVersion], a version mismatch is not an error: the result
+// has OK false and the chunk's current version, and the chunk is unchanged.
+func (c *Client) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opts PutOptions) (MutationResult, error) {
+	release, err := c.acquireSlot(ctx, "CHUNKPUT")
 	if err != nil {
-		return "", err
+		return MutationResult{}, err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "CHUNK", coord(cx), coord(cy))
+	established, geo, err := c.chunkConnection(ctx, "CHUNKPUT")
 	if err != nil {
-		return "", err
+		return MutationResult{}, err
 	}
-	payload, err := expectBulk(frame, "CHUNK")
-	if err != nil {
-		return "", err
+	if len(payload) != geo.payloadBytes {
+		return MutationResult{}, requestErrorf("CHUNKPUT", "CHUNKPUT payload must be %d bytes, got %d", geo.payloadBytes, len(payload))
 	}
-	return string(payload), nil
+	return c.putChunkBytes(ctx, established, cx, cy, payload, false, opts)
 }
 
-// SetChunk replaces the full chunk payload and marks the whole chunk present,
-// including an all-zero payload.
-func (c *Client) SetChunk(ctx context.Context, cx, cy int64, bits string) error {
-	release, err := c.acquireSlot(ctx, "CHUNKSET")
+// PutChunkState replaces the chunk's payload and presence bitmap; payload bits
+// of absent blocks are stored as zero, and an all-zero presence bitmap leaves
+// the chunk absent. Both parts must have exactly the table's sizes.
+// [PutOptions.IfVersion] works as for [Client.PutChunk].
+func (c *Client) PutChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput, opts PutOptions) (MutationResult, error) {
+	release, err := c.acquireSlot(ctx, "CHUNKPUT")
 	if err != nil {
-		return err
+		return MutationResult{}, err
 	}
 	defer release()
 
-	if !isBitString(bits) {
-		return requestErrorf("CHUNKSET", "CHUNKSET bits must contain only 0 and 1")
-	}
-	frame, err := c.exec(ctx, "CHUNKSET", coord(cx), coord(cy), bits)
+	established, geo, err := c.chunkConnection(ctx, "CHUNKPUT")
 	if err != nil {
-		return err
+		return MutationResult{}, err
 	}
-	return expectOK(frame, "CHUNKSET")
+	if len(state.Payload) != geo.payloadBytes {
+		return MutationResult{}, requestErrorf("CHUNKPUT", "CHUNKPUT STATE payload must be %d bytes, got %d", geo.payloadBytes, len(state.Payload))
+	}
+	if len(state.Presence) != geo.presenceBytes {
+		return MutationResult{}, requestErrorf("CHUNKPUT", "CHUNKPUT STATE presence must be %d bytes, got %d", geo.presenceBytes, len(state.Presence))
+	}
+	bytes := make([]byte, 0, geo.stateBytes())
+	bytes = append(bytes, state.Payload...)
+	bytes = append(bytes, state.Presence...)
+	return c.putChunkBytes(ctx, established, cx, cy, bytes, true, opts)
 }
 
-// SetChunkState replaces the full chunk payload and its per-block presence
-// bitmap in one request.
-func (c *Client) SetChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput) error {
-	release, err := c.acquireSlot(ctx, "CHUNKSET")
-	if err != nil {
-		return err
+// putChunkBytes sends CHUNKPUT. The server refuses a header it cannot parse
+// without reading the bytes and closes the connection, so every argument is
+// checked before anything is sent.
+func (c *Client) putChunkBytes(ctx context.Context, established *conn, cx, cy int64, bytes []byte, state bool, opts PutOptions) (MutationResult, error) {
+	args := []string{coord(cx), coord(cy)}
+	if state {
+		args = append(args, "STATE")
 	}
-	defer release()
+	body := bytes
+	if opts.ZRLE {
+		if compressed := ZRLECompress(bytes); len(compressed) < len(bytes) {
+			body = compressed
+			args = append(args, "ZRLE")
+		}
+	}
+	if opts.IfVersion != nil {
+		args = append(args, "IF", strconv.FormatUint(*opts.IfVersion, 10))
+	}
+	args = append(args, strconv.Itoa(len(body)))
 
-	if !isBitString(state.Bits) {
-		return requestErrorf("CHUNKSET", "CHUNKSET STATE payload bits must contain only 0 and 1")
-	}
-	if !isBitString(state.Presence) {
-		return requestErrorf("CHUNKSET", "CHUNKSET STATE presence bits must contain only 0 and 1")
-	}
-
-	geo, err := c.chunkGeometry(ctx)
+	frame, err := c.execPayloadOn(ctx, established, body, "CHUNKPUT", args...)
 	if err != nil {
-		return err
+		return mutationFromError(err, "CHUNKPUT")
 	}
-	if len(state.Bits) != geo.chunkPayloadBits {
-		return requestErrorf("CHUNKSET", "CHUNKSET STATE payload bits must be %d bits", geo.chunkPayloadBits)
-	}
-	if len(state.Presence) != geo.chunkBlockCount {
-		return requestErrorf("CHUNKSET", "CHUNKSET STATE presence bits must be %d bits", geo.chunkBlockCount)
-	}
-
-	frame, err := c.exec(ctx, "CHUNKSET", coord(cx), coord(cy), "STATE", state.Bits+"|"+state.Presence)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "CHUNKSET")
-}
-
-// SetChunkBin replaces the full chunk payload from raw packed bytes, the
-// layout [Client.ChunkBin] returns, and marks every block present. The server
-// must support CHUNKSETBIN (chunkdb 1.3+).
-func (c *Client) SetChunkBin(ctx context.Context, cx, cy int64, payload []byte) error {
-	release, err := c.acquireSlot(ctx, "CHUNKSETBIN")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	geo, err := c.chunkGeometry(ctx)
-	if err != nil {
-		return err
-	}
-	if len(payload) != geo.chunkPayloadBytes {
-		return requestErrorf("CHUNKSETBIN", "CHUNKSETBIN payload must be %d bytes", geo.chunkPayloadBytes)
-	}
-	frame, err := c.execPayload(ctx, payload, "CHUNKSETBIN", coord(cx), coord(cy), strconv.Itoa(len(payload)))
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "CHUNKSETBIN")
-}
-
-// SetChunkBinState replaces the full chunk payload and presence bitmap from
-// raw bytes laid out as [payload bytes][presence bytes], the layout
-// [Client.ChunkBinState] returns. The server must support CHUNKSETBIN
-// (chunkdb 1.3+).
-func (c *Client) SetChunkBinState(ctx context.Context, cx, cy int64, state []byte) error {
-	release, err := c.acquireSlot(ctx, "CHUNKSETBIN")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	geo, err := c.chunkGeometry(ctx)
-	if err != nil {
-		return err
-	}
-	expected := geo.chunkPayloadBytes + geo.presenceBytes
-	if len(state) != expected {
-		return requestErrorf("CHUNKSETBIN", "CHUNKSETBIN STATE payload must be %d bytes", expected)
-	}
-	frame, err := c.execPayload(ctx, state, "CHUNKSETBIN", coord(cx), coord(cy), "STATE", strconv.Itoa(len(state)))
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "CHUNKSETBIN")
-}
-
-// ChunkBin reads the full chunk payload as raw packed bytes.
-func (c *Client) ChunkBin(ctx context.Context, cx, cy int64) ([]byte, error) {
-	release, err := c.acquireSlot(ctx, "CHUNKBIN")
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "CHUNKBIN", coord(cx), coord(cy))
-	if err != nil {
-		return nil, err
-	}
-	return expectBulk(frame, "CHUNKBIN")
-}
-
-// ChunkBinState reads the exact chunk state as raw bytes, laid out as
-// [payload bytes][presence bytes].
-func (c *Client) ChunkBinState(ctx context.Context, cx, cy int64) ([]byte, error) {
-	release, err := c.acquireSlot(ctx, "CHUNKBIN")
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-
-	geo, err := c.chunkGeometry(ctx)
-	if err != nil {
-		return nil, err
-	}
-	frame, err := c.exec(ctx, "CHUNKBIN", coord(cx), coord(cy), "STATE")
-	if err != nil {
-		return nil, err
-	}
-	payload, err := expectBulk(frame, "CHUNKBIN")
-	if err != nil {
-		return nil, err
-	}
-	if len(payload) != geo.chunkPayloadBytes+geo.presenceBytes {
-		return nil, protocolErrorf("CHUNKBIN", "unexpected CHUNKBIN STATE payload length")
-	}
-	return payload, nil
-}
-
-// ChunkBinCompressed reads the same payload as [Client.ChunkBin], transferred
-// compressed and decompressed client-side.
-func (c *Client) ChunkBinCompressed(ctx context.Context, cx, cy int64) ([]byte, error) {
-	release, err := c.acquireSlot(ctx, "CHUNKBINC")
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-
-	geo, err := c.chunkGeometry(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return c.chunkBinCompressed(ctx, geo.chunkPayloadBytes, coord(cx), coord(cy))
-}
-
-// ChunkBinStateCompressed reads the same payload as [Client.ChunkBinState],
-// transferred compressed and decompressed client-side.
-func (c *Client) ChunkBinStateCompressed(ctx context.Context, cx, cy int64) ([]byte, error) {
-	release, err := c.acquireSlot(ctx, "CHUNKBINC")
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-
-	geo, err := c.chunkGeometry(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return c.chunkBinCompressed(ctx, geo.chunkPayloadBytes+geo.presenceBytes, coord(cx), coord(cy), "STATE")
-}
-
-func (c *Client) chunkBinCompressed(ctx context.Context, expectedSize int, args ...string) ([]byte, error) {
-	frame, err := c.exec(ctx, "CHUNKBINC", args...)
-	if err != nil {
-		return nil, err
-	}
-	payload, err := expectBulk(frame, "CHUNKBINC")
-	if err != nil {
-		return nil, err
-	}
-	decompressed, err := ZRLEDecompress(payload, expectedSize)
-	if err != nil {
-		return nil, protocolErrorf("CHUNKBINC", "invalid CHUNKBINC payload: %s", err)
-	}
-	return decompressed, nil
+	return mutationFromFrame(frame, "CHUNKPUT")
 }
 
 // ChunkScan enumerates populated chunks in ascending (cx, cy) order. limit must
@@ -540,7 +353,16 @@ func (c *Client) ChunkScan(ctx context.Context, limit int, cursor *CoordPair) (S
 
 	result := ScanResult{Coords: make([]CoordPair, 0, len(items)-1)}
 
-	header := string(items[0])
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		text, err := bulkText(item, "CHUNKSCAN")
+		if err != nil {
+			return ScanResult{}, err
+		}
+		texts = append(texts, text)
+	}
+
+	header := texts[0]
 	if rest, found := strings.CutPrefix(header, "CURSOR "); found {
 		cx, cy, err := parseCoordPair(rest, "CHUNKSCAN")
 		if err != nil {
@@ -551,8 +373,8 @@ func (c *Client) ChunkScan(ctx context.Context, limit int, cursor *CoordPair) (S
 		return ScanResult{}, protocolErrorf("CHUNKSCAN", "unexpected CHUNKSCAN header: %s", header)
 	}
 
-	for _, item := range items[1:] {
-		cx, cy, err := parseCoordPair(string(item), "CHUNKSCAN")
+	for _, item := range texts[1:] {
+		cx, cy, err := parseCoordPair(item, "CHUNKSCAN")
 		if err != nil {
 			return ScanResult{}, protocolErrorf("CHUNKSCAN", "unexpected CHUNKSCAN entry: %s", item)
 		}
@@ -561,36 +383,77 @@ func (c *Client) ChunkScan(ctx context.Context, limit int, cursor *CoordPair) (S
 	return result, nil
 }
 
-// ChunkRange reads a bounded rectangle of chunks, at most 256 chunks and 64 MiB
-// per request. Only populated chunks are returned.
-func (c *Client) ChunkRange(ctx context.Context, cx0, cy0, cx1, cy1 int64) ([]RangeEntry, error) {
+// ChunkRange reads the populated chunks in a rectangle, with their payload and
+// presence, ordered by ascending cx then cy. A request may cover at most
+// [HelloInfo.MaxAreaChunks] chunks (256) and its response is capped at
+// [HelloInfo.MaxResponseBytes] (64 MiB).
+func (c *Client) ChunkRange(ctx context.Context, cx0, cy0, cx1, cy1 int64, opts GetOptions) ([]RangeEntry, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKRANGE")
 	if err != nil {
 		return nil, err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "CHUNKRANGE", coord(cx0), coord(cy0), coord(cx1), coord(cy1))
-	if err != nil {
-		return nil, err
-	}
-	return parseRangeEntries(frame, "CHUNKRANGE")
+	return c.readArea(ctx, "CHUNKRANGE", opts, coord(cx0), coord(cy0), coord(cx1), coord(cy1))
 }
 
-// ChunkRadius reads the populated chunks within radiusChunks of (cx, cy), under
-// the same limits as [Client.ChunkRange].
-func (c *Client) ChunkRadius(ctx context.Context, cx, cy int64, radiusChunks int) ([]RangeEntry, error) {
+// ChunkRadius reads the populated chunks whose coordinate lies within
+// radiusChunks of (cx, cy), under the same limits and with the same result as
+// [Client.ChunkRange].
+func (c *Client) ChunkRadius(ctx context.Context, cx, cy int64, radiusChunks int, opts GetOptions) ([]RangeEntry, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKRADIUS")
 	if err != nil {
 		return nil, err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "CHUNKRADIUS", coord(cx), coord(cy), strconv.Itoa(radiusChunks))
+	return c.readArea(ctx, "CHUNKRADIUS", opts, coord(cx), coord(cy), strconv.Itoa(radiusChunks))
+}
+
+// readArea runs CHUNKRANGE or CHUNKRADIUS, always with STATE. The reply holds
+// two items per chunk: "<cx> <cy>", then the chunk bytes.
+func (c *Client) readArea(ctx context.Context, command string, opts GetOptions, args ...string) ([]RangeEntry, error) {
+	established, geo, err := c.chunkConnection(ctx, command)
 	if err != nil {
 		return nil, err
 	}
-	return parseRangeEntries(frame, "CHUNKRADIUS")
+	args = append(args, "STATE")
+	if opts.ZRLE {
+		args = append(args, "ZRLE")
+	}
+	frame, err := c.execOn(ctx, established, command, args...)
+	if err != nil {
+		return nil, err
+	}
+	items, err := expectArray(frame, command)
+	if err != nil {
+		return nil, err
+	}
+	if len(items)%2 != 0 {
+		return nil, protocolErrorf(command, "%s returned an odd number of items", command)
+	}
+
+	entries := make([]RangeEntry, 0, len(items)/2)
+	for i := 0; i < len(items); i += 2 {
+		text, err := bulkText(items[i], command)
+		if err != nil {
+			return nil, err
+		}
+		cx, cy, err := parseCoordPair(text, command)
+		if err != nil {
+			return nil, err
+		}
+		if items[i+1].Kind != FrameBulk {
+			return nil, protocolErrorf(command, "%s returned a null chunk", command)
+		}
+		state, err := decodeChunkBytes(items[i+1].Bulk, geo.stateBytes(), opts.ZRLE, command)
+		if err != nil {
+			return nil, err
+		}
+		payload, presence := splitChunkState(state, geo)
+		entries = append(entries, RangeEntry{CX: cx, CY: cy, Payload: payload, Presence: presence})
+	}
+	return entries, nil
 }
 
 // ChunkVersion returns the chunk's opaque version token.
@@ -612,43 +475,20 @@ func (c *Client) ChunkVersion(ctx context.Context, cx, cy int64) (uint64, error)
 	return parseVersion(string(payload), "CHUNKVER")
 }
 
-// ChunkCompareAndSet replaces the full chunk state only if the chunk still has
-// expectedVersion.
-//
-// On a mismatch the returned result has OK false and carries the current
-// version; the stored state is unchanged. Re-read, reconcile, and retry.
-func (c *Client) ChunkCompareAndSet(ctx context.Context, cx, cy int64, expectedVersion uint64, state ChunkStateInput) (MutationResult, error) {
-	release, err := c.acquireSlot(ctx, "CHUNKCAS")
-	if err != nil {
-		return MutationResult{}, err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "CHUNKCAS",
-		coord(cx), coord(cy),
-		strconv.FormatUint(expectedVersion, 10),
-		"STATE", state.Bits+"|"+state.Presence,
-	)
-	if err != nil {
-		return mutationFromError(err, "CHUNKCAS")
-	}
-	return mutationFromFrame(frame, "CHUNKCAS")
-}
-
 // ChunkBatch applies an atomic batch of block operations to one chunk,
 // unconditionally. Every coordinate must lie inside chunk (cx, cy).
 func (c *Client) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation) (MutationResult, error) {
-	return c.chunkBatch(ctx, cx, cy, "-", operations)
+	return c.chunkBatch(ctx, cx, cy, nil, operations)
 }
 
 // ChunkBatchIfVersion is [Client.ChunkBatch] conditioned on the chunk still
 // having expectedVersion. On a mismatch the returned result has OK false and
 // carries the current version; the chunk is unchanged.
 func (c *Client) ChunkBatchIfVersion(ctx context.Context, cx, cy int64, expectedVersion uint64, operations []BatchOperation) (MutationResult, error) {
-	return c.chunkBatch(ctx, cx, cy, strconv.FormatUint(expectedVersion, 10), operations)
+	return c.chunkBatch(ctx, cx, cy, &expectedVersion, operations)
 }
 
-func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, version string, operations []BatchOperation) (MutationResult, error) {
+func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, ifVersion *uint64, operations []BatchOperation) (MutationResult, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKBATCH")
 	if err != nil {
 		return MutationResult{}, err
@@ -659,8 +499,11 @@ func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, version string, o
 		return MutationResult{}, requestErrorf("CHUNKBATCH", "chunk batch requires at least one operation")
 	}
 
-	args := make([]string, 0, 3+len(operations)*4)
-	args = append(args, coord(cx), coord(cy), version)
+	args := make([]string, 0, 4+len(operations)*4)
+	args = append(args, coord(cx), coord(cy))
+	if ifVersion != nil {
+		args = append(args, "IF", strconv.FormatUint(*ifVersion, 10))
+	}
 	for _, operation := range operations {
 		switch operation.Type {
 		case BatchSet:
@@ -740,11 +583,31 @@ func expectBulk(frame Frame, command string) ([]byte, error) {
 	return frame.Bulk, nil
 }
 
-func expectArray(frame Frame, command string) ([][]byte, error) {
+func expectArray(frame Frame, command string) ([]Frame, error) {
 	if frame.Kind != FrameArray {
 		return nil, protocolErrorf(command, "expected array response for %s", command)
 	}
 	return frame.Array, nil
+}
+
+// bulkText reads a bulk array item as text; a null item is a protocol error.
+func bulkText(item Frame, command string) (string, error) {
+	if item.Kind != FrameBulk {
+		return "", protocolErrorf(command, "unexpected null item in %s response", command)
+	}
+	return string(item.Bulk), nil
+}
+
+// blockState reads a GET reply or MGET item: bit text, or null when unset.
+func blockState(frame Frame, command string) (BlockState, error) {
+	switch frame.Kind {
+	case FrameNull:
+		return BlockState{}, nil
+	case FrameBulk:
+		return BlockState{Exists: true, Bits: string(frame.Bulk)}, nil
+	default:
+		return BlockState{}, protocolErrorf(command, "expected bulk or null response for %s", command)
+	}
 }
 
 func expectOK(frame Frame, command string) error {
@@ -771,55 +634,6 @@ func expectBool(frame Frame, command string) (bool, error) {
 	default:
 		return false, protocolErrorf(command, "unexpected %s response: %s", command, text)
 	}
-}
-
-// parseChunkStateText splits a "<payload_bits>|<presence_bits>" payload.
-func parseChunkStateText(text, command string) (bits, presence string, err error) {
-	separator := strings.IndexByte(text, '|')
-	if separator <= 0 || separator != strings.LastIndexByte(text, '|') || separator == len(text)-1 {
-		return "", "", protocolErrorf(command, "unexpected %s STATE payload", command)
-	}
-	bits, presence = text[:separator], text[separator+1:]
-	if !isBitString(bits) || !isBitString(presence) {
-		return "", "", protocolErrorf(command, "unexpected %s STATE payload", command)
-	}
-	return bits, presence, nil
-}
-
-func parseRangeEntries(frame Frame, command string) ([]RangeEntry, error) {
-	items, err := expectArray(frame, command)
-	if err != nil {
-		return nil, err
-	}
-
-	entries := make([]RangeEntry, 0, len(items))
-	for _, item := range items {
-		text := string(item)
-		firstSpace := strings.IndexByte(text, ' ')
-		if firstSpace <= 0 {
-			return nil, protocolErrorf(command, "unexpected %s entry: %s", command, text)
-		}
-		secondSpace := strings.IndexByte(text[firstSpace+1:], ' ')
-		if secondSpace < 0 {
-			return nil, protocolErrorf(command, "unexpected %s entry: %s", command, text)
-		}
-		secondSpace += firstSpace + 1
-
-		cx, err := parseCoordToken(text[:firstSpace], command)
-		if err != nil {
-			return nil, err
-		}
-		cy, err := parseCoordToken(text[firstSpace+1:secondSpace], command)
-		if err != nil {
-			return nil, err
-		}
-		bits, presence, err := parseChunkStateText(text[secondSpace+1:], command)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, RangeEntry{CX: cx, CY: cy, Bits: bits, Presence: presence})
-	}
-	return entries, nil
 }
 
 func parseCoordPair(text, command string) (cx, cy int64, err error) {
@@ -864,33 +678,52 @@ func mutationFromFrame(frame Frame, command string) (MutationResult, error) {
 	return MutationResult{OK: true, Version: version}, nil
 }
 
-// mutationFromError turns a VERSION_MISMATCH response into a non-OK result and
-// passes every other error through unchanged.
+// mutationFromError turns a "VERSION_MISMATCH current=<version>" response into
+// a non-OK result and passes every other error through unchanged.
 func mutationFromError(err error, command string) (MutationResult, error) {
 	var typed *Error
 	if !errors.As(err, &typed) || typed.ServerCode != codeVersionMismatch {
 		return MutationResult{}, err
 	}
 
-	_, current, found := strings.Cut(typed.ServerMessage, "current=")
+	current, found := strings.CutPrefix(typed.ServerMessage, "current=")
 	if !found {
-		return MutationResult{}, protocolErrorf(command, "unexpected VERSION_MISMATCH payload for %s", command)
+		return MutationResult{}, protocolErrorf(command, "unexpected VERSION_MISMATCH payload for %s: %s", command, typed.ServerMessage)
 	}
-	digits := current
-	if end := strings.IndexFunc(current, func(r rune) bool { return r < '0' || r > '9' }); end >= 0 {
-		digits = current[:end]
-	}
-	version, parseErr := parseVersion(digits, command)
+	version, parseErr := parseVersion(current, command)
 	if parseErr != nil {
-		return MutationResult{}, protocolErrorf(command, "unexpected VERSION_MISMATCH payload for %s", command)
+		return MutationResult{}, protocolErrorf(command, "unexpected VERSION_MISMATCH payload for %s: %s", command, typed.ServerMessage)
 	}
 	return MutationResult{OK: false, Version: version}, nil
 }
 
-func positiveInfoInt(values map[string]string, field string) (int, error) {
-	parsed, err := strconv.Atoi(values[field])
-	if err != nil || parsed <= 0 {
-		return 0, protocolErrorf("INFO", "INFO missing valid %s", field)
+// decodeChunkBytes checks chunk bytes from the server against the table's
+// sizes, decompressing zrle with the expected size as its bound.
+func decodeChunkBytes(body []byte, expected int, zrle bool, command string) ([]byte, error) {
+	if zrle {
+		decoded, err := ZRLEDecompress(body, expected)
+		if err != nil {
+			return nil, protocolErrorf(command, "invalid %s ZRLE payload: %s", command, err)
+		}
+		return decoded, nil
 	}
-	return parsed, nil
+	if len(body) != expected {
+		return nil, protocolErrorf(command, "%s returned %d bytes, expected %d", command, len(body), expected)
+	}
+	return body, nil
+}
+
+// splitChunkState splits state bytes into payload and presence. Both share the
+// backing array of state, which the caller owns.
+func splitChunkState(state []byte, geo geometry) (payload, presence []byte) {
+	return state[:geo.payloadBytes:geo.payloadBytes], state[geo.payloadBytes:]
+}
+
+func anyBitSet(bits []byte) bool {
+	for _, b := range bits {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
 }

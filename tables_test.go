@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -18,16 +19,19 @@ const terrainInfo = "table=terrain\nstore_id=00112233445566778899aabbccddeeff\nb
 func tableHandler(_ *fakeServer, conn net.Conn, command string) {
 	switch verbOf(command) {
 	case "USE", "TABLEINFO":
-		if strings.HasSuffix(command, " missing") {
-			writeServerError(conn, "ERR NO_TABLE table 'missing' does not exist")
+		args := strings.Fields(command)
+		info, ok := fakeTables[args[len(args)-1]]
+		if !ok {
+			writeServerError(conn, "ERR NO_TABLE table '"+args[len(args)-1]+"' does not exist")
 			return
 		}
-		writeBulkString(conn, terrainInfo)
+		writeBulkString(conn, info)
 	case "TABLES":
 		writeArray(conn, "default", "terrain")
 	case "TABLECREATE", "TABLESET", "TABLEDROP":
 		writeSimple(conn, "OK")
-	case "CHUNKBIN":
+	case "CHUNKGET":
+		// The terrain table's state size.
 		writeBulk(conn, make([]byte, 10))
 	default:
 		genericHandler(nil, conn, command)
@@ -50,7 +54,7 @@ func TestURITable(t *testing.T) {
 }
 
 func TestClientSelectsTableOnEveryConnection(t *testing.T) {
-	server := newFakeServer(t, withAuth(tableHandler))
+	server := newFakeServer(t, withHello(tableHandler))
 	client := newTestClient(t, server, func(opts *Options) {
 		opts.URI = strings.TrimSuffix(server.uri("tok"), "/") + "/terrain"
 	})
@@ -67,11 +71,11 @@ func TestClientSelectsTableOnEveryConnection(t *testing.T) {
 	}
 	var selections []string
 	for _, command := range server.commands() {
-		if verbOf(command) == "AUTH" || verbOf(command) == "USE" {
+		if verbOf(command) == "HELLO" || verbOf(command) == "USE" {
 			selections = append(selections, command)
 		}
 	}
-	want := []string{"AUTH tok", "USE terrain", "AUTH tok", "USE terrain"}
+	want := []string{"HELLO 2 AUTH tok TABLE terrain", "HELLO 2 AUTH tok TABLE terrain"}
 	if !reflect.DeepEqual(selections, want) {
 		t.Fatalf("got %q, want %q", selections, want)
 	}
@@ -95,7 +99,7 @@ func TestClientOptionTableWinsOverPath(t *testing.T) {
 }
 
 func TestClientUseSwitchesTableAndGeometry(t *testing.T) {
-	server := newFakeServer(t, withAuth(tableHandler))
+	server := newFakeServer(t, withHello(tableHandler))
 	client := newTestClient(t, server, nil)
 
 	info, err := client.Use(t.Context(), "terrain")
@@ -110,11 +114,20 @@ func TestClientUseSwitchesTableAndGeometry(t *testing.T) {
 	if client.CurrentTable() != "terrain" {
 		t.Fatalf("got %q", client.CurrentTable())
 	}
-	// Chunk sizes now come from the table's geometry, not from INFO: the fake
-	// server answers 10 bytes, which only fits 8x2 blocks of 4 bits.
-	state, err := client.ChunkBinState(t.Context(), 0, 0)
-	if err != nil || len(state) != 10 {
-		t.Fatalf("ChunkBinState: %d bytes, %v", len(state), err)
+	// Chunk sizes now come from the USE reply: the fake server answers 10
+	// bytes, which only fits the state of 8x2 blocks of 4 bits.
+	state, err := client.GetChunkState(t.Context(), 0, 0, GetOptions{})
+	if err != nil || len(state.Payload) != 8 || len(state.Presence) != 2 {
+		t.Fatalf("GetChunkState: %+v, %v", state, err)
+	}
+	// The selection is repeated in HELLO after a reconnect.
+	server.dropConnections()
+	_ = client.Ping(t.Context())
+	if err := client.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping after reconnect: %v", err)
+	}
+	if got := server.commands(); !slices.Contains(got, "HELLO 2 AUTH tok TABLE terrain") {
+		t.Fatalf("got %q, want a HELLO naming terrain", got)
 	}
 
 	var serverErr *Error
@@ -128,7 +141,7 @@ func TestClientUseSwitchesTableAndGeometry(t *testing.T) {
 }
 
 func TestClientTableCommandEncoding(t *testing.T) {
-	server := newFakeServer(t, withAuth(tableHandler))
+	server := newFakeServer(t, withHello(tableHandler))
 	client := newTestClient(t, server, nil)
 	ctx := t.Context()
 

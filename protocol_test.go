@@ -61,7 +61,7 @@ func TestReadFrameSimpleAcceptsBareLF(t *testing.T) {
 }
 
 func TestReadFrameError(t *testing.T) {
-	frame, err := readFrameFrom(t, "-ERR AUTH_REQUIRED use AUTH <token>\r\n")
+	frame, err := readFrameFrom(t, "-ERR AUTH_REQUIRED use HELLO 2 AUTH <token>\r\n")
 	if err != nil {
 		t.Fatalf("ReadFrame: %v", err)
 	}
@@ -71,10 +71,10 @@ func TestReadFrameError(t *testing.T) {
 	if frame.Code != "AUTH_REQUIRED" {
 		t.Fatalf("got code %q, want AUTH_REQUIRED", frame.Code)
 	}
-	if frame.Message != "use AUTH <token>" {
+	if frame.Message != "use HELLO 2 AUTH <token>" {
 		t.Fatalf("got message %q", frame.Message)
 	}
-	if frame.Raw != "ERR AUTH_REQUIRED use AUTH <token>" {
+	if frame.Raw != "ERR AUTH_REQUIRED use HELLO 2 AUTH <token>" {
 		t.Fatalf("got raw %q", frame.Raw)
 	}
 }
@@ -139,8 +139,46 @@ func TestReadFrameArray(t *testing.T) {
 	if len(frame.Array) != 2 {
 		t.Fatalf("got %d items, want 2", len(frame.Array))
 	}
-	if string(frame.Array[0]) != "END" || string(frame.Array[1]) != "1 2" {
-		t.Fatalf("got %q", frame.Array)
+	if frame.Array[0].Kind != FrameBulk || string(frame.Array[0].Bulk) != "END" ||
+		frame.Array[1].Kind != FrameBulk || string(frame.Array[1].Bulk) != "1 2" {
+		t.Fatalf("got %+v", frame.Array)
+	}
+}
+
+func TestReadFrameNull(t *testing.T) {
+	frame, err := readFrameFrom(t, "$-1\r\n")
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if frame.Kind != FrameNull || frame.Bulk != nil {
+		t.Fatalf("got %+v, want a null frame", frame)
+	}
+}
+
+func TestReadFrameArrayWithNulls(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("*3\r\n$2\r\n10\r\n$-1\r\n$0\r\n\r\n+OK\r\n"))
+	frame, err := ReadFrame(reader)
+	if err != nil {
+		t.Fatalf("ReadFrame: %v", err)
+	}
+	if frame.Kind != FrameArray || len(frame.Array) != 3 {
+		t.Fatalf("got %+v, want an array of 3 items", frame)
+	}
+	if frame.Array[0].Kind != FrameBulk || string(frame.Array[0].Bulk) != "10" {
+		t.Fatalf("item 0: got %+v", frame.Array[0])
+	}
+	if frame.Array[1].Kind != FrameNull {
+		t.Fatalf("item 1: got %+v, want null", frame.Array[1])
+	}
+	// An empty bulk is not a null.
+	if frame.Array[2].Kind != FrameBulk || len(frame.Array[2].Bulk) != 0 {
+		t.Fatalf("item 2: got %+v, want an empty bulk", frame.Array[2])
+	}
+
+	// The reader is positioned at the next frame.
+	next, err := ReadFrame(reader)
+	if err != nil || next.Kind != FrameSimple || next.Simple != "OK" {
+		t.Fatalf("got %+v, %v, want +OK", next, err)
 	}
 }
 
@@ -175,7 +213,8 @@ func TestReadFrameRejectsBadInput(t *testing.T) {
 	cases := map[string]string{
 		"unknown prefix":         "?OK\r\n",
 		"invalid bulk length":    "$abc\r\n",
-		"negative bulk length":   "$-1\r\n",
+		"negative bulk length":   "$-2\r\n",
+		"non-canonical null":     "$-01\r\n",
 		"invalid array length":   "*abc\r\n",
 		"non-bulk array item":    "*1\r\n+OK\r\n",
 		"bad bulk terminator":    "$2\r\nabxx",
