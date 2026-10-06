@@ -143,4 +143,11 @@ func closedError(command string) *Error {
 const (
 	codeAuthFailed      = "AUTH_FAILED"
 	codeVersionMismatch = "VERSION_MISMATCH"
+
+	// CodeNoTable is the [Error.ServerCode] for an unknown table, and for any
+	// command on a connection whose table was dropped.
+	CodeNoTable = "NO_TABLE"
+	// CodeTableExists is the [Error.ServerCode] for creating a table whose
+	// name is taken.
+	CodeTableExists = "TABLE_EXISTS"
 )

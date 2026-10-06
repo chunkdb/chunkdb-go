@@ -53,6 +53,53 @@ type Options struct {
 	// PipelineDepth caps concurrent in-flight requests on one connection.
 	// Zero and one both mean sequential request/response.
 	PipelineDepth int
+
+	// Table is the table the connection works on (chunkdb 2.0+), selected
+	// with USE after connecting and after every reconnect. Empty means the
+	// URI path (chunk://host:4242/terrain), then the server's default table.
+	Table string
+}
+
+// TableOptions are the options of a table. In [Client.SetTableOptions] and
+// [TableSpec], a zero field leaves the option unchanged (or at the server's
+// default for a new table).
+type TableOptions struct {
+	// DurabilityMode is "relaxed", "fsync-wal" or "fsync-checkpoint".
+	DurabilityMode        string
+	CheckpointUpdates     int
+	CheckpointWalBytes    int
+	WalGroupCommitUpdates int
+	// CheckpointCompression is "none" or "zrle".
+	CheckpointCompression string
+}
+
+// TableSpec describes a new table for [Client.CreateTable]. Its geometry is
+// fixed once the table exists. Zero chunk and large-chunk sizes take the
+// server defaults (16x16 blocks, 8x8 chunks).
+type TableSpec struct {
+	BlockBits              int
+	ChunkWidthBlocks       int
+	ChunkHeightBlocks      int
+	LargeChunkWidthChunks  int
+	LargeChunkHeightChunks int
+	Options                TableOptions
+}
+
+// TableInfo is the geometry, options and identity of a table, as TABLEINFO
+// and USE report them.
+type TableInfo struct {
+	Name string
+	// StoreID changes when a table is dropped and created again under the
+	// same name.
+	StoreID                string
+	BlockBits              int
+	ChunkWidthBlocks       int
+	ChunkHeightBlocks      int
+	LargeChunkWidthChunks  int
+	LargeChunkHeightChunks int
+	Options                TableOptions
+	// Values holds every key/value line of the reply.
+	Values map[string]string
 }
 
 // Info is the parsed result of the INFO command.
