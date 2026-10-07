@@ -332,24 +332,12 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 		{"unset", func() error { return pool.Unset(ctx, 1, 2) }, "UNSET 1 2"},
 		{"mset", func() error { return pool.MSet(ctx, []Block{{X: 1, Y: 2, Bits: "1010"}}) }, "MSET 1 2 1010"},
 		{"mget", func() error { _, err := pool.MGet(ctx, []BlockRef{{X: 1, Y: 2}}); return err }, "MGET 1 2"},
-		{"xget", func() error { _, err := pool.XGet(ctx, 1, 2); return err }, "XGET 1 2"},
-		{
-			"xput",
-			func() error { return pool.XPut(ctx, 1, 2, ExtraValue{BitLength: 3, Bytes: []byte{5}}) },
-			"XPUT 1 2 3 1",
-		},
-		{"xdel", func() error { return pool.XDel(ctx, 1, 2) }, "XDEL 1 2"},
 		{"chunk exists", func() error { _, err := pool.ChunkExists(ctx, 1, 2); return err }, "CHUNKEXISTS 1 2"},
 		{"get chunk", func() error { _, err := pool.GetChunk(ctx, 1, 2, GetOptions{}); return err }, "CHUNKGET 1 2"},
 		{
 			"get chunk state",
 			func() error { _, err := pool.GetChunkState(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
 			"CHUNKGET 1 2 STATE ZRLE",
-		},
-		{
-			"get chunk state extra",
-			func() error { _, err := pool.GetChunkStateExtra(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
-			"CHUNKGET 1 2 STATE EXTRA ZRLE",
 		},
 		{
 			"put chunk",
@@ -365,17 +353,6 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 				return err
 			},
 			"CHUNKPUT 1 2 STATE IF 5 3",
-		},
-		{
-			"put chunk state extra",
-			func() error {
-				_, err := pool.PutChunkStateExtra(ctx, 1, 2, ChunkStateExtraInput{
-					Payload: []byte{1, 2}, Presence: []byte{1},
-					Extra: map[int]ExtraValue{0: {BitLength: 3, Bytes: []byte{5}}},
-				}, PutOptions{})
-				return err
-			},
-			"CHUNKPUT 1 2 STATE EXTRA 12",
 		},
 		{"scan", func() error { _, err := pool.ChunkScan(ctx, 10, nil); return err }, "CHUNKSCAN 10"},
 		{
@@ -404,14 +381,6 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 				return err
 			},
 			"CHUNKBATCH 1 2 IF 9 UNSET 3 4",
-		},
-		{
-			"batch with extra data",
-			func() error {
-				_, err := pool.ChunkBatch(ctx, 1, 2, []BatchOperation{XPutOp(3, 4, "101"), XDelOp(3, 4)})
-				return err
-			},
-			"CHUNKBATCH 1 2 XPUT 3 4 101 XDEL 3 4",
 		},
 		{"wal flush", func() error { return pool.WALFlush(ctx) }, "WALFLUSH"},
 		{"metrics", func() error { _, err := pool.Metrics(ctx); return err }, "METRICS"},

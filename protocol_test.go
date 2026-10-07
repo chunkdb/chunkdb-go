@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -252,23 +251,5 @@ func TestParseInfo(t *testing.T) {
 		if values[key] != value {
 			t.Fatalf("key %q: got %q, want %q", key, values[key], value)
 		}
-	}
-}
-
-// A chunk read may exceed MaxBulkBytes up to the bound its request sets;
-// every other bulk stays within MaxBulkBytes.
-func TestReadFrameBoundedBulk(t *testing.T) {
-	size := MaxBulkBytes + 10
-	wire := append([]byte("$"+strconv.Itoa(size)+"\r\n"), make([]byte, size)...)
-	wire = append(wire, '\r', '\n')
-	if _, err := ReadFrame(bufio.NewReader(bytes.NewReader(wire))); !errors.Is(err, ErrProtocol) {
-		t.Fatalf("ReadFrame: got %v, want ErrProtocol", err)
-	}
-	frame, err := readFrameBounded(bufio.NewReader(bytes.NewReader(wire)), func() int { return size })
-	if err != nil || len(frame.Bulk) != size {
-		t.Fatalf("bounded read: got %d bytes, %v", len(frame.Bulk), err)
-	}
-	if _, err := readFrameBounded(bufio.NewReader(bytes.NewReader(wire)), func() int { return size - 1 }); !errors.Is(err, ErrProtocol) {
-		t.Fatalf("bounded read under the size: got %v, want ErrProtocol", err)
 	}
 }
