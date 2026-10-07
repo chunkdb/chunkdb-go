@@ -203,7 +203,7 @@ func (c *Client) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([
 	if opts.ZRLE {
 		args = append(args, "ZRLE")
 	}
-	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.payloadBytes), "CHUNKGET", args...)
+	frame, err := c.execOn(ctx, established, "CHUNKGET", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +231,7 @@ func (c *Client) GetChunkState(ctx context.Context, cx, cy int64, opts GetOption
 	if opts.ZRLE {
 		args = append(args, "ZRLE")
 	}
-	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.stateBytes()), "CHUNKGET", args...)
+	frame, err := c.execOn(ctx, established, "CHUNKGET", args...)
 	if err != nil {
 		return ChunkState{}, err
 	}
@@ -267,7 +267,7 @@ func (c *Client) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opt
 	if len(payload) != geo.payloadBytes {
 		return MutationResult{}, requestErrorf("CHUNKPUT", "CHUNKPUT payload must be %d bytes, got %d", geo.payloadBytes, len(payload))
 	}
-	return c.putChunkBytes(ctx, established, cx, cy, payload, nil, opts)
+	return c.putChunkBytes(ctx, established, cx, cy, payload, false, opts)
 }
 
 // PutChunkState replaces the chunk's payload and presence bitmap; payload bits
@@ -294,15 +294,17 @@ func (c *Client) PutChunkState(ctx context.Context, cx, cy int64, state ChunkSta
 	bytes := make([]byte, 0, geo.stateBytes())
 	bytes = append(bytes, state.Payload...)
 	bytes = append(bytes, state.Presence...)
-	return c.putChunkBytes(ctx, established, cx, cy, bytes, []string{"STATE"}, opts)
+	return c.putChunkBytes(ctx, established, cx, cy, bytes, true, opts)
 }
 
-// putChunkBytes sends CHUNKPUT with the form options (STATE, EXTRA) given.
-// The server refuses a header it cannot parse without reading the bytes and
-// closes the connection, so every argument is checked before anything is
-// sent.
-func (c *Client) putChunkBytes(ctx context.Context, established *conn, cx, cy int64, bytes []byte, form []string, opts PutOptions) (MutationResult, error) {
-	args := append([]string{coord(cx), coord(cy)}, form...)
+// putChunkBytes sends CHUNKPUT. The server refuses a header it cannot parse
+// without reading the bytes and closes the connection, so every argument is
+// checked before anything is sent.
+func (c *Client) putChunkBytes(ctx context.Context, established *conn, cx, cy int64, bytes []byte, state bool, opts PutOptions) (MutationResult, error) {
+	args := []string{coord(cx), coord(cy)}
+	if state {
+		args = append(args, "STATE")
+	}
 	body := bytes
 	if opts.ZRLE {
 		if compressed := ZRLECompress(bytes); len(compressed) < len(bytes) {
@@ -475,8 +477,6 @@ func (c *Client) ChunkVersion(ctx context.Context, cx, cy int64) (uint64, error)
 
 // ChunkBatch applies an atomic batch of block operations to one chunk,
 // unconditionally. Every coordinate must lie inside chunk (cx, cy).
-// Operations apply in order; [XPutOp] and [XDelOp] need a table with extra
-// data, and a block must be present at its [XPutOp].
 func (c *Client) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation) (MutationResult, error) {
 	return c.chunkBatch(ctx, cx, cy, nil, operations)
 }
@@ -513,13 +513,6 @@ func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, ifVersion *uint64
 			args = append(args, "SET", coord(operation.X), coord(operation.Y), operation.Bits)
 		case BatchUnset:
 			args = append(args, "UNSET", coord(operation.X), coord(operation.Y))
-		case BatchXPut:
-			if !isBitString(operation.Bits) {
-				return MutationResult{}, requestErrorf("CHUNKBATCH", "chunk batch xput bits must contain only 0 and 1")
-			}
-			args = append(args, "XPUT", coord(operation.X), coord(operation.Y), operation.Bits)
-		case BatchXDel:
-			args = append(args, "XDEL", coord(operation.X), coord(operation.Y))
 		default:
 			return MutationResult{}, requestErrorf("CHUNKBATCH", "unknown chunk batch operation type: %d", operation.Type)
 		}
