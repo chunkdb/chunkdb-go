@@ -46,6 +46,11 @@ speaks the `chunkdb` 1.x protocol, version 2.x speaks protocol 2 (chunkdb
   `CurrentTable()` reports it, and `URI.Table` / `TableFromPath` parse it.
   `CodeNoTable` and `CodeTableExists` name the new server error codes. Chunk
   size checks follow the selected table's geometry
+- Per-block extra data (chunkdb 2.0+): `XGet`, `XPut` and `XDel` with the `ExtraValue` type; `GetChunkStateExtra` / `PutChunkStateExtra` read and replace a chunk's state and all its values in one request (`ChunkStateExtra`, `ChunkStateExtraInput`); `XPutOp` / `XDelOp` (`BatchXPut`, `BatchXDel`) in `ChunkBatch`; `EncodeExtraSection` / `DecodeExtraSection` for the EXTRA section; `TableOptions.ExtraMaxBlockBits` / `ExtraMaxChunkBytes` in `CreateTable`, `SetTableOptions` and `TableInfo`; `HelloInfo.MaxExtraChunkBytes`. `Pool` mirrors the new methods
+
+### Fixed
+- a request line longer than the server's `max_line_bytes` is refused before it is sent; the server answered `BAD_REQUEST` and closed the connection, failing every request in flight on it
+- a chunk read whose reply exceeds `MaxBulkBytes` (64 MiB) failed although the table's geometry allows it (up to 64 MiB of payload plus the presence bitmap); chunk reads are now bounded by the size the geometry gives
 
 ## 1.1.0 - 2026-09-03
 

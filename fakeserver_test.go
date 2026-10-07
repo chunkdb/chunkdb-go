@@ -27,8 +27,8 @@ type fakeServer struct {
 
 	mu       sync.Mutex
 	received []string
-	// puts holds every CHUNKPUT request exactly as it arrived: the request
-	// line, the payload, and the empty line after it.
+	// puts holds every CHUNKPUT and XPUT request exactly as it arrived: the
+	// request line, the payload, and the empty line after it.
 	puts     [][]byte
 	conns    []net.Conn
 	accepted int
@@ -101,7 +101,7 @@ func (s *fakeServer) serve(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		if strings.HasPrefix(strings.ToUpper(line), "CHUNKPUT ") {
+		if upper := strings.ToUpper(line); strings.HasPrefix(upper, "CHUNKPUT ") || strings.HasPrefix(upper, "XPUT ") {
 			// The payload and its empty-line terminator follow the header;
 			// read them so the next iteration sees the next request line.
 			fields := strings.Fields(line)
@@ -194,31 +194,35 @@ func (s *fakeServer) finishedConns() int {
 	return s.finished
 }
 
-// lastPut returns the most recent CHUNKPUT request as it arrived on the wire.
+// lastPut returns the most recent CHUNKPUT or XPUT request as it arrived on
+// the wire.
 func (s *fakeServer) lastPut(t *testing.T) []byte {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.puts) == 0 {
-		t.Fatal("server received no CHUNKPUT")
+		t.Fatal("server received no CHUNKPUT or XPUT")
 	}
 	return s.puts[len(s.puts)-1]
 }
 
 // helloLimits is the part of every fake HELLO reply before the table lines.
-const helloLimits = "protocol=2\nserver_version=test\ncapabilities=zrle\nmax_line_bytes=65536\n" +
-	"max_area_chunks=256\nmax_response_bytes=67108864\nmax_scan_limit=1024\nmax_batch_ops=1024\n"
+const helloLimits = "protocol=2\nserver_version=test\ncapabilities=zrle,extra-data\nmax_line_bytes=65536\n" +
+	"max_area_chunks=256\nmax_response_bytes=67108864\nmax_scan_limit=1024\nmax_batch_ops=1024\n" +
+	"max_extra_chunk_bytes=16777216\n"
 
 // defaultInfo is the fake server's default table. Chunks of 2x2 blocks of 4
 // bits keep the derived sizes small: 2 payload bytes and 1 presence byte.
 const defaultInfo = "table=default\nstore_id=ffeeddccbbaa99887766554433221100\nblock_bits=4\n" +
 	"chunk_width_blocks=2\nchunk_height_blocks=2\nlarge_chunk_width_chunks=8\n" +
 	"large_chunk_height_chunks=8\ndurability_mode=relaxed\ncheckpoint_updates=256\n" +
-	"checkpoint_wal_bytes=1048576\nwal_group_commit_updates=8\ncheckpoint_compression=none\n"
+	"checkpoint_wal_bytes=1048576\nwal_group_commit_updates=8\ncheckpoint_compression=none\n" +
+	"extra_max_block_bits=0\nextra_max_chunk_bytes=0\n"
 
 const (
 	testChunkPayloadBytes = 2
 	testPresenceBytes     = 1
+	testBlockCount        = 4
 )
 
 // fakeTables are the tables the fake HELLO and USE know.

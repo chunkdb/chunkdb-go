@@ -63,6 +63,18 @@ func ZRLECompress(input []byte) []byte {
 	return out
 }
 
+// zrleDeclaredSize reads the uncompressed size a zrle payload declares, so a
+// caller that accepts a range of sizes can check it before decompressing.
+func zrleDeclaredSize(input []byte) (int, error) {
+	if len(input) < 5 {
+		return 0, errors.New("zrle: input too small")
+	}
+	if input[0] != zrleCodecID {
+		return 0, fmt.Errorf("zrle: unsupported codec id 0x%02x", input[0])
+	}
+	return int(binary.LittleEndian.Uint32(input[1:5])), nil
+}
+
 // ZRLEDecompress decodes a zrle payload. The declared and produced sizes must
 // both equal expectedSize.
 func ZRLEDecompress(input []byte, expectedSize int) ([]byte, error) {
@@ -145,4 +157,11 @@ func readUleb128(input []byte, cursor int) (uint64, int, error) {
 		}
 		shift += 7
 	}
+}
+
+// chunkReplyBound is the largest CHUNKGET reply for rawBytes of chunk data:
+// the bytes themselves, or their zrle encoding, which adds at most a few
+// bytes of framing to incompressible data.
+func chunkReplyBound(rawBytes int) int {
+	return rawBytes + 64
 }

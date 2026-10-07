@@ -188,6 +188,43 @@ func ExampleClient_ChunkBatch() {
 	fmt.Println(result.OK, result.Version)
 }
 
+// Per-block extra data on a table that enables it.
+func ExampleClient_XPut() {
+	ctx := context.Background()
+
+	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	err = client.CreateTable(ctx, "world", chunkdb.TableSpec{
+		BlockBits: 16,
+		Options:   chunkdb.TableOptions{ExtraMaxBlockBits: 4096},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := client.Use(ctx, "world"); err != nil {
+		log.Fatal(err)
+	}
+
+	// A value belongs to a present block.
+	if err := client.Set(ctx, 10, 4, "0000000000000101"); err != nil {
+		log.Fatal(err)
+	}
+	value := chunkdb.ExtraValue{BitLength: 12, Bytes: []byte{0xab, 0x0c}}
+	if err := client.XPut(ctx, 10, 4, value); err != nil {
+		log.Fatal(err)
+	}
+
+	got, err := client.XGet(ctx, 10, 4)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(got.BitLength, got.Bytes)
+}
+
 // Server errors carry their protocol code, and the sentinels classify failures
 // without unwrapping.
 func ExampleError() {

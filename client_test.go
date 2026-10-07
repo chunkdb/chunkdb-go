@@ -56,8 +56,10 @@ func genericHandler(_ *fakeServer, conn net.Conn, command string) {
 	switch verbOf(command) {
 	case "PING":
 		writeSimple(conn, "PONG")
-	case "SET", "UNSET", "MSET", "WALFLUSH":
+	case "SET", "UNSET", "MSET", "WALFLUSH", "XPUT", "XDEL":
 		writeSimple(conn, "OK")
+	case "XGET":
+		writeNull(conn)
 	case "CHUNKEXISTS":
 		writeSimple(conn, "0")
 	case "GET":
@@ -150,15 +152,19 @@ func TestClientServerInfo(t *testing.T) {
 	if info == nil {
 		t.Fatal("got nil ServerInfo after connecting")
 	}
-	if info.Protocol != 2 || info.ServerVersion != "test" || len(info.Capabilities) != 1 ||
-		info.Capabilities[0] != "zrle" || info.MaxLineBytes != 65536 || info.MaxAreaChunks != 256 ||
-		info.MaxResponseBytes != 67108864 || info.MaxScanLimit != 1024 || info.MaxBatchOps != 1024 {
+	if info.Protocol != 2 || info.ServerVersion != "test" || len(info.Capabilities) != 2 ||
+		info.Capabilities[0] != "zrle" || info.Capabilities[1] != "extra-data" || info.MaxLineBytes != 65536 ||
+		info.MaxAreaChunks != 256 || info.MaxResponseBytes != 67108864 || info.MaxScanLimit != 1024 ||
+		info.MaxBatchOps != 1024 || info.MaxExtraChunkBytes != 16777216 {
 		t.Fatalf("got %+v", info)
 	}
 	if info.Table == nil || info.Table.Name != "default" || info.Table.BlockBits != 4 ||
 		info.Table.ChunkWidthBlocks != 2 || info.Table.ChunkHeightBlocks != 2 ||
 		info.Table.Options.DurabilityMode != "relaxed" {
 		t.Fatalf("got table %+v", info.Table)
+	}
+	if info.Table.Options.ExtraMaxBlockBits != 0 || info.Table.Options.ExtraMaxChunkBytes != 0 {
+		t.Fatalf("got table options %+v, want no extra data", info.Table.Options)
 	}
 	if info.Values["server_version"] != "test" {
 		t.Fatalf("got values %v", info.Values)
@@ -299,6 +305,14 @@ func TestClientHelloRejectsBadReplies(t *testing.T) {
 		"max_batch_ops missing":  withoutLimit("max_batch_ops"),
 		"max_area_chunks zero":   strings.Replace(helloLimits, "max_area_chunks=256", "max_area_chunks=0", 1),
 		"table lines incomplete": helloLimits + "table=default\n",
+		"max_extra_chunk_bytes zero": strings.Replace(helloLimits, "max_extra_chunk_bytes=16777216",
+			"max_extra_chunk_bytes=0", 1),
+		"max_extra_chunk_bytes not a number": strings.Replace(helloLimits, "max_extra_chunk_bytes=16777216",
+			"max_extra_chunk_bytes=lots", 1),
+		"extra_max_block_bits not a number": helloLimits +
+			strings.Replace(defaultInfo, "extra_max_block_bits=0", "extra_max_block_bits=x", 1),
+		"extra_max_chunk_bytes negative": helloLimits +
+			strings.Replace(defaultInfo, "extra_max_chunk_bytes=0", "extra_max_chunk_bytes=-1", 1),
 	}
 
 	for name, reply := range cases {
@@ -373,6 +387,17 @@ func TestClientWithoutTable(t *testing.T) {
 		},
 		"ChunkRange":  func() error { _, err := client.ChunkRange(ctx, 0, 0, 1, 1, GetOptions{}); return err },
 		"ChunkRadius": func() error { _, err := client.ChunkRadius(ctx, 0, 0, 1, GetOptions{}); return err },
+		// The server sizes XPUT bytes by the table and closes a connection
+		// without one.
+		"XPut": func() error { return client.XPut(ctx, 0, 0, ExtraValue{BitLength: 1, Bytes: []byte{1}}) },
+		"GetChunkStateExtra": func() error {
+			_, err := client.GetChunkStateExtra(ctx, 0, 0, GetOptions{})
+			return err
+		},
+		"PutChunkStateExtra": func() error {
+			_, err := client.PutChunkStateExtra(ctx, 0, 0, ChunkStateExtraInput{}, PutOptions{})
+			return err
+		},
 	}
 	for name, call := range calls {
 		before := len(server.commands())
@@ -534,12 +559,40 @@ func TestClientCommandEncoding(t *testing.T) {
 			want: "CHUNKBATCH 1 2 IF 9 UNSET 5 6",
 		},
 		{
+			name: "batch with extra data",
+			call: func() error {
+				_, err := client.ChunkBatch(ctx, 1, 2, []BatchOperation{SetOp(3, 4, "1010"), XPutOp(3, 4, "1011"), XDelOp(5, 6)})
+				return err
+			},
+			want: "CHUNKBATCH 1 2 SET 3 4 1010 XPUT 3 4 1011 XDEL 5 6",
+		},
+		{
 			name: "batch with the largest version",
 			call: func() error {
 				_, err := client.ChunkBatchIfVersion(ctx, 1, 2, math.MaxUint64, []BatchOperation{UnsetOp(5, 6)})
 				return err
 			},
 			want: "CHUNKBATCH 1 2 IF 18446744073709551615 UNSET 5 6",
+		},
+		{
+			name: "xget",
+			call: func() error { _, err := client.XGet(ctx, 1, -2); return err },
+			want: "XGET 1 -2",
+		},
+		{
+			name: "xdel",
+			call: func() error { return client.XDel(ctx, math.MinInt64, math.MaxInt64) },
+			want: "XDEL -9223372036854775808 9223372036854775807",
+		},
+		{
+			name: "chunk get state extra",
+			call: func() error { _, err := client.GetChunkStateExtra(ctx, 1, 2, GetOptions{}); return err },
+			want: "CHUNKGET 1 2 STATE EXTRA",
+		},
+		{
+			name: "chunk get state extra zrle",
+			call: func() error { _, err := client.GetChunkStateExtra(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
+			want: "CHUNKGET 1 2 STATE EXTRA ZRLE",
 		},
 		{
 			name: "wal flush",
@@ -1001,6 +1054,14 @@ func TestClientValidatesArgumentsBeforeSending(t *testing.T) {
 		}},
 		{"batch with unknown operation", func() error {
 			_, err := client.ChunkBatch(ctx, 0, 0, []BatchOperation{{}})
+			return err
+		}},
+		{"batch xput with non-bit value", func() error {
+			_, err := client.ChunkBatch(ctx, 0, 0, []BatchOperation{XPutOp(0, 0, "102")})
+			return err
+		}},
+		{"batch xput with empty value", func() error {
+			_, err := client.ChunkBatch(ctx, 0, 0, []BatchOperation{SetOp(0, 0, "1010"), XPutOp(0, 0, "")})
 			return err
 		}},
 	}

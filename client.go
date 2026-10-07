@@ -391,6 +391,9 @@ func (c *Client) helloOn(ctx context.Context, established *conn) error {
 	if info.Table != nil {
 		established.setGeometry(geometryOf(*info.Table))
 	}
+	// Set before the connection is published, and never changed.
+	established.maxExtraChunkBytes = info.MaxExtraChunkBytes
+	established.maxLineBytes = info.MaxLineBytes
 	c.helloMu.Lock()
 	c.hello = info
 	c.helloMu.Unlock()
@@ -503,16 +506,32 @@ func (c *Client) exec(ctx context.Context, command string, args ...string) (Fram
 }
 
 func (c *Client) execOn(ctx context.Context, established *conn, command string, args ...string) (Frame, error) {
-	return c.execPayloadOn(ctx, established, nil, command, args...)
+	return c.execRequest(ctx, established, nil, 0, command, args...)
+}
+
+// execBoundedOn is execOn for a reply that may be a bulk payload larger than
+// MaxBulkBytes, up to maxBulk bytes (a chunk read sized by its geometry).
+func (c *Client) execBoundedOn(ctx context.Context, established *conn, maxBulk int, command string, args ...string) (Frame, error) {
+	return c.execRequest(ctx, established, nil, maxBulk, command, args...)
 }
 
 // execPayloadOn is execOn for commands that carry raw bytes after the request
 // line (CHUNKPUT): the payload is written right after the line, followed by an
 // empty line, as one write so pipelined peers never see a partial request.
 func (c *Client) execPayloadOn(ctx context.Context, established *conn, payload []byte, command string, args ...string) (Frame, error) {
+	return c.execRequest(ctx, established, payload, 0, command, args...)
+}
+
+func (c *Client) execRequest(ctx context.Context, established *conn, payload []byte, maxBulk int, command string, args ...string) (Frame, error) {
 	line, err := SerializeCommand(append([]string{command}, args...)...)
 	if err != nil {
 		return Frame{}, err
+	}
+	// The server answers a longer line with BAD_REQUEST and closes the
+	// connection, failing every request in flight on it.
+	if established.maxLineBytes > 0 && len(line) > established.maxLineBytes {
+		return Frame{}, requestErrorf(command, "%s request line of %d bytes exceeds the server's max_line_bytes (%d)",
+			command, len(line), established.maxLineBytes)
 	}
 	if payload != nil {
 		wire := make([]byte, 0, len(line)+len(payload)+2)
@@ -525,7 +544,7 @@ func (c *Client) execPayloadOn(ctx context.Context, established *conn, payload [
 	deadline := c.commandDeadline(ctx, command)
 	defer deadline.cancel()
 
-	frame, err := established.roundTrip(deadline, line)
+	frame, err := established.roundTrip(deadline, line, maxBulk)
 	if err != nil {
 		return Frame{}, err
 	}
@@ -544,6 +563,9 @@ func (c *Client) execPayloadOn(ctx context.Context, established *conn, payload [
 type pending struct {
 	command string
 	ch      chan result
+	// maxBulk raises the bulk payload limit of its reply above MaxBulkBytes
+	// (0: the default limit).
+	maxBulk int
 }
 
 type result struct {
@@ -573,6 +595,11 @@ type conn struct {
 	// none. HELLO sets it and USE replaces it.
 	geoMu sync.Mutex
 	geo   *geometry
+
+	// maxExtraChunkBytes is the server's max_extra_chunk_bytes from HELLO.
+	maxExtraChunkBytes int
+	// maxLineBytes is the server's max_line_bytes from HELLO (0 before it).
+	maxLineBytes int
 }
 
 func (cn *conn) setGeometry(geo geometry) {
@@ -590,8 +617,8 @@ func (cn *conn) geometry() (geometry, bool) {
 	return *cn.geo, true
 }
 
-func (cn *conn) roundTrip(deadline callDeadline, line []byte) (Frame, error) {
-	waiter := &pending{command: deadline.command, ch: make(chan result, 1)}
+func (cn *conn) roundTrip(deadline callDeadline, line []byte, maxBulk int) (Frame, error) {
+	waiter := &pending{command: deadline.command, ch: make(chan result, 1), maxBulk: maxBulk}
 
 	cn.writeMu.Lock()
 	cn.mu.Lock()
@@ -637,7 +664,8 @@ func (cn *conn) roundTrip(deadline callDeadline, line []byte) (Frame, error) {
 
 func (cn *conn) readLoop() {
 	for {
-		frame, err := ReadFrame(cn.reader)
+		// The reply being read belongs to the oldest pending request.
+		frame, err := readFrameBounded(cn.reader, cn.headBulkLimit)
 		if err != nil {
 			_ = cn.shutdown(cn.readError(err))
 			return
@@ -670,6 +698,15 @@ func (cn *conn) terminalError() error {
 		return nil
 	}
 	return cn.termErr
+}
+
+func (cn *conn) headBulkLimit() int {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	if len(cn.queue) == 0 {
+		return 0
+	}
+	return cn.queue[0].maxBulk
 }
 
 func (cn *conn) popPending() *pending {
@@ -719,6 +756,7 @@ func (cn *conn) shutdown(cause error) error {
 
 // geometry holds the chunk sizes of a table.
 type geometry struct {
+	blockCount    int
 	payloadBytes  int
 	presenceBytes int
 }
@@ -726,6 +764,7 @@ type geometry struct {
 func geometryOf(info TableInfo) geometry {
 	blockCount := info.ChunkWidthBlocks * info.ChunkHeightBlocks
 	return geometry{
+		blockCount:    blockCount,
 		payloadBytes:  (blockCount*info.BlockBits + 7) / 8,
 		presenceBytes: (blockCount + 7) / 8,
 	}
@@ -785,6 +824,14 @@ func parseHelloInfo(payload []byte) (*HelloInfo, error) {
 			return nil, protocolErrorf("HELLO", "HELLO missing valid %s", field.key)
 		}
 		*field.target = value
+	}
+	// Reported by servers with the extra-data capability.
+	if text, ok := values["max_extra_chunk_bytes"]; ok {
+		value, err := strconv.Atoi(text)
+		if err != nil || value <= 0 {
+			return nil, protocolErrorf("HELLO", "HELLO has an invalid max_extra_chunk_bytes: %s", text)
+		}
+		info.MaxExtraChunkBytes = value
 	}
 
 	// Without a default table and without TABLE, the connection has none.

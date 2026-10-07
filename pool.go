@@ -307,6 +307,21 @@ func (p *Pool) MGet(ctx context.Context, blocks []BlockRef) ([]BlockState, error
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]BlockState, error) { return c.MGet(ctx, blocks) })
 }
 
+// XGet runs [Client.XGet] on a leased client.
+func (p *Pool) XGet(ctx context.Context, x, y int64) (*ExtraValue, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (*ExtraValue, error) { return c.XGet(ctx, x, y) })
+}
+
+// XPut runs [Client.XPut] on a leased client.
+func (p *Pool) XPut(ctx context.Context, x, y int64, value ExtraValue) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.XPut(ctx, x, y, value) })
+}
+
+// XDel runs [Client.XDel] on a leased client.
+func (p *Pool) XDel(ctx context.Context, x, y int64) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.XDel(ctx, x, y) })
+}
+
 // ChunkExists runs [Client.ChunkExists] on a leased client.
 func (p *Pool) ChunkExists(ctx context.Context, cx, cy int64) (bool, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (bool, error) { return c.ChunkExists(ctx, cx, cy) })
@@ -326,6 +341,13 @@ func (p *Pool) GetChunkState(ctx context.Context, cx, cy int64, opts GetOptions)
 	})
 }
 
+// GetChunkStateExtra runs [Client.GetChunkStateExtra] on a leased client.
+func (p *Pool) GetChunkStateExtra(ctx context.Context, cx, cy int64, opts GetOptions) (ChunkStateExtra, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ChunkStateExtra, error) {
+		return c.GetChunkStateExtra(ctx, cx, cy, opts)
+	})
+}
+
 // PutChunk runs [Client.PutChunk] on a leased client.
 func (p *Pool) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opts PutOptions) (MutationResult, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
@@ -337,6 +359,13 @@ func (p *Pool) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opts 
 func (p *Pool) PutChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput, opts PutOptions) (MutationResult, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
 		return c.PutChunkState(ctx, cx, cy, state, opts)
+	})
+}
+
+// PutChunkStateExtra runs [Client.PutChunkStateExtra] on a leased client.
+func (p *Pool) PutChunkStateExtra(ctx context.Context, cx, cy int64, state ChunkStateExtraInput, opts PutOptions) (MutationResult, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
+		return c.PutChunkStateExtra(ctx, cx, cy, state, opts)
 	})
 }
 

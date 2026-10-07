@@ -21,6 +21,11 @@
 // payload (bit i of the chunk is payload[i/8] >> (i%8) & 1) and the presence
 // bitmap, sized by the table's geometry.
 //
+// A table can enable per-block extra data ([TableOptions.ExtraMaxBlockBits]):
+// one opaque value of 1 or more bits per present block, read and written with
+// [Client.XGet], [Client.XPut], [Client.XDel], [Client.GetChunkStateExtra],
+// [Client.PutChunkStateExtra] and the [XPutOp] and [XDelOp] batch operations.
+//
 // Every request method takes a [context.Context]. Cancelling it aborts the
 // call; because the protocol has no request identifiers, an aborted in-flight
 // request also drops the connection, since the client cannot resynchronize
