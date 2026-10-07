@@ -52,13 +52,25 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 // Get reads one block. An unset block reports Exists false; an explicitly
 // stored all-zero block reports Exists true.
 func (c *Client) Get(ctx context.Context, x, y int64) (BlockState, error) {
+	return c.GetAt(ctx, x, y, HistoryPoint{})
+}
+
+// GetAt reads one block as it was at a point in the past ([AtRevision],
+// [AtTimeMs]) on a table with history, and as [Client.Get] for the zero
+// point. A point before what the table's history keeps fails with
+// [CodeNotRetained].
+func (c *Client) GetAt(ctx context.Context, x, y int64, at HistoryPoint) (BlockState, error) {
 	release, err := c.acquireSlot(ctx, "GET")
 	if err != nil {
 		return BlockState{}, err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "GET", coord(x), coord(y))
+	point, err := at.args("GET")
+	if err != nil {
+		return BlockState{}, err
+	}
+	frame, err := c.exec(ctx, "GET", append([]string{coord(x), coord(y)}, point...)...)
 	if err != nil {
 		return BlockState{}, err
 	}
@@ -66,8 +78,8 @@ func (c *Client) Get(ctx context.Context, x, y int64) (BlockState, error) {
 }
 
 // Set writes one block. bits must contain only 0 and 1 and match the table's
-// block_bits.
-func (c *Client) Set(ctx context.Context, x, y int64, bits string) error {
+// block_bits. [WithTag] tags the write.
+func (c *Client) Set(ctx context.Context, x, y int64, bits string, opts ...WriteOption) error {
 	release, err := c.acquireSlot(ctx, "SET")
 	if err != nil {
 		return err
@@ -77,35 +89,27 @@ func (c *Client) Set(ctx context.Context, x, y int64, bits string) error {
 	if !isBitString(bits) {
 		return requestErrorf("SET", "SET bits must contain only 0 and 1")
 	}
-	frame, err := c.exec(ctx, "SET", coord(x), coord(y), bits)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "SET")
+	return c.writeBlocks(ctx, "SET", opts, coord(x), coord(y), bits)
 }
 
 // Unset clears explicit presence for one block; a later [Client.Get] reports
-// it unset.
-func (c *Client) Unset(ctx context.Context, x, y int64) error {
+// it unset. [WithTag] tags the write.
+func (c *Client) Unset(ctx context.Context, x, y int64, opts ...WriteOption) error {
 	release, err := c.acquireSlot(ctx, "UNSET")
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "UNSET", coord(x), coord(y))
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "UNSET")
+	return c.writeBlocks(ctx, "UNSET", opts, coord(x), coord(y))
 }
 
 // MSet writes many blocks in one round-trip.
 //
 // Items apply in order and are not atomic as a group: if one item fails,
 // earlier items stay applied. Use [Client.ChunkBatch] for an atomic
-// single-chunk update.
-func (c *Client) MSet(ctx context.Context, blocks []Block) error {
+// single-chunk update. [WithTag] tags each of its writes.
+func (c *Client) MSet(ctx context.Context, blocks []Block, opts ...WriteOption) error {
 	release, err := c.acquireSlot(ctx, "MSET")
 	if err != nil {
 		return err
@@ -115,19 +119,32 @@ func (c *Client) MSet(ctx context.Context, blocks []Block) error {
 	if len(blocks) == 0 {
 		return nil
 	}
-	args := make([]string, 0, len(blocks)*3)
+	args := make([]string, 0, len(blocks)*3+2)
 	for _, block := range blocks {
 		if !isBitString(block.Bits) {
 			return requestErrorf("MSET", "MSET bits must contain only 0 and 1")
 		}
 		args = append(args, coord(block.X), coord(block.Y), block.Bits)
 	}
+	return c.writeBlocks(ctx, "MSET", opts, args...)
+}
 
-	frame, err := c.exec(ctx, "MSET", args...)
+// writeBlocks sends a block write that replies +OK (SET, UNSET, MSET, XDEL),
+// with its tag last.
+func (c *Client) writeBlocks(ctx context.Context, command string, opts []WriteOption, args ...string) error {
+	established, err := c.connection(ctx)
 	if err != nil {
 		return err
 	}
-	return expectOK(frame, "MSET")
+	tag, err := tagArgs(established, command, writeOptionsOf(opts).tag)
+	if err != nil {
+		return err
+	}
+	frame, err := c.execOn(ctx, established, command, append(args, tag...)...)
+	if err != nil {
+		return err
+	}
+	return expectOK(frame, command)
 }
 
 // MGet reads many blocks in one round-trip, returning one [BlockState] per
@@ -187,7 +204,8 @@ func (c *Client) ChunkExists(ctx context.Context, cx, cy int64) (bool, error) {
 
 // GetChunk reads the chunk's packed block payload (see [ChunkState] for the
 // layout). An absent chunk reads as zeros; use [Client.GetChunkState] or
-// [Client.ChunkExists] to tell it from an all-zero chunk.
+// [Client.ChunkExists] to tell it from an all-zero chunk. [GetOptions.At]
+// reads it as it was in the past.
 func (c *Client) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([]byte, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKGET")
 	if err != nil {
@@ -203,7 +221,11 @@ func (c *Client) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([
 	if opts.ZRLE {
 		args = append(args, "ZRLE")
 	}
-	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.payloadBytes), "CHUNKGET", args...)
+	point, err := opts.At.args("CHUNKGET")
+	if err != nil {
+		return nil, err
+	}
+	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.payloadBytes), "CHUNKGET", append(args, point...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +237,8 @@ func (c *Client) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([
 }
 
 // GetChunkState reads the chunk's payload and presence bitmap. An absent chunk
-// reports Exists false with zero payload and presence.
+// reports Exists false with zero payload and presence. [GetOptions.At] reads
+// it as it was in the past.
 func (c *Client) GetChunkState(ctx context.Context, cx, cy int64, opts GetOptions) (ChunkState, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKGET")
 	if err != nil {
@@ -231,7 +254,11 @@ func (c *Client) GetChunkState(ctx context.Context, cx, cy int64, opts GetOption
 	if opts.ZRLE {
 		args = append(args, "ZRLE")
 	}
-	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.stateBytes()), "CHUNKGET", args...)
+	point, err := opts.At.args("CHUNKGET")
+	if err != nil {
+		return ChunkState{}, err
+	}
+	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.stateBytes()), "CHUNKGET", append(args, point...)...)
 	if err != nil {
 		return ChunkState{}, err
 	}
@@ -249,7 +276,7 @@ func (c *Client) GetChunkState(ctx context.Context, cx, cy int64, opts GetOption
 
 // PutChunk replaces the chunk's payload; every block becomes explicitly
 // present, including in an all-zero payload. payload must have exactly the
-// table's chunk payload size.
+// table's chunk payload size. [PutOptions.Tag] tags the write.
 //
 // With [PutOptions.IfVersion], a version mismatch is not an error: the result
 // has OK false and the chunk's current version, and the chunk is unchanged.
@@ -273,7 +300,7 @@ func (c *Client) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opt
 // PutChunkState replaces the chunk's payload and presence bitmap; payload bits
 // of absent blocks are stored as zero, and an all-zero presence bitmap leaves
 // the chunk absent. Both parts must have exactly the table's sizes.
-// [PutOptions.IfVersion] works as for [Client.PutChunk].
+// [PutOptions.IfVersion] and [PutOptions.Tag] work as for [Client.PutChunk].
 func (c *Client) PutChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput, opts PutOptions) (MutationResult, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKPUT")
 	if err != nil {
@@ -313,6 +340,11 @@ func (c *Client) putChunkBytes(ctx context.Context, established *conn, cx, cy in
 	if opts.IfVersion != nil {
 		args = append(args, "IF", strconv.FormatUint(*opts.IfVersion, 10))
 	}
+	tag, err := tagArgs(established, "CHUNKPUT", opts.Tag)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	args = append(args, tag...)
 	args = append(args, strconv.Itoa(len(body)))
 
 	frame, err := c.execPayloadOn(ctx, established, body, "CHUNKPUT", args...)
@@ -384,7 +416,8 @@ func (c *Client) ChunkScan(ctx context.Context, limit int, cursor *CoordPair) (S
 // ChunkRange reads the populated chunks in a rectangle, with their payload and
 // presence, ordered by ascending cx then cy. A request may cover at most
 // [HelloInfo.MaxAreaChunks] chunks (256) and its response is capped at
-// [HelloInfo.MaxResponseBytes] (64 MiB).
+// [HelloInfo.MaxResponseBytes] (64 MiB). [GetOptions.At] reads the chunks as
+// they were in the past.
 func (c *Client) ChunkRange(ctx context.Context, cx0, cy0, cx1, cy1 int64, opts GetOptions) ([]RangeEntry, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKRANGE")
 	if err != nil {
@@ -419,7 +452,11 @@ func (c *Client) readArea(ctx context.Context, command string, opts GetOptions, 
 	if opts.ZRLE {
 		args = append(args, "ZRLE")
 	}
-	frame, err := c.execOn(ctx, established, command, args...)
+	point, err := opts.At.args(command)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := c.execOn(ctx, established, command, append(args, point...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -476,19 +513,20 @@ func (c *Client) ChunkVersion(ctx context.Context, cx, cy int64) (uint64, error)
 // ChunkBatch applies an atomic batch of block operations to one chunk,
 // unconditionally. Every coordinate must lie inside chunk (cx, cy).
 // Operations apply in order; [XPutOp] and [XDelOp] need a table with extra
-// data, and a block must be present at its [XPutOp].
-func (c *Client) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation) (MutationResult, error) {
-	return c.chunkBatch(ctx, cx, cy, nil, operations)
+// data, and a block must be present at its [XPutOp]. [WithTag] tags the
+// write.
+func (c *Client) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation, opts ...WriteOption) (MutationResult, error) {
+	return c.chunkBatch(ctx, cx, cy, nil, operations, opts)
 }
 
 // ChunkBatchIfVersion is [Client.ChunkBatch] conditioned on the chunk still
 // having expectedVersion. On a mismatch the returned result has OK false and
 // carries the current version; the chunk is unchanged.
-func (c *Client) ChunkBatchIfVersion(ctx context.Context, cx, cy int64, expectedVersion uint64, operations []BatchOperation) (MutationResult, error) {
-	return c.chunkBatch(ctx, cx, cy, &expectedVersion, operations)
+func (c *Client) ChunkBatchIfVersion(ctx context.Context, cx, cy int64, expectedVersion uint64, operations []BatchOperation, opts ...WriteOption) (MutationResult, error) {
+	return c.chunkBatch(ctx, cx, cy, &expectedVersion, operations, opts)
 }
 
-func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, ifVersion *uint64, operations []BatchOperation) (MutationResult, error) {
+func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, ifVersion *uint64, operations []BatchOperation, opts []WriteOption) (MutationResult, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKBATCH")
 	if err != nil {
 		return MutationResult{}, err
@@ -499,33 +537,45 @@ func (c *Client) chunkBatch(ctx context.Context, cx, cy int64, ifVersion *uint64
 		return MutationResult{}, requestErrorf("CHUNKBATCH", "chunk batch requires at least one operation")
 	}
 
-	args := make([]string, 0, 4+len(operations)*4)
-	args = append(args, coord(cx), coord(cy))
-	if ifVersion != nil {
-		args = append(args, "IF", strconv.FormatUint(*ifVersion, 10))
-	}
+	ops := make([]string, 0, len(operations)*4)
 	for _, operation := range operations {
 		switch operation.Type {
 		case BatchSet:
 			if !isBitString(operation.Bits) {
 				return MutationResult{}, requestErrorf("CHUNKBATCH", "chunk batch set bits must contain only 0 and 1")
 			}
-			args = append(args, "SET", coord(operation.X), coord(operation.Y), operation.Bits)
+			ops = append(ops, "SET", coord(operation.X), coord(operation.Y), operation.Bits)
 		case BatchUnset:
-			args = append(args, "UNSET", coord(operation.X), coord(operation.Y))
+			ops = append(ops, "UNSET", coord(operation.X), coord(operation.Y))
 		case BatchXPut:
 			if !isBitString(operation.Bits) {
 				return MutationResult{}, requestErrorf("CHUNKBATCH", "chunk batch xput bits must contain only 0 and 1")
 			}
-			args = append(args, "XPUT", coord(operation.X), coord(operation.Y), operation.Bits)
+			ops = append(ops, "XPUT", coord(operation.X), coord(operation.Y), operation.Bits)
 		case BatchXDel:
-			args = append(args, "XDEL", coord(operation.X), coord(operation.Y))
+			ops = append(ops, "XDEL", coord(operation.X), coord(operation.Y))
 		default:
 			return MutationResult{}, requestErrorf("CHUNKBATCH", "unknown chunk batch operation type: %d", operation.Type)
 		}
 	}
 
-	frame, err := c.exec(ctx, "CHUNKBATCH", args...)
+	established, err := c.connection(ctx)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	tag, err := tagArgs(established, "CHUNKBATCH", writeOptionsOf(opts).tag)
+	if err != nil {
+		return MutationResult{}, err
+	}
+	args := make([]string, 0, 6+len(ops))
+	args = append(args, coord(cx), coord(cy))
+	if ifVersion != nil {
+		args = append(args, "IF", strconv.FormatUint(*ifVersion, 10))
+	}
+	args = append(args, tag...)
+	args = append(args, ops...)
+
+	frame, err := c.execOn(ctx, established, "CHUNKBATCH", args...)
 	if err != nil {
 		return mutationFromError(err, "CHUNKBATCH")
 	}

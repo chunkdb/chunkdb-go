@@ -552,13 +552,13 @@ func TestClientHelloWithoutExtraData(t *testing.T) {
 			kept = append(kept, line)
 		}
 	}
-	reply := strings.Replace(strings.Join(kept, "\n"), "capabilities=zrle,extra-data", "capabilities=zrle", 1)
+	reply := strings.Replace(strings.Join(kept, "\n"), "capabilities=zrle,extra-data,history", "capabilities=zrle,history", 1)
 	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) { writeBulkString(conn, reply) })
 	client := newTestClient(t, server, nil)
 
 	info := client.ServerInfo()
 	if info.MaxExtraChunkBytes != 0 || info.Table == nil || info.Table.Options.ExtraMaxBlockBits != 0 ||
-		info.Table.Options.ExtraMaxChunkBytes != 0 || len(info.Capabilities) != 1 {
+		info.Table.Options.ExtraMaxChunkBytes != 0 || len(info.Capabilities) != 2 {
 		t.Fatalf("got %+v, table %+v", info, info.Table)
 	}
 	// No extra data can be sent to it: an XPUT value would be read as

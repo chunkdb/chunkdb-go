@@ -2,6 +2,7 @@ package chunkdb
 
 import (
 	"errors"
+	"math"
 	"net"
 	"reflect"
 	"slices"
@@ -15,7 +16,9 @@ const terrainInfo = "table=terrain\nstore_id=00112233445566778899aabbccddeeff\nb
 	"chunk_width_blocks=8\nchunk_height_blocks=2\nlarge_chunk_width_chunks=8\n" +
 	"large_chunk_height_chunks=8\ndurability_mode=fsync-wal\ncheckpoint_updates=256\n" +
 	"checkpoint_wal_bytes=1048576\nwal_group_commit_updates=8\ncheckpoint_compression=none\n" +
-	"extra_max_block_bits=4096\nextra_max_chunk_bytes=65536\n"
+	"extra_max_block_bits=4096\nextra_max_chunk_bytes=65536\nhistory=on\nhistory_start=41\n" +
+	"history_start_time_ms=1791377487382\nhistory_max_age_ms=2592000000\nhistory_max_chunk_bytes=18446744073709551615\n" +
+	"history_max_tag_bytes=32\n"
 
 func tableHandler(_ *fakeServer, conn net.Conn, command string) {
 	switch verbOf(command) {
@@ -177,6 +180,20 @@ func TestClientTableCommandEncoding(t *testing.T) {
 		{func() error {
 			return client.SetTableOptions(ctx, "items", TableOptions{ExtraMaxBlockBits: 512})
 		}, "TABLESET items extra_max_block_bits 512"},
+		{func() error {
+			return client.CreateTable(ctx, "world", TableSpec{
+				BlockBits: 16, Options: TableOptions{
+					History: true, HistoryMaxAgeMs: 2592000000, HistoryMaxChunkBytes: math.MaxUint64 - 1, HistoryMaxTagBytes: 8,
+				},
+			})
+		}, "TABLECREATE world block_bits 16 history on history_max_age_ms 2592000000 " +
+			"history_max_chunk_bytes 18446744073709551614 history_max_tag_bytes 8"},
+		{func() error {
+			return client.SetTableOptions(ctx, "world", TableOptions{HistoryMaxAgeMs: HistoryNoLimit, HistoryMaxChunkBytes: HistoryNoLimit})
+		}, "TABLESET world history_max_age_ms 0 history_max_chunk_bytes 0"},
+		{func() error {
+			return client.SetTableOptions(ctx, "terrain", TableOptions{History: true})
+		}, "TABLESET terrain history on"},
 		{func() error { return client.DropTable(ctx, "terrain") }, "TABLEDROP terrain"},
 		{func() error {
 			names, err := client.Tables(ctx)
@@ -205,6 +222,49 @@ func TestClientTableCommandEncoding(t *testing.T) {
 	}
 	if len(server.commands()) != before {
 		t.Fatal("an empty SetTableOptions reached the server")
+	}
+}
+
+func TestTableInfoHistory(t *testing.T) {
+	info, err := parseTableValues(ParseInfo([]byte(terrainInfo)), "TABLEINFO")
+	if err != nil || !info.Options.History || info.HistoryStart != 41 || info.HistoryStartTimeMs != 1791377487382 ||
+		info.Options.HistoryMaxAgeMs != 2592000000 || info.Options.HistoryMaxChunkBytes != math.MaxUint64 ||
+		info.Options.HistoryMaxTagBytes != 32 {
+		t.Fatalf("got %+v, %v", info, err)
+	}
+
+	// A table without history reports off and zeros; a server without the
+	// history capability omits every line.
+	info, err = parseTableValues(ParseInfo([]byte(defaultInfo)), "TABLEINFO")
+	if err != nil || info.Options.History || info.HistoryStart != 0 || info.Options.HistoryMaxTagBytes != 0 {
+		t.Fatalf("got %+v, %v", info, err)
+	}
+	var kept []string
+	for _, line := range strings.Split(terrainInfo, "\n") {
+		if !strings.HasPrefix(line, "history") {
+			kept = append(kept, line)
+		}
+	}
+	info, err = parseTableValues(ParseInfo([]byte(strings.Join(kept, "\n"))), "TABLEINFO")
+	if err != nil || info.Options.History || info.HistoryStart != 0 || info.HistoryStartTimeMs != 0 ||
+		info.Options.HistoryMaxAgeMs != 0 || info.Options.HistoryMaxChunkBytes != 0 || info.Options.HistoryMaxTagBytes != 0 {
+		t.Fatalf("got %+v, %v without the history lines", info, err)
+	}
+
+	for _, bad := range []string{"history=", "history=yes", "history_start=-1", "history_start=18446744073709551616",
+		"history_start_time_ms=-1", "history_start_time_ms=x", "history_max_age_ms=", "history_max_chunk_bytes=-1",
+		"history_max_tag_bytes=-1", "history_max_tag_bytes=lots"} {
+		key, _, _ := strings.Cut(bad, "=")
+		var lines []string
+		for _, line := range strings.Split(terrainInfo, "\n") {
+			if strings.HasPrefix(line, key+"=") {
+				line = bad
+			}
+			lines = append(lines, line)
+		}
+		if _, err := parseTableValues(ParseInfo([]byte(strings.Join(lines, "\n"))), "TABLEINFO"); !errors.Is(err, ErrProtocol) {
+			t.Fatalf("%s: got %v, want ErrProtocol", bad, err)
+		}
 	}
 }
 

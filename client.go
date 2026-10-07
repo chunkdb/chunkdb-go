@@ -394,6 +394,8 @@ func (c *Client) helloOn(ctx context.Context, established *conn) error {
 	// Set before the connection is published, and never changed.
 	established.maxExtraChunkBytes = info.MaxExtraChunkBytes
 	established.maxLineBytes = info.MaxLineBytes
+	established.maxTagBytes = info.MaxTagBytes
+	established.maxHistoryLimit = info.MaxHistoryLimit
 	c.helloMu.Lock()
 	c.hello = info
 	c.helloMu.Unlock()
@@ -554,6 +556,12 @@ func (c *Client) execRequest(ctx context.Context, established *conn, payload []b
 		if command == "HELLO" && (frame.Code == codeAuthFailed || frame.Code == codeAuthRequired) {
 			phase = PhaseAuth
 		}
+		// NotRetainedStart reads the revision this error carries.
+		if frame.Code == CodeNotRetained {
+			if _, ok := parseNotRetained(frame.Message); !ok {
+				return Frame{}, protocolErrorf(command, "unexpected NOT_RETAINED payload for %s: %s", command, frame.Message)
+			}
+		}
 		return Frame{}, serverError(phase, command, frame.Code, frame.Message)
 	}
 	return frame, nil
@@ -600,6 +608,10 @@ type conn struct {
 	maxExtraChunkBytes int
 	// maxLineBytes is the server's max_line_bytes from HELLO (0 before it).
 	maxLineBytes int
+	// maxTagBytes and maxHistoryLimit are the server's max_tag_bytes and
+	// max_history_limit from HELLO, 0 from a server without history.
+	maxTagBytes     int
+	maxHistoryLimit int
 }
 
 func (cn *conn) setGeometry(geo geometry) {
@@ -756,6 +768,7 @@ func (cn *conn) shutdown(cause error) error {
 
 // geometry holds the chunk sizes of a table.
 type geometry struct {
+	blockBits     int
 	blockCount    int
 	payloadBytes  int
 	presenceBytes int
@@ -764,6 +777,7 @@ type geometry struct {
 func geometryOf(info TableInfo) geometry {
 	blockCount := info.ChunkWidthBlocks * info.ChunkHeightBlocks
 	return geometry{
+		blockBits:     info.BlockBits,
 		blockCount:    blockCount,
 		payloadBytes:  (blockCount*info.BlockBits + 7) / 8,
 		presenceBytes: (blockCount + 7) / 8,
@@ -825,13 +839,24 @@ func parseHelloInfo(payload []byte) (*HelloInfo, error) {
 		}
 		*field.target = value
 	}
-	// Reported by servers with the extra-data capability.
-	if text, ok := values["max_extra_chunk_bytes"]; ok {
+	// Reported by servers with the extra-data and history capabilities.
+	for _, field := range []struct {
+		key    string
+		target *int
+	}{
+		{"max_extra_chunk_bytes", &info.MaxExtraChunkBytes},
+		{"max_tag_bytes", &info.MaxTagBytes},
+		{"max_history_limit", &info.MaxHistoryLimit},
+	} {
+		text, ok := values[field.key]
+		if !ok {
+			continue
+		}
 		value, err := strconv.Atoi(text)
 		if err != nil || value <= 0 {
-			return nil, protocolErrorf("HELLO", "HELLO has an invalid max_extra_chunk_bytes: %s", text)
+			return nil, protocolErrorf("HELLO", "HELLO has an invalid %s: %s", field.key, text)
 		}
-		info.MaxExtraChunkBytes = value
+		*field.target = value
 	}
 
 	// Without a default table and without TABLE, the connection has none.

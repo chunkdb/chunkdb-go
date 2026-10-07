@@ -35,6 +35,7 @@ This package is intentionally small:
   `SetTableOptions`, `Use`, per-table clients (`client.Table(ctx, name)`), and
   the table named in the URI path (`chunk://host:4242/terrain`)
 - per-block extra data: `XGet`, `XPut`, `XDel`, `GetChunkStateExtra`, `PutChunkStateExtra`, and `XPutOp` / `XDelOp` in `ChunkBatch`
+- block history: `History`, `ChunkHistory`, `RangeHistory` and their iterators, tagged writes (`WithTag`, `PutOptions.Tag`), and reads in the past (`GetAt`, `GetOptions.At`)
 - configurable request pipelining for high-latency links
 - `context.Context` on every request, for per-call deadlines and cancellation
 - typed errors with `errors.Is` sentinels and protocol error codes
@@ -363,6 +364,62 @@ fmt.Println(chunk.Extra[4*16+10].BitLength) // 12
 - The client checks value lengths (1 to 134217664 bits in `ceil(bits/8)` bytes) and block indexes before sending. The server checks the table's limits: a value over them, a value for an unset block, or a table without extra data fails with an `*Error` whose `ServerCode` is `INVALID_ARGUMENT`, and the connection stays usable.
 - `Get`, `MGet`, `MSet`, `ChunkScan`, `ChunkRange` and `ChunkRadius` do not carry extra data.
 
+## History
+
+A table can keep the history of its blocks: every committed change, with the block before and after (bits and extra data), the mutation's revision and commit time, and a tag the writer attached. Clients list the changes of a block, a chunk or an area, and read the table as it was at a past revision or time.
+
+History is off until a table sets `TableOptions.History`; enabling is permanent, and changes before it are not events. `HistoryMaxAgeMs` and `HistoryMaxChunkBytes` let the server remove old history when a chunk is checkpointed (`0`, the default, keeps it all; `HistoryNoLimit` removes a limit), and `HistoryMaxTagBytes` caps tags (1 to 255, default 32). `TableInfo` reports them, with `HistoryStart` and `HistoryStartTimeMs` where history begins.
+
+```go
+err := client.CreateTable(ctx, "world", chunkdb.TableSpec{
+	BlockBits: 16,
+	Options:   chunkdb.TableOptions{History: true},
+})
+if err != nil {
+	log.Fatal(err)
+}
+world, err := client.Table(ctx, "world")
+if err != nil {
+	log.Fatal(err)
+}
+defer world.Close()
+
+// A tag finds the write's events later.
+if err := world.Set(ctx, 10, 4, "0000000000000101", chunkdb.WithTag([]byte("job-7"))); err != nil {
+	log.Fatal(err)
+}
+version, err := world.ChunkVersion(ctx, 0, 0)
+if err != nil {
+	log.Fatal(err)
+}
+if err := world.Set(ctx, 10, 4, "0000000000000110"); err != nil {
+	log.Fatal(err)
+}
+
+// Every change of the block, oldest first, page by page until the end.
+for event, err := range world.HistoryEvents(ctx, 10, 4, chunkdb.HistoryOptions{Ascending: true}) {
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(event.Revision, event.Before.Bits, event.After.Bits, string(event.Tag))
+}
+
+// The block as it was after the first write.
+then, err := world.GetAt(ctx, 10, 4, chunkdb.AtRevision(version))
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(then.Bits) // 0000000000000101
+```
+
+- `History`, `ChunkHistory` and `RangeHistory` (at most 256 chunks) return one `HistoryPage`: `Events`, ordered by revision and by block within a mutation, newest first unless `Ascending`, and a `Cursor` to pass as `After` (ascending) or `Before` (descending) for the next page. A page can be short or empty and still carry a cursor; only an empty `Cursor` ends the window. `HistoryEvents`, `ChunkHistoryEvents` and `RangeHistoryEvents` follow the cursors and stop at the first error, which they yield.
+- `HistoryOptions`: `Limit` (1 to 1024, default 100), `Ascending`, `After` and `Before` (exclusive cursors), `SinceMs` and `UntilMs` (commit time in Unix milliseconds, inclusive) and `Tag`. `After: chunkdb.RevisionCursor(v)` lists what changed since `ChunkVersion` returned `v`.
+- A `HistoryEvent` holds `Revision`, `TimeMs`, `X`, `Y`, `Before` and `After` as `Get` returns blocks (`Exists` false when absent), `BeforeExtra` and `AfterExtra` (nil without extra data) and `Tag` (nil without one). A write that changes nothing records nothing. Revisions are ordered across the table, commit times only within a chunk.
+- `WithTag(tag)` tags `Set`, `Unset`, `MSet` (each of its writes), `XPut`, `XDel`, `ChunkBatch` and `ChunkBatchIfVersion`; `PutOptions.Tag` tags the chunk writes. A tag on a table without history or over its limit fails with `INVALID_ARGUMENT` and nothing changes.
+- `GetAt(ctx, x, y, point)` and `GetOptions.At` (`GetChunk`, `GetChunkState`, `GetChunkStateExtra`, `ChunkRange`, `ChunkRadius`) read the past: `AtRevision(v)` after every mutation at or below `v`, `AtTimeMs(ms)` each chunk after its mutations committed by then. A revision at or above the next one, or a time not in the past, fails with `OUT_OF_RANGE`.
+- Reading below what a table's history keeps fails with `CodeNotRetained`: a point before it, a window oldest first at once, newest first after the page that returns what is kept. `NotRetainedStart(err)` returns the revision history is kept from.
+- An event of a block beyond the `int64` range (in a chunk at the edge of the chunk range) fails the read with `ErrProtocol`.
+
 ## API
 
 Package functions:
@@ -379,6 +436,7 @@ Package functions:
   and array items are `FrameBulk` or `FrameNull` frames
 - `ZRLECompress([]byte) []byte`, `ZRLEDecompress([]byte, int) ([]byte, error)`
 - `EncodeExtraSection(map[int]ExtraValue, blockCount) ([]byte, error)`, `DecodeExtraSection([]byte, blockCount) (map[int]ExtraValue, error)`
+- `WithTag(tag) WriteOption`; `AtRevision(revision)`, `AtTimeMs(ms) HistoryPoint`; `RevisionCursor(revision) HistoryCursor`; `NotRetainedStart(err) (uint64, bool)`
 
 `Client` methods:
 
@@ -386,7 +444,7 @@ Package functions:
 - `ServerInfo() *HelloInfo` — the `HELLO` reply of the most recent
   connection, nil before the first: `ServerVersion`, `Capabilities`,
   `MaxLineBytes`, `MaxAreaChunks`, `MaxResponseBytes`, `MaxScanLimit`,
-  `MaxBatchOps`, `MaxExtraChunkBytes`, and `Table` (geometry and options, or nil)
+  `MaxBatchOps`, `MaxExtraChunkBytes`, `MaxTagBytes`, `MaxHistoryLimit`, and `Table` (geometry and options, or nil)
 - `CurrentTable()` — the table this client works on
 - `Tables(ctx) ([]string, error)`
 - `TableInfo(ctx, name) (TableInfo, error)` — geometry, options and store id
@@ -398,9 +456,10 @@ Package functions:
 - `Ping(ctx)`
 - `Info(ctx)` — runtime statistics of the selected table
 - `Get(ctx, x, y) (BlockState, error)` — `{Exists: false}` for an unset block
-- `Set(ctx, x, y, bits)`
-- `Unset(ctx, x, y)`
-- `MSet(ctx, blocks []Block)` — batch write, one round-trip; items apply in order
+- `GetAt(ctx, x, y, HistoryPoint) (BlockState, error)` — a block in the past
+- `Set(ctx, x, y, bits, ...WriteOption)`
+- `Unset(ctx, x, y, ...WriteOption)`
+- `MSet(ctx, blocks []Block, ...WriteOption)` — batch write, one round-trip; items apply in order
   and are not atomic as a group (on error, earlier items may already be
   applied) — use `ChunkBatch` for an atomic single-chunk update
 - `MGet(ctx, blocks []BlockRef) ([]BlockState, error)` — batch read, one round-trip
@@ -411,7 +470,7 @@ Package functions:
 - `PutChunk(ctx, cx, cy, payload, PutOptions) (MutationResult, error)`
 - `PutChunkState(ctx, cx, cy, ChunkStateInput, PutOptions) (MutationResult, error)`
 - `XGet(ctx, x, y) (*ExtraValue, error)` — a block's extra data, nil when it has none
-- `XPut(ctx, x, y, ExtraValue)`, `XDel(ctx, x, y)`
+- `XPut(ctx, x, y, ExtraValue, ...WriteOption)`, `XDel(ctx, x, y, ...WriteOption)`
 - `GetChunkStateExtra(ctx, cx, cy, GetOptions) (ChunkStateExtra, error)` — `Exists`, `Payload`, `Presence`, `Extra`
 - `PutChunkStateExtra(ctx, cx, cy, ChunkStateExtraInput, PutOptions) (MutationResult, error)`
 - `ChunkScan(ctx, limit, cursor)` — enumerate populated chunks in deterministic
@@ -423,9 +482,11 @@ Package functions:
 - `ChunkRadius(ctx, cx, cy, radiusChunks, GetOptions)` — bounded radius/disc
   multi-chunk read with the same limits and result shape as `ChunkRange`
 - `ChunkVersion(ctx, cx, cy) (uint64, error)` — opaque chunk version token
-- `ChunkBatch(ctx, cx, cy, operations)` / `ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations)` —
+- `ChunkBatch(ctx, cx, cy, operations, ...WriteOption)` / `ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations, ...WriteOption)` —
   atomic single-chunk batch of `SetOp` / `UnsetOp` / `XPutOp` / `XDelOp`
   operations; returns a `MutationResult`
+- `History(ctx, x, y, HistoryOptions) (HistoryPage, error)`, `ChunkHistory(ctx, cx, cy, HistoryOptions)`, `RangeHistory(ctx, cx0, cy0, cx1, cy1, HistoryOptions)` — one page of block history
+- `HistoryEvents(ctx, x, y, HistoryOptions) iter.Seq2[HistoryEvent, error]`, `ChunkHistoryEvents(ctx, cx, cy, HistoryOptions)`, `RangeHistoryEvents(ctx, cx0, cy0, cx1, cy1, HistoryOptions)` — every event of a window
 - `WALFlush(ctx)` — explicit durability barrier: returns once every previously
   acknowledged write is durable, even when the server runs in `relaxed` mode
 - `Metrics(ctx)` — Prometheus text-format runtime metrics
@@ -486,12 +547,13 @@ if err != nil {
 
 Client-side argument validation (a bit string containing anything but `0` and
 `1`, a chunk of the wrong size, a malformed extra data value, an empty batch, a
-chunk method without a table) fails with `ErrProtocol` before anything is
-written to the socket.
+chunk method without a table, a malformed history option, a tag for a server
+without history) fails with `ErrProtocol` before anything is written to the
+socket.
 
 ## Limits
 
-- a single bulk payload is capped at `MaxBulkBytes` (64 MiB); a larger declared length is rejected as a protocol error instead of being allocated. A chunk read is capped by the size its table's geometry gives (plus `max_extra_chunk_bytes` with extra data), which can be larger
+- a single bulk payload is capped at `MaxBulkBytes` (64 MiB); a larger declared length is rejected as a protocol error instead of being allocated. A chunk read is capped by the size its table's geometry gives (plus `max_extra_chunk_bytes` with extra data), and a history event by its extra data in hex, which can be larger
 - a request line longer than the server's `max_line_bytes` (for example a long `XPutOp` value in `ChunkBatch`) is refused before it is sent; the server would close the connection
 - ZRLE reads bound decompression by the size the table's geometry gives and
   reject any payload that declares or produces a different size

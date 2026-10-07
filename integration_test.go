@@ -2,6 +2,7 @@ package chunkdb
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,11 +12,15 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"iter"
+	"maps"
+	"math"
 	"math/big"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1645,5 +1650,701 @@ func TestIntegrationExtraDataPoolAndPipelining(t *testing.T) {
 	chunk, err := client.GetChunkStateExtra(ctx, 0, 2, GetOptions{})
 	if err != nil || len(chunk.Extra) != 4 {
 		t.Fatalf("GetChunkStateExtra: %d values, %v", len(chunk.Extra), err)
+	}
+}
+
+// historyBlock is a block of historyModel: its bits and extra data.
+type historyBlock struct {
+	bits  string
+	extra *ExtraValue
+}
+
+// historyModel follows the blocks of a table with history and the events its
+// writes record.
+type historyModel struct {
+	width, height int64
+	blockBits     int
+	blocks        map[[2]int64]historyBlock
+	events        []HistoryEvent
+}
+
+func newHistoryModel(geo serverGeometry) *historyModel {
+	return &historyModel{
+		width: int64(geo.width), height: int64(geo.height), blockBits: geo.blockBits,
+		blocks: map[[2]int64]historyBlock{},
+	}
+}
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if a%b != 0 && (a < 0) != (b < 0) {
+		q--
+	}
+	return q
+}
+
+func (m *historyModel) chunkOf(x, y int64) (cx, cy int64) {
+	return floorDiv(x, m.width), floorDiv(y, m.height)
+}
+
+// blockAt returns the coordinates of block index i of chunk (cx, cy).
+func (m *historyModel) blockAt(cx, cy int64, i int) (x, y int64) {
+	return cx*m.width + int64(i)%m.width, cy*m.height + int64(i)/m.width
+}
+
+// change makes block (x, y) after (nil: absent) in a mutation of revision,
+// recording an event when that changes it.
+func (m *historyModel) change(revision uint64, tag []byte, x, y int64, after *historyBlock) {
+	key := [2]int64{x, y}
+	before, had := m.blocks[key]
+	if after == nil && !had || after != nil && had && after.bits == before.bits && equalExtraValue(after.extra, before.extra) {
+		return
+	}
+	event := HistoryEvent{Revision: revision, X: x, Y: y, Tag: tag}
+	if had {
+		event.Before = BlockState{Exists: true, Bits: before.bits}
+		event.BeforeExtra = before.extra
+	}
+	if after != nil {
+		event.After = BlockState{Exists: true, Bits: after.bits}
+		event.AfterExtra = after.extra
+		m.blocks[key] = *after
+	} else {
+		delete(m.blocks, key)
+	}
+	m.events = append(m.events, event)
+}
+
+// changeChunk applies the final blocks of a chunk mutation, by block index
+// (nil: absent), recording events in block order.
+func (m *historyModel) changeChunk(revision uint64, tag []byte, cx, cy int64, after map[int]*historyBlock) {
+	for i := range int(m.width * m.height) {
+		x, y := m.blockAt(cx, cy, i)
+		m.change(revision, tag, x, y, after[i])
+	}
+}
+
+// chunkBlocks returns the blocks of chunk (cx, cy) by block index.
+func (m *historyModel) chunkBlocks(cx, cy int64) map[int]*historyBlock {
+	out := map[int]*historyBlock{}
+	for i := range int(m.width * m.height) {
+		x, y := m.blockAt(cx, cy, i)
+		if block, ok := m.blocks[[2]int64{x, y}]; ok {
+			out[i] = &block
+		}
+	}
+	return out
+}
+
+func (m *historyModel) snapshot() map[[2]int64]historyBlock {
+	return maps.Clone(m.blocks)
+}
+
+// packChunk returns the state and extra data of chunk blocks by block index.
+func (m *historyModel) packChunk(blocks map[int]*historyBlock) (payload, presence []byte, extra map[int]ExtraValue) {
+	count := int(m.width * m.height)
+	payload = make([]byte, (count*m.blockBits+7)/8)
+	presence = make([]byte, (count+7)/8)
+	extra = map[int]ExtraValue{}
+	for i, block := range blocks {
+		presence[i/8] |= 1 << (i % 8)
+		for j, bit := range block.bits {
+			if bit == '1' {
+				n := i*m.blockBits + j
+				payload[n/8] |= 1 << (n % 8)
+			}
+		}
+		if block.extra != nil {
+			extra[i] = *block.extra
+		}
+	}
+	return payload, presence, extra
+}
+
+// stateIn returns the blocks of chunk (cx, cy) in a snapshot.
+func (m *historyModel) stateIn(snapshot map[[2]int64]historyBlock, cx, cy int64) map[int]*historyBlock {
+	out := map[int]*historyBlock{}
+	for i := range int(m.width * m.height) {
+		x, y := m.blockAt(cx, cy, i)
+		if block, ok := snapshot[[2]int64{x, y}]; ok {
+			out[i] = &block
+		}
+	}
+	return out
+}
+
+// eventsWhere returns the model's events that keep returns true for, oldest
+// first, or newest first when descending.
+func (m *historyModel) eventsWhere(descending bool, keep func(HistoryEvent) bool) []HistoryEvent {
+	var out []HistoryEvent
+	for _, event := range m.events {
+		if keep(event) {
+			out = append(out, event)
+		}
+	}
+	if descending {
+		slices.Reverse(out)
+	}
+	return out
+}
+
+func equalExtraValue(a, b *ExtraValue) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.BitLength == b.BitLength && bytes.Equal(a.Bytes, b.Bytes)
+}
+
+// requireEvents compares events with the model's, ignoring commit times,
+// which must be set.
+func requireEvents(t *testing.T, label string, got, want []HistoryEvent) {
+	t.Helper()
+	stripped := make([]HistoryEvent, len(got))
+	for i, event := range got {
+		if event.TimeMs <= 0 {
+			t.Fatalf("%s: event %d has time %d", label, i, event.TimeMs)
+		}
+		event.TimeMs = 0
+		stripped[i] = event
+	}
+	if len(want) == 0 {
+		want = []HistoryEvent{}
+	}
+	if !reflect.DeepEqual(stripped, want) {
+		t.Fatalf("%s: got %d events\n%+v\nwant %d\n%+v", label, len(stripped), stripped, len(want), want)
+	}
+}
+
+// collectEvents reads every event of a history iterator.
+func collectEvents(t *testing.T, label string, events iter.Seq2[HistoryEvent, error]) []HistoryEvent {
+	t.Helper()
+	out := []HistoryEvent{}
+	for event, err := range events {
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		out = append(out, event)
+	}
+	return out
+}
+
+// collectPages reads every page of a history window by hand, following the
+// cursors.
+func collectPages(t *testing.T, label string, opts HistoryOptions, read func(HistoryOptions) (HistoryPage, error)) []HistoryEvent {
+	t.Helper()
+	out := []HistoryEvent{}
+	for pages := 0; ; pages++ {
+		if pages > 10000 {
+			t.Fatalf("%s: the window does not end", label)
+		}
+		page, err := read(opts)
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+		if opts.Limit != 0 && len(page.Events) > opts.Limit {
+			t.Fatalf("%s: a page of %d events, limit %d", label, len(page.Events), opts.Limit)
+		}
+		out = append(out, page.Events...)
+		if page.Cursor == "" {
+			return out
+		}
+		if opts.Ascending {
+			opts.After = page.Cursor
+		} else {
+			opts.Before = page.Cursor
+		}
+	}
+}
+
+func TestIntegrationHistoryTables(t *testing.T) {
+	server := startServer(t, serverConfig{workers: 4})
+	client := connectIntegration(t, server, nil)
+	ctx := t.Context()
+
+	hello := client.ServerInfo()
+	if !slices.Contains(hello.Capabilities, "history") || hello.MaxTagBytes != 255 || hello.MaxHistoryLimit != 1024 {
+		t.Fatalf("got %+v", hello)
+	}
+	if table := hello.Table; table.Options.History || table.HistoryStart != 0 || table.HistoryStartTimeMs != 0 ||
+		table.Options.HistoryMaxTagBytes != 0 {
+		t.Fatalf("got default table %+v, want no history", table)
+	}
+
+	// A table without history refuses tags, history and the past, and the
+	// connection stays usable.
+	geo := readGeometry(t, client)
+	connection := activeConn(client)
+	tag := []byte("job")
+	if err := client.Set(ctx, 0, 0, geo.blockPattern(1)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	requireServerCode(t, client.Set(ctx, 0, 0, geo.blockPattern(2), WithTag(tag)), "INVALID_ARGUMENT")
+	requireServerCode(t, client.Unset(ctx, 0, 0, WithTag(tag)), "INVALID_ARGUMENT")
+	_, err := client.PutChunk(ctx, 0, 0, geo.sparsePayload(1), PutOptions{Tag: tag, ZRLE: true})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	_, err = client.ChunkBatch(ctx, 0, 0, []BatchOperation{UnsetOp(0, 0)}, WithTag(tag))
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	requireServerCode(t, client.XPut(ctx, 0, 0, ExtraValue{BitLength: 1, Bytes: []byte{1}}, WithTag(tag)), "INVALID_ARGUMENT")
+	_, err = client.History(ctx, 0, 0, HistoryOptions{})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	_, err = client.GetAt(ctx, 0, 0, AtRevision(1))
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	if block, err := client.Get(ctx, 0, 0); err != nil || block.Bits != geo.blockPattern(1) {
+		t.Fatalf("a refused write changed the block: %+v, %v", block, err)
+	}
+	if err := client.Ping(ctx); err != nil || activeConn(client) != connection {
+		t.Fatalf("Ping: %v; the connection was replaced: %v", err, activeConn(client) != connection)
+	}
+
+	// Options round trip through TABLECREATE, TABLESET, TABLEINFO and HELLO.
+	before := time.Now().UnixMilli()
+	if err := client.CreateTable(ctx, "world", TableSpec{
+		BlockBits: 4, ChunkWidthBlocks: 4, ChunkHeightBlocks: 4,
+		Options: TableOptions{History: true, HistoryMaxAgeMs: 86400000, HistoryMaxTagBytes: 8},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	info, err := client.TableInfo(ctx, "world")
+	if err != nil || !info.Options.History || info.HistoryStart == 0 || info.HistoryStartTimeMs < before ||
+		info.Options.HistoryMaxAgeMs != 86400000 || info.Options.HistoryMaxChunkBytes != 0 || info.Options.HistoryMaxTagBytes != 8 {
+		t.Fatalf("TableInfo: %+v, %v", info, err)
+	}
+	if err := client.SetTableOptions(ctx, "world", TableOptions{HistoryMaxChunkBytes: 1 << 20, HistoryMaxTagBytes: 16}); err != nil {
+		t.Fatalf("SetTableOptions: %v", err)
+	}
+	if got, err := client.TableInfo(ctx, "world"); err != nil || got.Options.HistoryMaxChunkBytes != 1<<20 ||
+		got.Options.HistoryMaxAgeMs != 86400000 || got.Options.HistoryMaxTagBytes != 16 || got.HistoryStart != info.HistoryStart {
+		t.Fatalf("TableInfo: %+v, %v", got.Options, err)
+	}
+	if err := client.SetTableOptions(ctx, "world", TableOptions{HistoryMaxAgeMs: HistoryNoLimit, HistoryMaxChunkBytes: HistoryNoLimit}); err != nil {
+		t.Fatalf("SetTableOptions: %v", err)
+	}
+	world := connectIntegration(t, server, func(o *Options) { o.Table = "world" })
+	if table := world.ServerInfo().Table; !table.Options.History || table.Options.HistoryMaxAgeMs != 0 ||
+		table.Options.HistoryMaxChunkBytes != 0 || table.HistoryStart != info.HistoryStart {
+		t.Fatalf("got HELLO table %+v", table)
+	}
+	// A tag over the table's limit is refused.
+	requireServerCode(t, world.Set(ctx, 0, 0, "1010", WithTag(make([]byte, 17))), "INVALID_ARGUMENT")
+	if err := world.Set(ctx, 0, 0, "1010", WithTag(make([]byte, 16))); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// Limits need history, which a table keeps once it has it.
+	requireServerCode(t, client.SetTableOptions(ctx, "default", TableOptions{HistoryMaxTagBytes: 4}), "INVALID_ARGUMENT")
+	if err := client.SetTableOptions(ctx, "world", TableOptions{History: true}); err != nil {
+		t.Fatalf("SetTableOptions history on again: %v", err)
+	}
+
+	// Enabling history on a table with data: earlier changes are not
+	// events, and what they left is the Before of a block's first event.
+	if err := client.Set(ctx, 3, 3, geo.blockPattern(3)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := client.SetTableOptions(ctx, "default", TableOptions{History: true}); err != nil {
+		t.Fatalf("SetTableOptions: %v", err)
+	}
+	enabled, err := client.TableInfo(ctx, "default")
+	if err != nil || !enabled.Options.History || enabled.HistoryStart == 0 || enabled.Options.HistoryMaxTagBytes != 32 {
+		t.Fatalf("TableInfo: %+v, %v", enabled, err)
+	}
+	// The first write after enabling, in another chunk, takes the start
+	// revision.
+	if err := client.Set(ctx, 100, 100, geo.blockPattern(5)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := client.Set(ctx, 3, 3, geo.blockPattern(4), WithTag(tag)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	page, err := client.History(ctx, 3, 3, HistoryOptions{})
+	if err != nil || page.Cursor != "" || len(page.Events) != 1 || page.Events[0].Before.Bits != geo.blockPattern(3) ||
+		page.Events[0].After.Bits != geo.blockPattern(4) || !bytes.Equal(page.Events[0].Tag, tag) ||
+		page.Events[0].Revision <= enabled.HistoryStart {
+		t.Fatalf("History: %+v, %v", page, err)
+	}
+	// Before history started is not kept; from its start on it is.
+	_, err = client.GetAt(ctx, 3, 3, AtRevision(enabled.HistoryStart-1))
+	if start, ok := NotRetainedStart(err); !ok || start != enabled.HistoryStart {
+		t.Fatalf("got %v, want NOT_RETAINED start=%d", err, enabled.HistoryStart)
+	}
+	if block, err := client.GetAt(ctx, 3, 3, AtRevision(enabled.HistoryStart)); err != nil || block.Bits != geo.blockPattern(3) {
+		t.Fatalf("GetAt the start: %+v, %v", block, err)
+	}
+}
+
+func TestIntegrationHistory(t *testing.T) {
+	// The admin client, the world client and two pooled connections.
+	server := startServer(t, serverConfig{workers: 6})
+	admin := connectIntegration(t, server, nil)
+	ctx := t.Context()
+	if err := admin.CreateTable(ctx, "world", TableSpec{
+		BlockBits: 4, ChunkWidthBlocks: 4, ChunkHeightBlocks: 4,
+		Options: TableOptions{History: true, HistoryMaxTagBytes: 8, ExtraMaxBlockBits: 64},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	info, err := admin.TableInfo(ctx, "world")
+	if err != nil {
+		t.Fatalf("TableInfo: %v", err)
+	}
+	world := connectIntegration(t, server, func(o *Options) { o.Table = "world" })
+	connection := activeConn(world)
+	model := newHistoryModel(readGeometry(t, world))
+	version := func(x, y int64) uint64 {
+		t.Helper()
+		cx, cy := model.chunkOf(x, y)
+		v, err := world.ChunkVersion(ctx, cx, cy)
+		if err != nil {
+			t.Fatalf("ChunkVersion: %v", err)
+		}
+		return v
+	}
+	must := func(label string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", label, err)
+		}
+	}
+	block := func(bits string, extra *ExtraValue) *historyBlock { return &historyBlock{bits: bits, extra: extra} }
+
+	// Phase 1: a tagged write, one that changes nothing, an untagged one,
+	// extra data, MSET into two chunks and a chunk write.
+	tagSet, tagXPut, tagMSet, tagPut := []byte("set"), []byte("xput"), []byte("mset"), []byte("put")
+	must("Set", world.Set(ctx, 1, 1, "1010", WithTag(tagSet)))
+	model.change(version(1, 1), tagSet, 1, 1, block("1010", nil))
+	must("Set", world.Set(ctx, 1, 1, "1010", WithTag(tagSet)))
+	must("Set", world.Set(ctx, 1, 1, "0011"))
+	model.change(version(1, 1), nil, 1, 1, block("0011", nil))
+	value12 := ExtraValue{BitLength: 12, Bytes: []byte{0xab, 0x0c}}
+	must("XPut", world.XPut(ctx, 1, 1, value12, WithTag(tagXPut)))
+	model.change(version(1, 1), tagXPut, 1, 1, block("0011", &value12))
+	must("MSet", world.MSet(ctx, []Block{{X: 2, Y: 2, Bits: "1111"}, {X: 5, Y: 1, Bits: "0001"}}, WithTag(tagMSet)))
+	model.change(version(2, 2), tagMSet, 2, 2, block("1111", nil))
+	model.change(version(5, 1), tagMSet, 5, 1, block("0001", nil))
+	put := map[int]*historyBlock{0: block("0100", nil), 6: block("1001", nil), 15: block("0000", nil)}
+	payload, presence, _ := model.packChunk(put)
+	result, err := world.PutChunkState(ctx, 0, 1, ChunkStateInput{Payload: payload, Presence: presence}, PutOptions{Tag: tagPut})
+	must("PutChunkState", err)
+	model.changeChunk(result.Version, tagPut, 0, 1, put)
+
+	// The past is phase 1: every commit so far is at or before past.
+	pastRevision := result.Version
+	pastTime := time.Now().UnixMilli()
+	past := model.snapshot()
+	for time.Now().UnixMilli() <= pastTime {
+		time.Sleep(time.Millisecond)
+	}
+	phase1 := len(model.events)
+
+	// Phase 2.
+	tagXDel, tagUnset, tagBatch, tagBatchIf, tagPutX, tagOut := []byte("xdel"), []byte("unset"), []byte("batch"),
+		[]byte("batchif"), []byte("putx"), []byte("out")
+	must("XDel", world.XDel(ctx, 1, 1, WithTag(tagXDel)))
+	model.change(version(1, 1), tagXDel, 1, 1, block("0011", nil))
+	must("Unset", world.Unset(ctx, 2, 2, WithTag(tagUnset)))
+	model.change(version(2, 2), tagUnset, 2, 2, nil)
+	chunk00 := version(0, 0)
+	// (3, 3) is set and unset in the batch: no event.
+	result, err = world.ChunkBatch(ctx, 0, 0, []BatchOperation{
+		SetOp(0, 0, "0110"), XPutOp(0, 0, "101"), UnsetOp(1, 1), SetOp(3, 3, "1000"), UnsetOp(3, 3),
+	}, WithTag(tagBatch))
+	must("ChunkBatch", err)
+	after := model.chunkBlocks(0, 0)
+	after[0] = block("0110", &ExtraValue{BitLength: 3, Bytes: []byte{0x05}})
+	delete(after, 5)
+	model.changeChunk(result.Version, tagBatch, 0, 0, after)
+	chunk10 := version(5, 1)
+	result, err = world.ChunkBatchIfVersion(ctx, 1, 0, chunk10, []BatchOperation{SetOp(5, 1, "1000")}, WithTag(tagBatchIf))
+	if err != nil || !result.OK {
+		t.Fatalf("ChunkBatchIfVersion: %+v, %v", result, err)
+	}
+	model.change(result.Version, tagBatchIf, 5, 1, block("1000", nil))
+	// A rejected write records nothing.
+	if stale, err := world.ChunkBatchIfVersion(ctx, 1, 0, chunk10, []BatchOperation{UnsetOp(5, 1)}, WithTag(tagBatchIf)); err != nil || stale.OK {
+		t.Fatalf("ChunkBatchIfVersion with a stale version: %+v, %v", stale, err)
+	}
+	value64 := extraValueOf(64, 7)
+	putX := map[int]*historyBlock{0: block("1111", &value64), 15: block("0001", nil)}
+	payload, presence, extra := model.packChunk(putX)
+	chunk11 := version(4, 4)
+	result, err = world.PutChunkStateExtra(ctx, 1, 1, ChunkStateExtraInput{Payload: payload, Presence: presence, Extra: extra},
+		PutOptions{IfVersion: &chunk11, ZRLE: true, Tag: tagPutX})
+	if err != nil || !result.OK {
+		t.Fatalf("PutChunkStateExtra: %+v, %v", result, err)
+	}
+	model.changeChunk(result.Version, tagPutX, 1, 1, putX)
+	// Chunk (2, 0) lies outside the range read below.
+	out := map[int]*historyBlock{}
+	for i := range 16 {
+		out[i] = block("0101", nil)
+	}
+	payload, _, _ = model.packChunk(out)
+	result, err = world.PutChunk(ctx, 2, 0, payload, PutOptions{Tag: tagOut})
+	must("PutChunk", err)
+	model.changeChunk(result.Version, tagOut, 2, 0, out)
+	must("Set", world.Set(ctx, 0, 0, "0110"))
+
+	// Every block, chunk and the range, oldest and newest first, by hand
+	// and with the iterators.
+	inChunk := func(cx, cy int64) func(HistoryEvent) bool {
+		return func(event HistoryEvent) bool {
+			x, y := model.chunkOf(event.X, event.Y)
+			return x == cx && y == cy
+		}
+	}
+	blocks := map[[2]int64]bool{}
+	for _, event := range model.events {
+		blocks[[2]int64{event.X, event.Y}] = true
+	}
+	for key := range blocks {
+		x, y := key[0], key[1]
+		at := func(event HistoryEvent) bool { return event.X == x && event.Y == y }
+		label := fmt.Sprintf("block (%d, %d)", x, y)
+		requireEvents(t, label+" ascending", collectEvents(t, label,
+			world.HistoryEvents(ctx, x, y, HistoryOptions{Limit: 2, Ascending: true})), model.eventsWhere(false, at))
+		requireEvents(t, label+" descending", collectPages(t, label, HistoryOptions{Limit: 1},
+			func(opts HistoryOptions) (HistoryPage, error) { return world.History(ctx, x, y, opts) }), model.eventsWhere(true, at))
+	}
+	for _, chunk := range [][2]int64{{0, 0}, {1, 0}, {0, 1}, {1, 1}, {2, 0}} {
+		cx, cy := chunk[0], chunk[1]
+		label := fmt.Sprintf("chunk (%d, %d)", cx, cy)
+		requireEvents(t, label+" ascending", collectPages(t, label, HistoryOptions{Limit: 3, Ascending: true},
+			func(opts HistoryOptions) (HistoryPage, error) { return world.ChunkHistory(ctx, cx, cy, opts) }),
+			model.eventsWhere(false, inChunk(cx, cy)))
+		requireEvents(t, label+" descending", collectEvents(t, label,
+			world.ChunkHistoryEvents(ctx, cx, cy, HistoryOptions{Limit: 2})), model.eventsWhere(true, inChunk(cx, cy)))
+	}
+	inRange := func(event HistoryEvent) bool {
+		cx, cy := model.chunkOf(event.X, event.Y)
+		return cx >= 0 && cx <= 1 && cy >= 0 && cy <= 1
+	}
+	requireEvents(t, "range ascending", collectEvents(t, "range",
+		world.RangeHistoryEvents(ctx, 0, 0, 1, 1, HistoryOptions{Limit: 4, Ascending: true})), model.eventsWhere(false, inRange))
+	requireEvents(t, "range descending", collectPages(t, "range", HistoryOptions{Limit: 5},
+		func(opts HistoryOptions) (HistoryPage, error) { return world.RangeHistory(ctx, 0, 0, 1, 1, opts) }),
+		model.eventsWhere(true, inRange))
+	// The newest 100 by default, in one page here.
+	page, err := world.RangeHistory(ctx, 0, 0, 2, 1, HistoryOptions{})
+	if err != nil || page.Cursor != "" {
+		t.Fatalf("RangeHistory: cursor %q, %v", page.Cursor, err)
+	}
+	requireEvents(t, "range default", page.Events, model.eventsWhere(true, func(HistoryEvent) bool { return true }))
+
+	// Filters: a tag, commit times, and what changed after a chunk version.
+	requireEvents(t, "tag", collectEvents(t, "tag", world.RangeHistoryEvents(ctx, 0, 0, 2, 1, HistoryOptions{Tag: tagMSet})),
+		model.eventsWhere(true, func(event HistoryEvent) bool { return bytes.Equal(event.Tag, tagMSet) }))
+	requireEvents(t, "until", collectEvents(t, "until",
+		world.RangeHistoryEvents(ctx, 0, 0, 2, 1, HistoryOptions{Ascending: true, UntilMs: pastTime})), model.events[:phase1])
+	requireEvents(t, "since", collectEvents(t, "since",
+		world.RangeHistoryEvents(ctx, 0, 0, 2, 1, HistoryOptions{Ascending: true, SinceMs: pastTime + 1})), model.events[phase1:])
+	requireEvents(t, "after a chunk version", collectEvents(t, "after",
+		world.ChunkHistoryEvents(ctx, 0, 0, HistoryOptions{Ascending: true, After: RevisionCursor(chunk00)})),
+		model.eventsWhere(false, func(event HistoryEvent) bool { return inChunk(0, 0)(event) && event.Revision > chunk00 }))
+	requireEvents(t, "before a chunk version", collectEvents(t, "before",
+		world.ChunkHistoryEvents(ctx, 0, 0, HistoryOptions{Before: RevisionCursor(chunk00), After: RevisionCursor(info.HistoryStart)})),
+		model.eventsWhere(true, func(event HistoryEvent) bool { return inChunk(0, 0)(event) && event.Revision < chunk00 }))
+
+	// Reads in the past: at the revision and at the time phase 1 ended,
+	// on every read command.
+	for _, point := range []HistoryPoint{AtRevision(pastRevision), AtTimeMs(pastTime)} {
+		for key := range blocks {
+			want := BlockState{}
+			if block, ok := past[key]; ok {
+				want = BlockState{Exists: true, Bits: block.bits}
+			}
+			if got, err := world.GetAt(ctx, key[0], key[1], point); err != nil || got != want {
+				t.Fatalf("GetAt(%v, %+v): %+v, %v; want %+v", key, point, got, err, want)
+			}
+		}
+		var populated []RangeEntry
+		for _, chunk := range [][2]int64{{0, 0}, {1, 0}, {0, 1}, {1, 1}} {
+			cx, cy := chunk[0], chunk[1]
+			blocks := model.stateIn(past, cx, cy)
+			payload, presence, extra := model.packChunk(blocks)
+			for _, zrle := range []bool{false, true} {
+				opts := GetOptions{ZRLE: zrle, At: point}
+				got, err := world.GetChunk(ctx, cx, cy, opts)
+				if err != nil || !bytes.Equal(got, payload) {
+					t.Fatalf("GetChunk(%d, %d, %+v): %x, %v; want %x", cx, cy, opts, got, err, payload)
+				}
+				state, err := world.GetChunkState(ctx, cx, cy, opts)
+				if err != nil || !bytes.Equal(state.Payload, payload) || !bytes.Equal(state.Presence, presence) ||
+					state.Exists != (len(blocks) > 0) {
+					t.Fatalf("GetChunkState(%d, %d, %+v): %+v, %v", cx, cy, opts, state, err)
+				}
+				withExtra, err := world.GetChunkStateExtra(ctx, cx, cy, opts)
+				if err != nil || !bytes.Equal(withExtra.Payload, payload) || !equalExtra(withExtra.Extra, extra) {
+					t.Fatalf("GetChunkStateExtra(%d, %d, %+v): %+v, %v", cx, cy, opts, withExtra, err)
+				}
+			}
+			if len(blocks) > 0 {
+				populated = append(populated, RangeEntry{CX: cx, CY: cy, Payload: payload, Presence: presence})
+			}
+		}
+		slices.SortFunc(populated, func(a, b RangeEntry) int { return cmp.Or(cmp.Compare(a.CX, b.CX), cmp.Compare(a.CY, b.CY)) })
+		entries, err := world.ChunkRange(ctx, 0, 0, 1, 1, GetOptions{At: point})
+		if err != nil || !reflect.DeepEqual(entries, populated) {
+			t.Fatalf("ChunkRange(%+v): %+v, %v; want %+v", point, entries, err, populated)
+		}
+		entries, err = world.ChunkRadius(ctx, 0, 0, 1, GetOptions{ZRLE: true, At: point})
+		radius := slices.DeleteFunc(slices.Clone(populated), func(entry RangeEntry) bool { return entry.CX == 1 && entry.CY == 1 })
+		if err != nil || !reflect.DeepEqual(entries, radius) {
+			t.Fatalf("ChunkRadius(%+v): %+v, %v; want %+v", point, entries, err, radius)
+		}
+	}
+	// The present, the next revision and the future, and before the start.
+	if got, err := world.Get(ctx, 0, 0); err != nil || got.Bits != "0110" {
+		t.Fatalf("Get: %+v, %v", got, err)
+	}
+	_, err = world.GetAt(ctx, 0, 0, AtRevision(math.MaxUint64))
+	requireServerCode(t, err, "OUT_OF_RANGE")
+	_, err = world.GetChunkState(ctx, 0, 0, GetOptions{At: AtTimeMs(time.Now().Add(time.Hour).UnixMilli())})
+	requireServerCode(t, err, "OUT_OF_RANGE")
+	_, err = world.ChunkRange(ctx, 0, 0, 1, 1, GetOptions{At: AtRevision(info.HistoryStart - 1)})
+	if start, ok := NotRetainedStart(err); !ok || start != info.HistoryStart {
+		t.Fatalf("got %v, want NOT_RETAINED start=%d", err, info.HistoryStart)
+	}
+	_, err = world.GetAt(ctx, 0, 0, AtTimeMs(1))
+	requireServerCode(t, err, CodeNotRetained)
+
+	// Events of a chunk at the edge of the chunk range lie beyond int64:
+	// a protocol error that keeps the connection. The chunk before it ends
+	// at block MaxInt64.
+	payload, _, _ = model.packChunk(map[int]*historyBlock{})
+	for _, cx := range []int64{math.MaxInt64, math.MaxInt64 / 4} {
+		if _, err := world.PutChunk(ctx, cx, 0, payload, PutOptions{}); err != nil {
+			t.Fatalf("PutChunk: %v", err)
+		}
+	}
+	if _, err := world.ChunkHistory(ctx, math.MaxInt64, 0, HistoryOptions{Limit: 1}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want ErrProtocol for coordinates beyond int64", err)
+	}
+	if page, err := world.ChunkHistory(ctx, math.MaxInt64/4, 0, HistoryOptions{Limit: 1}); err != nil ||
+		len(page.Events) != 1 || page.Events[0].X != math.MaxInt64 || page.Events[0].Y != 3 {
+		t.Fatalf("ChunkHistory: %+v, %v", page, err)
+	}
+	if err := world.Ping(ctx); err != nil || activeConn(world) != connection {
+		t.Fatalf("Ping: %v; the connection was replaced: %v", err, activeConn(world) != connection)
+	}
+
+	// A pool reads the same pages, and tags its writes.
+	pool, err := ConnectPool(ctx, PoolOptions{Options: Options{URI: server.uri, Table: "world"}, MaxConnections: 2})
+	if err != nil {
+		t.Fatalf("ConnectPool: %v", err)
+	}
+	defer pool.Close()
+	tagPool := []byte("pool")
+	must("Set", pool.Set(ctx, 9, 9, "1100", WithTag(tagPool)))
+	v, err := pool.ChunkVersion(ctx, 2, 2)
+	must("ChunkVersion", err)
+	model.change(v, tagPool, 9, 9, block("1100", nil))
+	requireEvents(t, "pool chunk", collectEvents(t, "pool", pool.ChunkHistoryEvents(ctx, 2, 2, HistoryOptions{Limit: 1})),
+		model.eventsWhere(true, inChunk(2, 2)))
+	if page, err := pool.History(ctx, 9, 9, HistoryOptions{Tag: tagPool}); err != nil || len(page.Events) != 1 {
+		t.Fatalf("History: %+v, %v", page, err)
+	}
+	if got, err := pool.GetAt(ctx, 9, 9, AtRevision(v-1)); err != nil || got.Exists {
+		t.Fatalf("GetAt: %+v, %v", got, err)
+	}
+}
+
+// Retention removes the oldest history of a chunk: oldest first fails at
+// once, newest first after the pages of what is kept.
+func TestIntegrationHistoryRetention(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.CommandTimeout = 60 * time.Second })
+	ctx := t.Context()
+	// 64x64 blocks of 16 bits: 8 KiB per chunk write; history segments roll
+	// at 64 KiB.
+	if err := client.CreateTable(ctx, "trim", TableSpec{
+		BlockBits: 16, ChunkWidthBlocks: 64, ChunkHeightBlocks: 64,
+		Options: TableOptions{History: true, HistoryMaxChunkBytes: 1, CheckpointUpdates: 2},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	if _, err := client.Use(ctx, "trim"); err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+	var versions []uint64
+	for i := range 16 {
+		// Seeds two apart change every block.
+		result, err := client.PutChunk(ctx, 0, 0, denseBytes(8192, byte(2*i)), PutOptions{})
+		if err != nil {
+			t.Fatalf("PutChunk: %v", err)
+		}
+		versions = append(versions, result.Version)
+	}
+
+	_, err := client.ChunkHistory(ctx, 0, 0, HistoryOptions{Ascending: true})
+	start, ok := NotRetainedStart(err)
+	if !ok || start <= versions[0] || start >= versions[len(versions)-1] {
+		t.Fatalf("got %v, want NOT_RETAINED with a start among the writes %v", err, versions)
+	}
+	_, err = client.GetChunk(ctx, 0, 0, GetOptions{At: AtRevision(start - 1)})
+	if got, ok := NotRetainedStart(err); !ok || got != start {
+		t.Fatalf("GetChunk before the start: %v", err)
+	}
+	if _, err := client.GetChunk(ctx, 0, 0, GetOptions{At: AtRevision(start)}); err != nil {
+		t.Fatalf("GetChunk at the start: %v", err)
+	}
+
+	// Newest first: every kept event, then NOT_RETAINED.
+	var kept []HistoryEvent
+	for event, err := range client.ChunkHistoryEvents(ctx, 0, 0, HistoryOptions{Limit: 1024}) {
+		if err != nil {
+			if got, ok := NotRetainedStart(err); !ok || got != start {
+				t.Fatalf("got %v, want NOT_RETAINED start=%d", err, start)
+			}
+			break
+		}
+		kept = append(kept, event)
+	}
+	if len(kept) == 0 || len(kept)%4096 != 0 || kept[len(kept)-1].Revision <= start {
+		t.Fatalf("got %d kept events, the oldest at %d, start %d", len(kept), kept[len(kept)-1].Revision, start)
+	}
+	// From the start on, the same events oldest first, to the end.
+	ascending := collectEvents(t, "kept", client.ChunkHistoryEvents(ctx, 0, 0,
+		HistoryOptions{Limit: 1024, Ascending: true, After: RevisionCursor(start)}))
+	slices.Reverse(ascending)
+	if !reflect.DeepEqual(ascending, kept) {
+		t.Fatalf("got %d events oldest first, %d newest first", len(ascending), len(kept))
+	}
+}
+
+// A page can be empty and carry a cursor: here the server reads its budget
+// of history without finding the tag.
+func TestIntegrationHistoryEmptyPage(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.CommandTimeout = 60 * time.Second })
+	ctx := t.Context()
+	// 1024x1024 blocks of 16 bits: 2 MiB per chunk write, past the 16 MiB
+	// the server reads for one page in ten writes.
+	if err := client.CreateTable(ctx, "big", TableSpec{
+		BlockBits: 16, ChunkWidthBlocks: 1024, ChunkHeightBlocks: 1024,
+		Options: TableOptions{History: true, CheckpointUpdates: 1},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	if _, err := client.Use(ctx, "big"); err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+	for i := range 10 {
+		if _, err := client.PutChunk(ctx, 0, 0, denseBytes(2<<20, byte(2*i)), PutOptions{}); err != nil {
+			t.Fatalf("PutChunk: %v", err)
+		}
+	}
+	tag := []byte{0x77}
+	if err := client.Set(ctx, 0, 0, "0000000000000000", WithTag(tag)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	page, err := client.ChunkHistory(ctx, 0, 0, HistoryOptions{Ascending: true, Tag: tag})
+	if err != nil || len(page.Events) != 0 || page.Cursor == "" {
+		t.Fatalf("ChunkHistory: %d events, cursor %q, %v; want an empty page with a cursor", len(page.Events), page.Cursor, err)
+	}
+	for _, ascending := range []bool{true, false} {
+		events := collectEvents(t, "tagged", client.ChunkHistoryEvents(ctx, 0, 0, HistoryOptions{Ascending: ascending, Tag: tag}))
+		if len(events) != 1 || !bytes.Equal(events[0].Tag, tag) || events[0].After.Bits != "0000000000000000" {
+			t.Fatalf("ascending=%v: got %+v, want the tagged event", ascending, events)
+		}
 	}
 }

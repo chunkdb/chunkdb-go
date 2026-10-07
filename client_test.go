@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -69,7 +70,8 @@ func genericHandler(_ *fakeServer, conn net.Conn, command string) {
 		if strings.Contains(command, " STATE") {
 			size += testPresenceBytes
 		}
-		if strings.HasSuffix(command, " ZRLE") {
+		// ZRLE comes last but for AT.
+		if strings.Contains(command, " ZRLE") {
 			writeBulk(conn, ZRLECompress(make([]byte, size)))
 			return
 		}
@@ -84,7 +86,7 @@ func genericHandler(_ *fakeServer, conn net.Conn, command string) {
 			items = append(items, "0000")
 		}
 		writeArray(conn, items...)
-	case "CHUNKSCAN":
+	case "CHUNKSCAN", "HISTORY", "CHUNKHISTORY", "RANGEHISTORY":
 		writeArray(conn, "END")
 	case "CHUNKRANGE", "CHUNKRADIUS":
 		writeArray(conn)
@@ -152,10 +154,11 @@ func TestClientServerInfo(t *testing.T) {
 	if info == nil {
 		t.Fatal("got nil ServerInfo after connecting")
 	}
-	if info.Protocol != 2 || info.ServerVersion != "test" || len(info.Capabilities) != 2 ||
-		info.Capabilities[0] != "zrle" || info.Capabilities[1] != "extra-data" || info.MaxLineBytes != 65536 ||
+	if info.Protocol != 2 || info.ServerVersion != "test" ||
+		!slices.Equal(info.Capabilities, []string{"zrle", "extra-data", "history"}) || info.MaxLineBytes != 65536 ||
 		info.MaxAreaChunks != 256 || info.MaxResponseBytes != 67108864 || info.MaxScanLimit != 1024 ||
-		info.MaxBatchOps != 1024 || info.MaxExtraChunkBytes != 16777216 {
+		info.MaxBatchOps != 1024 || info.MaxExtraChunkBytes != 16777216 || info.MaxTagBytes != 255 ||
+		info.MaxHistoryLimit != 1024 {
 		t.Fatalf("got %+v", info)
 	}
 	if info.Table == nil || info.Table.Name != "default" || info.Table.BlockBits != 4 ||
@@ -163,8 +166,9 @@ func TestClientServerInfo(t *testing.T) {
 		info.Table.Options.DurabilityMode != "relaxed" {
 		t.Fatalf("got table %+v", info.Table)
 	}
-	if info.Table.Options.ExtraMaxBlockBits != 0 || info.Table.Options.ExtraMaxChunkBytes != 0 {
-		t.Fatalf("got table options %+v, want no extra data", info.Table.Options)
+	if info.Table.Options.ExtraMaxBlockBits != 0 || info.Table.Options.ExtraMaxChunkBytes != 0 ||
+		info.Table.Options.History || info.Table.Options.HistoryMaxTagBytes != 0 || info.Table.HistoryStart != 0 {
+		t.Fatalf("got table options %+v, want no extra data and no history", info.Table.Options)
 	}
 	if info.Values["server_version"] != "test" {
 		t.Fatalf("got values %v", info.Values)
@@ -313,6 +317,12 @@ func TestClientHelloRejectsBadReplies(t *testing.T) {
 			strings.Replace(defaultInfo, "extra_max_block_bits=0", "extra_max_block_bits=x", 1),
 		"extra_max_chunk_bytes negative": helloLimits +
 			strings.Replace(defaultInfo, "extra_max_chunk_bytes=0", "extra_max_chunk_bytes=-1", 1),
+		"max_tag_bytes zero": strings.Replace(helloLimits, "max_tag_bytes=255", "max_tag_bytes=0", 1),
+		"max_history_limit not a number": strings.Replace(helloLimits, "max_history_limit=1024",
+			"max_history_limit=lots", 1),
+		"history neither on nor off": helloLimits + strings.Replace(defaultInfo, "history=off", "history=1", 1),
+		"history_start negative": helloLimits +
+			strings.Replace(defaultInfo, "history_start=0", "history_start=-1", 1),
 	}
 
 	for name, reply := range cases {
@@ -396,6 +406,16 @@ func TestClientWithoutTable(t *testing.T) {
 		},
 		"PutChunkStateExtra": func() error {
 			_, err := client.PutChunkStateExtra(ctx, 0, 0, ChunkStateExtraInput{}, PutOptions{})
+			return err
+		},
+		// History events are checked against the table's block_bits.
+		"History": func() error { _, err := client.History(ctx, 0, 0, HistoryOptions{}); return err },
+		"ChunkHistory": func() error {
+			_, err := client.ChunkHistory(ctx, 0, 0, HistoryOptions{})
+			return err
+		},
+		"RangeHistory": func() error {
+			_, err := client.RangeHistory(ctx, 0, 0, 1, 1, HistoryOptions{})
 			return err
 		},
 	}

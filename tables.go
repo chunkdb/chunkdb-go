@@ -135,7 +135,8 @@ func (c *Client) CreateTable(ctx context.Context, name string, spec TableSpec) e
 
 // SetTableOptions changes the non-zero options of a table; the server
 // reopens the table. Extra data cannot be turned off and its limits cannot be
-// lowered; the server refuses that with INVALID_ARGUMENT.
+// lowered, and history cannot be turned off; the server refuses that with
+// INVALID_ARGUMENT. [HistoryNoLimit] removes a history limit.
 func (c *Client) SetTableOptions(ctx context.Context, name string, options TableOptions) error {
 	args := tableOptionArgs(options)
 	if len(args) == 0 {
@@ -192,6 +193,28 @@ func tableOptionArgs(options TableOptions) []string {
 	}
 	if options.ExtraMaxChunkBytes != 0 {
 		args = append(args, "extra_max_chunk_bytes", strconv.Itoa(options.ExtraMaxChunkBytes))
+	}
+	if options.History {
+		args = append(args, "history", "on")
+	}
+	for _, field := range []struct {
+		key   string
+		value uint64
+	}{
+		{"history_max_age_ms", options.HistoryMaxAgeMs},
+		{"history_max_chunk_bytes", options.HistoryMaxChunkBytes},
+	} {
+		switch field.value {
+		case 0:
+		case HistoryNoLimit:
+			// The server's 0 keeps all history.
+			args = append(args, field.key, "0")
+		default:
+			args = append(args, field.key, strconv.FormatUint(field.value, 10))
+		}
+	}
+	if options.HistoryMaxTagBytes != 0 {
+		args = append(args, "history_max_tag_bytes", strconv.Itoa(options.HistoryMaxTagBytes))
 	}
 	return args
 }
@@ -257,5 +280,56 @@ func parseTableValues(values map[string]string, command string) (TableInfo, erro
 		}
 		*field.target = value
 	}
+	if err := parseTableHistory(values, command, &info); err != nil {
+		return TableInfo{}, err
+	}
 	return info, nil
+}
+
+// parseTableHistory reads the history lines: "off" and zeros for a table
+// without history, all absent from servers without the history capability.
+func parseTableHistory(values map[string]string, command string, info *TableInfo) error {
+	invalid := func(key string) error {
+		return protocolErrorf(command, "%s has an invalid %s: %s", command, key, values[key])
+	}
+	if text, ok := values["history"]; ok {
+		switch text {
+		case "on":
+			info.Options.History = true
+		case "off":
+		default:
+			return invalid("history")
+		}
+	}
+	for _, field := range []struct {
+		key    string
+		target *uint64
+	}{
+		{"history_start", &info.HistoryStart},
+		{"history_max_age_ms", &info.Options.HistoryMaxAgeMs},
+		{"history_max_chunk_bytes", &info.Options.HistoryMaxChunkBytes},
+	} {
+		if text, ok := values[field.key]; ok {
+			value, err := strconv.ParseUint(text, 10, 64)
+			if err != nil {
+				return invalid(field.key)
+			}
+			*field.target = value
+		}
+	}
+	if text, ok := values["history_start_time_ms"]; ok {
+		value, err := strconv.ParseInt(text, 10, 64)
+		if err != nil || value < 0 {
+			return invalid("history_start_time_ms")
+		}
+		info.HistoryStartTimeMs = value
+	}
+	if text, ok := values["history_max_tag_bytes"]; ok {
+		value, err := strconv.Atoi(text)
+		if err != nil || value < 0 {
+			return invalid("history_max_tag_bytes")
+		}
+		info.Options.HistoryMaxTagBytes = value
+	}
+	return nil
 }

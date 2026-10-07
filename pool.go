@@ -3,6 +3,7 @@ package chunkdb
 import (
 	"context"
 	"errors"
+	"iter"
 	"sync"
 	"time"
 )
@@ -287,19 +288,24 @@ func (p *Pool) Get(ctx context.Context, x, y int64) (BlockState, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (BlockState, error) { return c.Get(ctx, x, y) })
 }
 
+// GetAt runs [Client.GetAt] on a leased client.
+func (p *Pool) GetAt(ctx context.Context, x, y int64, at HistoryPoint) (BlockState, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (BlockState, error) { return c.GetAt(ctx, x, y, at) })
+}
+
 // Set runs [Client.Set] on a leased client.
-func (p *Pool) Set(ctx context.Context, x, y int64, bits string) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Set(ctx, x, y, bits) })
+func (p *Pool) Set(ctx context.Context, x, y int64, bits string, opts ...WriteOption) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Set(ctx, x, y, bits, opts...) })
 }
 
 // Unset runs [Client.Unset] on a leased client.
-func (p *Pool) Unset(ctx context.Context, x, y int64) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Unset(ctx, x, y) })
+func (p *Pool) Unset(ctx context.Context, x, y int64, opts ...WriteOption) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Unset(ctx, x, y, opts...) })
 }
 
 // MSet runs [Client.MSet] on a leased client.
-func (p *Pool) MSet(ctx context.Context, blocks []Block) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.MSet(ctx, blocks) })
+func (p *Pool) MSet(ctx context.Context, blocks []Block, opts ...WriteOption) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.MSet(ctx, blocks, opts...) })
 }
 
 // MGet runs [Client.MGet] on a leased client.
@@ -313,13 +319,13 @@ func (p *Pool) XGet(ctx context.Context, x, y int64) (*ExtraValue, error) {
 }
 
 // XPut runs [Client.XPut] on a leased client.
-func (p *Pool) XPut(ctx context.Context, x, y int64, value ExtraValue) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.XPut(ctx, x, y, value) })
+func (p *Pool) XPut(ctx context.Context, x, y int64, value ExtraValue, opts ...WriteOption) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.XPut(ctx, x, y, value, opts...) })
 }
 
 // XDel runs [Client.XDel] on a leased client.
-func (p *Pool) XDel(ctx context.Context, x, y int64) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.XDel(ctx, x, y) })
+func (p *Pool) XDel(ctx context.Context, x, y int64, opts ...WriteOption) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.XDel(ctx, x, y, opts...) })
 }
 
 // ChunkExists runs [Client.ChunkExists] on a leased client.
@@ -396,16 +402,61 @@ func (p *Pool) ChunkVersion(ctx context.Context, cx, cy int64) (uint64, error) {
 }
 
 // ChunkBatch runs [Client.ChunkBatch] on a leased client.
-func (p *Pool) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation) (MutationResult, error) {
+func (p *Pool) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation, opts ...WriteOption) (MutationResult, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.ChunkBatch(ctx, cx, cy, operations)
+		return c.ChunkBatch(ctx, cx, cy, operations, opts...)
 	})
 }
 
 // ChunkBatchIfVersion runs [Client.ChunkBatchIfVersion] on a leased client.
-func (p *Pool) ChunkBatchIfVersion(ctx context.Context, cx, cy int64, expectedVersion uint64, operations []BatchOperation) (MutationResult, error) {
+func (p *Pool) ChunkBatchIfVersion(ctx context.Context, cx, cy int64, expectedVersion uint64, operations []BatchOperation, opts ...WriteOption) (MutationResult, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations)
+		return c.ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations, opts...)
+	})
+}
+
+// History runs [Client.History] on a leased client.
+func (p *Pool) History(ctx context.Context, x, y int64, opts HistoryOptions) (HistoryPage, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (HistoryPage, error) {
+		return c.History(ctx, x, y, opts)
+	})
+}
+
+// ChunkHistory runs [Client.ChunkHistory] on a leased client.
+func (p *Pool) ChunkHistory(ctx context.Context, cx, cy int64, opts HistoryOptions) (HistoryPage, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (HistoryPage, error) {
+		return c.ChunkHistory(ctx, cx, cy, opts)
+	})
+}
+
+// RangeHistory runs [Client.RangeHistory] on a leased client.
+func (p *Pool) RangeHistory(ctx context.Context, cx0, cy0, cx1, cy1 int64, opts HistoryOptions) (HistoryPage, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (HistoryPage, error) {
+		return c.RangeHistory(ctx, cx0, cy0, cx1, cy1, opts)
+	})
+}
+
+// HistoryEvents is [Client.HistoryEvents] with each page read on a leased
+// client.
+func (p *Pool) HistoryEvents(ctx context.Context, x, y int64, opts HistoryOptions) iter.Seq2[HistoryEvent, error] {
+	return historyEvents(ctx, "HISTORY", opts, func(ctx context.Context, opts HistoryOptions) (HistoryPage, error) {
+		return p.History(ctx, x, y, opts)
+	})
+}
+
+// ChunkHistoryEvents is [Client.ChunkHistoryEvents] with each page read on a
+// leased client.
+func (p *Pool) ChunkHistoryEvents(ctx context.Context, cx, cy int64, opts HistoryOptions) iter.Seq2[HistoryEvent, error] {
+	return historyEvents(ctx, "CHUNKHISTORY", opts, func(ctx context.Context, opts HistoryOptions) (HistoryPage, error) {
+		return p.ChunkHistory(ctx, cx, cy, opts)
+	})
+}
+
+// RangeHistoryEvents is [Client.RangeHistoryEvents] with each page read on a
+// leased client.
+func (p *Pool) RangeHistoryEvents(ctx context.Context, cx0, cy0, cx1, cy1 int64, opts HistoryOptions) iter.Seq2[HistoryEvent, error] {
+	return historyEvents(ctx, "RANGEHISTORY", opts, func(ctx context.Context, opts HistoryOptions) (HistoryPage, error) {
+		return p.RangeHistory(ctx, cx0, cy0, cx1, cy1, opts)
 	})
 }
 

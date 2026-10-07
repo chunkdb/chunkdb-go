@@ -84,8 +84,10 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 }
 
 // readFrameBounded is ReadFrame with the bulk payload limit given by
-// bulkLimit when the length header arrives (MaxBulkBytes when nil or 0): a
-// chunk read whose state and extra data exceed MaxBulkBytes is legal.
+// bulkLimit when the length header arrives (MaxBulkBytes when nil or 0),
+// for a bulk reply and each array item: a chunk read whose state and extra
+// data exceed MaxBulkBytes is legal, and so is a history event whose extra
+// data does.
 func readFrameBounded(r *bufio.Reader, bulkLimit func() int) (Frame, error) {
 	limit := func() int {
 		if bulkLimit != nil {
@@ -132,6 +134,7 @@ func readFrameBounded(r *bufio.Reader, bulkLimit func() int) (Frame, error) {
 		// The capacity hint is clamped so a bogus count cannot preallocate an
 		// arbitrarily large slice before any payload has arrived.
 		items := make([]Frame, 0, min(count, 1024))
+		itemLimit := limit()
 		for range count {
 			itemPrefix, err := r.ReadByte()
 			if err != nil {
@@ -140,7 +143,7 @@ func readFrameBounded(r *bufio.Reader, bulkLimit func() int) (Frame, error) {
 			if itemPrefix != '$' {
 				return Frame{}, protocolErrorf("", "expected bulk item in array response")
 			}
-			item, err := readBulk(r, MaxBulkBytes)
+			item, err := readBulk(r, itemLimit)
 			if err != nil {
 				return Frame{}, err
 			}

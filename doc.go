@@ -26,6 +26,13 @@
 // [Client.XGet], [Client.XPut], [Client.XDel], [Client.GetChunkStateExtra],
 // [Client.PutChunkStateExtra] and the [XPutOp] and [XDelOp] batch operations.
 //
+// A table can keep block history ([TableOptions.History]): every committed
+// change of every block, listed page by page with [Client.History],
+// [Client.ChunkHistory] and [Client.RangeHistory] or iterated with
+// [Client.HistoryEvents], [Client.ChunkHistoryEvents] and
+// [Client.RangeHistoryEvents], and read in the past with [Client.GetAt] and
+// [GetOptions.At]. Writes carry a tag with [WithTag] or [PutOptions.Tag].
+//
 // Every request method takes a [context.Context]. Cancelling it aborts the
 // call; because the protocol has no request identifiers, an aborted in-flight
 // request also drops the connection, since the client cannot resynchronize

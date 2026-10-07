@@ -91,8 +91,8 @@ func decodeExtraReply(body []byte) (ExtraValue, error) {
 // The table must have extra data, and the value must fit its
 // extra_max_block_bits and extra_max_chunk_bytes; the server checks those
 // limits and refuses a value over them with INVALID_ARGUMENT. Padding bits
-// past BitLength in the last byte are ignored.
-func (c *Client) XPut(ctx context.Context, x, y int64, value ExtraValue) error {
+// past BitLength in the last byte are ignored. [WithTag] tags the write.
+func (c *Client) XPut(ctx context.Context, x, y int64, value ExtraValue, opts ...WriteOption) error {
 	release, err := c.acquireSlot(ctx, "XPUT")
 	if err != nil {
 		return err
@@ -118,8 +118,12 @@ func (c *Client) XPut(ctx context.Context, x, y int64, value ExtraValue) error {
 		return requestErrorf("XPUT", "XPUT value of %d bytes exceeds the server's max_extra_chunk_bytes minus %d (%d)",
 			len(value.Bytes), extraEntryHeaderBytes, limit)
 	}
-	frame, err := c.execPayloadOn(ctx, established, value.Bytes, "XPUT", coord(x), coord(y),
-		strconv.Itoa(value.BitLength), strconv.Itoa(len(value.Bytes)))
+	tag, err := tagArgs(established, "XPUT", writeOptionsOf(opts).tag)
+	if err != nil {
+		return err
+	}
+	args := append([]string{coord(x), coord(y), strconv.Itoa(value.BitLength)}, tag...)
+	frame, err := c.execPayloadOn(ctx, established, value.Bytes, "XPUT", append(args, strconv.Itoa(len(value.Bytes)))...)
 	if err != nil {
 		return err
 	}
@@ -128,24 +132,21 @@ func (c *Client) XPut(ctx context.Context, x, y int64, value ExtraValue) error {
 
 // XDel removes the extra data of one block. Removing a value that does not
 // exist is not an error; on a table without extra data the server replies
-// INVALID_ARGUMENT.
-func (c *Client) XDel(ctx context.Context, x, y int64) error {
+// INVALID_ARGUMENT. [WithTag] tags the write.
+func (c *Client) XDel(ctx context.Context, x, y int64, opts ...WriteOption) error {
 	release, err := c.acquireSlot(ctx, "XDEL")
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	frame, err := c.exec(ctx, "XDEL", coord(x), coord(y))
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "XDEL")
+	return c.writeBlocks(ctx, "XDEL", opts, coord(x), coord(y))
 }
 
 // GetChunkStateExtra reads the chunk's payload, presence bitmap and extra
 // data in one request. The table must have extra data. An absent chunk
 // reports Exists false, zero payload and presence, and no values.
+// [GetOptions.At] reads it as it was in the past.
 //
 // With [GetOptions.ZRLE], decompression is bounded by the state size plus
 // [HelloInfo.MaxExtraChunkBytes].
@@ -164,8 +165,12 @@ func (c *Client) GetChunkStateExtra(ctx context.Context, cx, cy int64, opts GetO
 	if opts.ZRLE {
 		args = append(args, "ZRLE")
 	}
+	point, err := opts.At.args("CHUNKGET")
+	if err != nil {
+		return ChunkStateExtra{}, err
+	}
 	frame, err := c.execBoundedOn(ctx, established, chunkReplyBound(geo.stateBytes()+established.maxExtraChunkBytes),
-		"CHUNKGET", args...)
+		"CHUNKGET", append(args, point...)...)
 	if err != nil {
 		return ChunkStateExtra{}, err
 	}
@@ -215,8 +220,8 @@ func decodeChunkExtraBytes(body []byte, stateBytes, maxExtra int, zrle bool) ([]
 // its extra data in one write. Payload and presence work as for
 // [Client.PutChunkState]; every value in state.Extra must belong to a block
 // the new presence bitmap marks present and fit the table's extra data
-// limits, which the server checks. [PutOptions.IfVersion] and
-// [PutOptions.ZRLE] work as for [Client.PutChunk].
+// limits, which the server checks. [PutOptions.IfVersion], [PutOptions.ZRLE]
+// and [PutOptions.Tag] work as for [Client.PutChunk].
 func (c *Client) PutChunkStateExtra(ctx context.Context, cx, cy int64, state ChunkStateExtraInput, opts PutOptions) (MutationResult, error) {
 	release, err := c.acquireSlot(ctx, "CHUNKPUT")
 	if err != nil {

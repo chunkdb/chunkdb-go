@@ -3,6 +3,8 @@ package chunkdb
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // Phase identifies the stage of an operation that produced an [Error].
@@ -153,4 +155,32 @@ const (
 	// CodeTableExists is the [Error.ServerCode] for creating a table whose
 	// name is taken.
 	CodeTableExists = "TABLE_EXISTS"
+	// CodeNotRetained is the [Error.ServerCode] for a history read that
+	// reaches below what the table's history keeps; [NotRetainedStart] reads
+	// the oldest revision it still has.
+	CodeNotRetained = "NOT_RETAINED"
 )
+
+// NotRetainedStart reports whether err is a [CodeNotRetained] server error
+// and, if so, the revision the table's history is kept from: a window or an
+// [AtRevision] point from there on can still be read.
+func NotRetainedStart(err error) (start uint64, ok bool) {
+	var typed *Error
+	if !errors.As(err, &typed) || typed.ServerCode != CodeNotRetained {
+		return 0, false
+	}
+	return parseNotRetained(typed.ServerMessage)
+}
+
+// parseNotRetained reads the "start=<revision>" message of NOT_RETAINED.
+func parseNotRetained(message string) (uint64, bool) {
+	text, found := strings.CutPrefix(message, "start=")
+	if !found {
+		return 0, false
+	}
+	start, err := strconv.ParseUint(text, 10, 64)
+	if err != nil || strconv.FormatUint(start, 10) != text {
+		return 0, false
+	}
+	return start, true
+}

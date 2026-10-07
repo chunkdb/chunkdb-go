@@ -225,6 +225,57 @@ func ExampleClient_XPut() {
 	fmt.Println(got.BitLength, got.Bytes)
 }
 
+// Block history on a table that keeps it: a tagged write, every change of
+// a block, and the block as it was in the past.
+func ExampleClient_HistoryEvents() {
+	ctx := context.Background()
+
+	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	err = client.CreateTable(ctx, "world", chunkdb.TableSpec{
+		BlockBits: 16,
+		Options:   chunkdb.TableOptions{History: true},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := client.Use(ctx, "world"); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := client.Set(ctx, 10, 4, "0000000000000101", chunkdb.WithTag([]byte("job-7"))); err != nil {
+		log.Fatal(err)
+	}
+	version, err := client.ChunkVersion(ctx, 0, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := client.Set(ctx, 10, 4, "0000000000000110"); err != nil {
+		log.Fatal(err)
+	}
+
+	// Oldest first, page by page until the window ends.
+	for event, err := range client.HistoryEvents(ctx, 10, 4, chunkdb.HistoryOptions{Ascending: true}) {
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(event.Revision, event.Before.Bits, event.After.Bits, string(event.Tag))
+	}
+
+	then, err := client.GetAt(ctx, 10, 4, chunkdb.AtRevision(version))
+	if start, ok := chunkdb.NotRetainedStart(err); ok {
+		log.Fatalf("history is kept from revision %d", start)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(then.Bits)
+}
+
 // Server errors carry their protocol code, and the sentinels classify failures
 // without unwrapping.
 func ExampleError() {

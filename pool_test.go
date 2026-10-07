@@ -3,6 +3,7 @@ package chunkdb
 import (
 	"context"
 	"errors"
+	"iter"
 	"net"
 	"strings"
 	"sync"
@@ -315,6 +316,17 @@ func TestNewPoolRejectsBadOptions(t *testing.T) {
 	}
 }
 
+// drainHistory reads every event of a history iterator and returns its
+// error.
+func drainHistory(events iter.Seq2[HistoryEvent, error]) error {
+	for _, err := range events {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func TestPoolMirrorsClientCommands(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, nil)
@@ -339,6 +351,70 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 			"XPUT 1 2 3 1",
 		},
 		{"xdel", func() error { return pool.XDel(ctx, 1, 2) }, "XDEL 1 2"},
+		{"get at", func() error { _, err := pool.GetAt(ctx, 1, 2, AtRevision(3)); return err }, "GET 1 2 AT 3"},
+		{"tagged set", func() error { return pool.Set(ctx, 1, 2, "1010", WithTag([]byte{1})) }, "SET 1 2 1010 TAG 01"},
+		{"tagged unset", func() error { return pool.Unset(ctx, 1, 2, WithTag([]byte{1})) }, "UNSET 1 2 TAG 01"},
+		{
+			"tagged mset",
+			func() error { return pool.MSet(ctx, []Block{{X: 1, Y: 2, Bits: "1010"}}, WithTag([]byte{1})) },
+			"MSET 1 2 1010 TAG 01",
+		},
+		{
+			"tagged xput",
+			func() error {
+				return pool.XPut(ctx, 1, 2, ExtraValue{BitLength: 3, Bytes: []byte{5}}, WithTag([]byte{1}))
+			},
+			"XPUT 1 2 3 TAG 01 1",
+		},
+		{"tagged xdel", func() error { return pool.XDel(ctx, 1, 2, WithTag([]byte{1})) }, "XDEL 1 2 TAG 01"},
+		{
+			"tagged batch",
+			func() error {
+				_, err := pool.ChunkBatch(ctx, 1, 2, []BatchOperation{UnsetOp(3, 4)}, WithTag([]byte{1}))
+				return err
+			},
+			"CHUNKBATCH 1 2 TAG 01 UNSET 3 4",
+		},
+		{
+			"tagged batch with a version",
+			func() error {
+				_, err := pool.ChunkBatchIfVersion(ctx, 1, 2, 5, []BatchOperation{UnsetOp(3, 4)}, WithTag([]byte{1}))
+				return err
+			},
+			"CHUNKBATCH 1 2 IF 5 TAG 01 UNSET 3 4",
+		},
+		{
+			"history",
+			func() error { _, err := pool.History(ctx, 1, 2, HistoryOptions{Limit: 5}); return err },
+			"HISTORY 1 2 LIMIT 5",
+		},
+		{
+			"chunk history",
+			func() error { _, err := pool.ChunkHistory(ctx, 1, 2, HistoryOptions{Ascending: true}); return err },
+			"CHUNKHISTORY 1 2 ASC",
+		},
+		{
+			"range history",
+			func() error { _, err := pool.RangeHistory(ctx, 1, 2, 3, 4, HistoryOptions{After: "7"}); return err },
+			"RANGEHISTORY 1 2 3 4 AFTER 7",
+		},
+		{
+			"history events",
+			func() error { return drainHistory(pool.HistoryEvents(ctx, 1, 2, HistoryOptions{Tag: []byte{1}})) },
+			"HISTORY 1 2 TAG 01",
+		},
+		{
+			"chunk history events",
+			func() error { return drainHistory(pool.ChunkHistoryEvents(ctx, 1, 2, HistoryOptions{SinceMs: 5})) },
+			"CHUNKHISTORY 1 2 SINCE 5",
+		},
+		{
+			"range history events",
+			func() error {
+				return drainHistory(pool.RangeHistoryEvents(ctx, 1, 2, 3, 4, HistoryOptions{UntilMs: 5}))
+			},
+			"RANGEHISTORY 1 2 3 4 UNTIL 5",
+		},
 		{"chunk exists", func() error { _, err := pool.ChunkExists(ctx, 1, 2); return err }, "CHUNKEXISTS 1 2"},
 		{"get chunk", func() error { _, err := pool.GetChunk(ctx, 1, 2, GetOptions{}); return err }, "CHUNKGET 1 2"},
 		{
@@ -350,6 +426,11 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 			"get chunk state extra",
 			func() error { _, err := pool.GetChunkStateExtra(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
 			"CHUNKGET 1 2 STATE EXTRA ZRLE",
+		},
+		{
+			"get chunk state at a time",
+			func() error { _, err := pool.GetChunkState(ctx, 1, 2, GetOptions{At: AtTimeMs(5)}); return err },
+			"CHUNKGET 1 2 STATE AT TIME 5",
 		},
 		{
 			"put chunk",

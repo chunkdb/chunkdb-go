@@ -1,6 +1,10 @@
 package chunkdb
 
-import "time"
+import (
+	"math"
+	"strconv"
+	"time"
+)
 
 // DefaultTimeout is used for connect and command deadlines when [Options]
 // leaves them at zero.
@@ -78,7 +82,27 @@ type TableOptions struct {
 	// enables it in the same call. Zero in a [TableInfo] means the table has
 	// no extra data.
 	ExtraMaxChunkBytes int
+	// History, when true, enables block history on the table: every
+	// committed change of every block is kept ([Client.History]). Enabling is
+	// permanent. In a [TableInfo] it reports whether the table keeps history.
+	History bool
+	// HistoryMaxAgeMs lets history older than this many milliseconds be
+	// removed when a chunk is checkpointed, and HistoryMaxChunkBytes caps the
+	// history one chunk keeps on disk. Zero in a [TableInfo] means no limit;
+	// [HistoryNoLimit] removes a limit. Both are refused on a table without
+	// history unless History enables it in the same call.
+	HistoryMaxAgeMs      uint64
+	HistoryMaxChunkBytes uint64
+	// HistoryMaxTagBytes is the longest tag a write may carry, 1 to 255
+	// (default 32). Zero in a [TableInfo] means the table has no history.
+	HistoryMaxTagBytes int
 }
+
+// HistoryNoLimit, as [TableOptions.HistoryMaxAgeMs] or
+// [TableOptions.HistoryMaxChunkBytes] in [Client.CreateTable] or
+// [Client.SetTableOptions], removes that limit: the table keeps all of its
+// history. A zero field leaves the limit unchanged.
+const HistoryNoLimit uint64 = math.MaxUint64
 
 // TableSpec describes a new table for [Client.CreateTable]. Its geometry is
 // fixed once the table exists. Zero chunk and large-chunk sizes take the
@@ -105,6 +129,12 @@ type TableInfo struct {
 	LargeChunkWidthChunks  int
 	LargeChunkHeightChunks int
 	Options                TableOptions
+	// HistoryStart is the revision at which the table's history begins, and
+	// HistoryStartTimeMs its time in milliseconds since the Unix epoch; both
+	// are zero without history. Earlier changes are not events: what they
+	// left is the Before of a block's first event.
+	HistoryStart       uint64
+	HistoryStartTimeMs int64
 	// Values holds every key/value line of the reply.
 	Values map[string]string
 }
@@ -115,8 +145,8 @@ type HelloInfo struct {
 	// Protocol is the protocol version, always 2.
 	Protocol      int
 	ServerVersion string
-	// Capabilities lists optional features, for example "zrle" and
-	// "extra-data".
+	// Capabilities lists optional features, for example "zrle",
+	// "extra-data" and "history".
 	Capabilities []string
 	// MaxLineBytes bounds one request line.
 	MaxLineBytes int
@@ -135,6 +165,13 @@ type HelloInfo struct {
 	// the extra data of [Client.PutChunkStateExtra]. Zero when the server
 	// does not report it.
 	MaxExtraChunkBytes int
+	// MaxTagBytes is the longest tag ([WithTag], [PutOptions.Tag]) any table
+	// takes on this server, 255; a table's own limit may be lower. Zero when
+	// the server does not report it: it has no history.
+	MaxTagBytes int
+	// MaxHistoryLimit is the largest [HistoryOptions.Limit], 1024. Zero when
+	// the server does not report it.
+	MaxHistoryLimit int
 	// Table is the connection's table at HELLO time, or nil when the
 	// connection has none (the server has no default table and none was
 	// named). [Client.Use] reports later selections.
@@ -218,6 +255,9 @@ type GetOptions struct {
 	// ZRLE transfers the chunk zrle-compressed. The client decompresses it
 	// and checks its size.
 	ZRLE bool
+	// At reads the chunks as they were at a point in the past ([AtRevision],
+	// [AtTimeMs]) on a table with history. The zero value reads the present.
+	At HistoryPoint
 }
 
 // PutOptions configure a chunk write.
@@ -228,6 +268,130 @@ type PutOptions struct {
 	// ZRLE sends the chunk zrle-compressed when that is smaller than the raw
 	// bytes, and raw otherwise.
 	ZRLE bool
+	// Tag is kept with the write's history events, as [WithTag] does for the
+	// block writes. Empty means none.
+	Tag []byte
+}
+
+// WriteOption configures a block write: [Client.Set], [Client.Unset],
+// [Client.MSet], [Client.XPut], [Client.XDel], [Client.ChunkBatch] and
+// [Client.ChunkBatchIfVersion].
+type WriteOption func(*writeOptions)
+
+type writeOptions struct {
+	tag []byte
+}
+
+// WithTag keeps tag with the history events of the write, on a table with
+// history ([TableOptions.History]): 1 to [TableOptions.HistoryMaxTagBytes]
+// bytes (at most 255), which [HistoryOptions.Tag] can filter by. An empty
+// tag means none. On a table without history, or over its limit, the server
+// refuses the write with INVALID_ARGUMENT and nothing changes. [Client.MSet]
+// tags each of its writes.
+func WithTag(tag []byte) WriteOption {
+	return func(options *writeOptions) { options.tag = tag }
+}
+
+// HistoryPoint is a point in a table's past to read at: a revision
+// ([AtRevision]) or a commit time ([AtTimeMs]). The zero value is the
+// present.
+type HistoryPoint struct {
+	set    bool
+	byTime bool
+	// revision is the point of [AtRevision], timeMs that of [AtTimeMs].
+	revision uint64
+	timeMs   int64
+}
+
+// AtRevision is the table after every mutation at or below revision. A chunk
+// version ([Client.ChunkVersion], [MutationResult.Version]) is the revision of
+// the chunk's last mutation. A revision at or above the table's next one
+// fails with OUT_OF_RANGE, so an answer never changes later.
+func AtRevision(revision uint64) HistoryPoint {
+	return HistoryPoint{set: true, revision: revision}
+}
+
+// AtTimeMs is each chunk after its mutations committed at or before timeMs,
+// in milliseconds since the Unix epoch, as [HistoryEvent.TimeMs]. Commit
+// times are ordered only within a chunk, so each chunk is read at its own
+// point. A time not in the past fails with OUT_OF_RANGE.
+func AtTimeMs(timeMs int64) HistoryPoint {
+	return HistoryPoint{set: true, byTime: true, timeMs: timeMs}
+}
+
+// IsZero reports whether p is the present.
+func (p HistoryPoint) IsZero() bool { return !p.set }
+
+// HistoryCursor is a position in a history window: "<revision>" or
+// "<revision>:<block_index>". [HistoryPage.Cursor] returns one; it is opaque
+// otherwise, but a bare revision such as a chunk version is a valid
+// [HistoryOptions.After] ([RevisionCursor]).
+type HistoryCursor string
+
+// RevisionCursor is the cursor of revision. As [HistoryOptions.After] the
+// window starts after the revision's events, for example what changed since
+// a chunk version; as [HistoryOptions.Before] it ends before them.
+func RevisionCursor(revision uint64) HistoryCursor {
+	return HistoryCursor(strconv.FormatUint(revision, 10))
+}
+
+// HistoryOptions configure a history read ([Client.History],
+// [Client.ChunkHistory], [Client.RangeHistory]). The zero value reads the
+// newest 100 events.
+type HistoryOptions struct {
+	// Limit is the most events of a page, 1 to [HelloInfo.MaxHistoryLimit]
+	// (1024); zero means the server's default, 100. The iterators
+	// ([Client.HistoryEvents]) read pages of this size.
+	Limit int
+	// Ascending lists the oldest events first; the default lists the newest
+	// first.
+	Ascending bool
+	// After and Before bound the window by position, both exclusive.
+	After  HistoryCursor
+	Before HistoryCursor
+	// SinceMs and UntilMs bound the window by commit time, in milliseconds
+	// since the Unix epoch, both inclusive; zero leaves that side open.
+	SinceMs int64
+	UntilMs int64
+	// Tag lists only the events of writes with this tag; empty lists all.
+	Tag []byte
+}
+
+// HistoryEvent is one committed change of one block.
+type HistoryEvent struct {
+	// Revision is the mutation's revision, ordered across the table, and
+	// TimeMs its commit time in milliseconds since the Unix epoch, ordered
+	// within a chunk. One mutation (a chunk write) changes several blocks
+	// under one revision.
+	Revision uint64
+	TimeMs   int64
+	// X and Y are the block's coordinates.
+	X int64
+	Y int64
+	// Before and After are the block before and after the change, as
+	// [Client.Get] reads it: Exists false when the block was or became
+	// absent.
+	Before BlockState
+	After  BlockState
+	// BeforeExtra and AfterExtra are the block's extra data before and after
+	// the change, nil when it had none.
+	BeforeExtra *ExtraValue
+	AfterExtra  *ExtraValue
+	// Tag is the tag the write carried ([WithTag]), nil when it had none.
+	Tag []byte
+}
+
+// HistoryPage is one page of a history window.
+type HistoryPage struct {
+	// Events are ordered by revision, the events of one mutation by block
+	// index, oldest or newest first as [HistoryOptions.Ascending] asks. It is
+	// empty, not nil, when the page has none.
+	Events []HistoryEvent
+	// Cursor continues the window: pass it as [HistoryOptions.After] when
+	// ascending or [HistoryOptions.Before] when descending. It is empty when
+	// the window is done. A page can be shorter than the limit, even empty,
+	// and still carry a cursor: only an empty Cursor ends the window.
+	Cursor HistoryCursor
 }
 
 // Block is one item of a batch write.
