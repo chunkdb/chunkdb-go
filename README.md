@@ -34,6 +34,7 @@ This package is intentionally small:
 - tables: `CreateTable`, `DropTable`, `Tables`, `TableInfo`,
   `SetTableOptions`, `Use`, per-table clients (`client.Table(ctx, name)`), and
   the table named in the URI path (`chunk://host:4242/terrain`)
+- per-block extra data: `XGet`, `XPut`, `XDel`, `GetChunkStateExtra`, `PutChunkStateExtra`, and `XPutOp` / `XDelOp` in `ChunkBatch`
 - configurable request pipelining for high-latency links
 - `context.Context` on every request, for per-call deadlines and cancellation
 - typed errors with `errors.Is` sentinels and protocol error codes
@@ -313,6 +314,55 @@ defer same.Close()
 - An unknown table in `Options.Table` or the URI path fails `Connect` with
   `CodeNoTable`.
 
+## Extra Data
+
+A table can let each present block carry one opaque value of 1 or more bits next to its payload: an owner, a label, an object's state. Values can differ in length from block to block, and blocks without one cost nothing.
+
+Extra data is off until a table sets `TableOptions.ExtraMaxBlockBits`, the longest value in bits. `ExtraMaxChunkBytes` caps the extra data of one chunk, where each value costs 8 bytes plus `ceil(bits/8)` (server default 65536). Enabling is permanent and both limits can only be raised; `TableInfo` reports them, `0` for a table without extra data.
+
+```go
+err := client.CreateTable(ctx, "world", chunkdb.TableSpec{
+	BlockBits: 16,
+	Options:   chunkdb.TableOptions{ExtraMaxBlockBits: 4096},
+})
+if err != nil {
+	log.Fatal(err)
+}
+world, err := client.Table(ctx, "world")
+if err != nil {
+	log.Fatal(err)
+}
+defer world.Close()
+
+// A value belongs to a present block. Bit n is Bytes[n/8] >> (n%8) & 1.
+if err := world.Set(ctx, 10, 4, "0000000000000101"); err != nil {
+	log.Fatal(err)
+}
+if err := world.XPut(ctx, 10, 4, chunkdb.ExtraValue{BitLength: 12, Bytes: []byte{0xab, 0x0c}}); err != nil {
+	log.Fatal(err)
+}
+value, err := world.XGet(ctx, 10, 4) // nil when the block has no value
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(value.BitLength, value.Bytes) // 12 [171 12]
+
+// Every value of a chunk by block index: local_y * ChunkWidthBlocks + local_x.
+chunk, err := world.GetChunkStateExtra(ctx, 0, 0, chunkdb.GetOptions{})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(chunk.Extra[4*16+10].BitLength) // 12
+```
+
+- `XPut` replaces the value of a present block and `XDel` removes it (also when there is none). `Unset` removes the value with the block; `Set` keeps it.
+- `GetChunkStateExtra` reads a chunk's payload, presence and values in one request. Block indexes use local coordinates, the block coordinates modulo the chunk size (never negative). `PutChunkStateExtra` replaces the state and all values in one write, with `IfVersion` and `ZRLE` as for `PutChunkState`; each value must belong to a block the new presence bitmap marks present.
+- In `ChunkBatch`, `XPutOp(x, y, bits)` (`0`/`1` text, character `n` is bit `n`) and `XDelOp(x, y)` apply in order with `SetOp` and `UnsetOp`; a block must be present at its `XPutOp`. Batch values are text, so they count against the server's `MaxLineBytes`.
+- `XPut` and `XDel` take no version condition: use `ChunkBatchIfVersion` or `PutChunkStateExtra` with `IfVersion`. Every change advances the chunk version.
+- Padding bits past `BitLength` in a value's last byte are ignored on write and zero on read. `EncodeExtraSection` and `DecodeExtraSection` convert values to and from the wire's EXTRA section.
+- The client checks value lengths (1 to 134217664 bits in `ceil(bits/8)` bytes) and block indexes before sending. The server checks the table's limits: a value over them, a value for an unset block, or a table without extra data fails with an `*Error` whose `ServerCode` is `INVALID_ARGUMENT`, and the connection stays usable.
+- `Get`, `MGet`, `MSet`, `ChunkScan`, `ChunkRange` and `ChunkRadius` do not carry extra data.
+
 ## API
 
 Package functions:
@@ -328,6 +378,7 @@ Package functions:
   `ParseInfo([]byte) map[string]string`; `$-1` reads as a `FrameNull` frame,
   and array items are `FrameBulk` or `FrameNull` frames
 - `ZRLECompress([]byte) []byte`, `ZRLEDecompress([]byte, int) ([]byte, error)`
+- `EncodeExtraSection(map[int]ExtraValue, blockCount) ([]byte, error)`, `DecodeExtraSection([]byte, blockCount) (map[int]ExtraValue, error)`
 
 `Client` methods:
 
@@ -335,7 +386,7 @@ Package functions:
 - `ServerInfo() *HelloInfo` — the `HELLO` reply of the most recent
   connection, nil before the first: `ServerVersion`, `Capabilities`,
   `MaxLineBytes`, `MaxAreaChunks`, `MaxResponseBytes`, `MaxScanLimit`,
-  `MaxBatchOps`, and `Table` (geometry and options, or nil)
+  `MaxBatchOps`, `MaxExtraChunkBytes`, and `Table` (geometry and options, or nil)
 - `CurrentTable()` — the table this client works on
 - `Tables(ctx) ([]string, error)`
 - `TableInfo(ctx, name) (TableInfo, error)` — geometry, options and store id
@@ -359,6 +410,10 @@ Package functions:
   `Payload`, `Presence`
 - `PutChunk(ctx, cx, cy, payload, PutOptions) (MutationResult, error)`
 - `PutChunkState(ctx, cx, cy, ChunkStateInput, PutOptions) (MutationResult, error)`
+- `XGet(ctx, x, y) (*ExtraValue, error)` — a block's extra data, nil when it has none
+- `XPut(ctx, x, y, ExtraValue)`, `XDel(ctx, x, y)`
+- `GetChunkStateExtra(ctx, cx, cy, GetOptions) (ChunkStateExtra, error)` — `Exists`, `Payload`, `Presence`, `Extra`
+- `PutChunkStateExtra(ctx, cx, cy, ChunkStateExtraInput, PutOptions) (MutationResult, error)`
 - `ChunkScan(ctx, limit, cursor)` — enumerate populated chunks in deterministic
   `(cx, cy)` order; returns `Coords` and `NextCursor`, pass `NextCursor` back to
   continue (limit 1..1024 per page)
@@ -369,8 +424,8 @@ Package functions:
   multi-chunk read with the same limits and result shape as `ChunkRange`
 - `ChunkVersion(ctx, cx, cy) (uint64, error)` — opaque chunk version token
 - `ChunkBatch(ctx, cx, cy, operations)` / `ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations)` —
-  atomic single-chunk batch of `SetOp` / `UnsetOp` operations; returns a
-  `MutationResult`
+  atomic single-chunk batch of `SetOp` / `UnsetOp` / `XPutOp` / `XDelOp`
+  operations; returns a `MutationResult`
 - `WALFlush(ctx)` — explicit durability barrier: returns once every previously
   acknowledged write is durable, even when the server runs in `relaxed` mode
 - `Metrics(ctx)` — Prometheus text-format runtime metrics
@@ -430,13 +485,14 @@ if err != nil {
 ```
 
 Client-side argument validation (a bit string containing anything but `0` and
-`1`, a chunk of the wrong size, an empty batch, a chunk method without a table)
-fails with `ErrProtocol` before anything is written to the socket.
+`1`, a chunk of the wrong size, a malformed extra data value, an empty batch, a
+chunk method without a table) fails with `ErrProtocol` before anything is
+written to the socket.
 
 ## Limits
 
-- a single bulk payload is capped at `MaxBulkBytes` (64 MiB), matching the
-  server's response-size limit; a larger declared length is rejected as a
-  protocol error instead of being allocated
+- a single bulk payload is capped at `MaxBulkBytes` (64 MiB); a larger declared length is rejected as a protocol error instead of being allocated. A chunk read is capped by the size its table's geometry gives (plus `max_extra_chunk_bytes` with extra data), which can be larger
+- a request line longer than the server's `max_line_bytes` (for example a long `XPutOp` value in `ChunkBatch`) is refused before it is sent; the server would close the connection
 - ZRLE reads bound decompression by the size the table's geometry gives and
   reject any payload that declares or produces a different size
+- ZRLE reads of `GetChunkStateExtra` bound decompression by the state size plus `MaxExtraChunkBytes` (16 MiB)

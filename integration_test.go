@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"os"
@@ -1278,5 +1279,371 @@ func TestIntegrationUseIsExclusiveWithPipelinedChunkWrites(t *testing.T) {
 	}
 	if err := client.Ping(ctx); err != nil {
 		t.Fatalf("Ping after the switches: %v", err)
+	}
+}
+
+// activeConn returns the client's current connection, to tell whether an
+// error kept it.
+func activeConn(client *Client) *conn {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.active
+}
+
+func requireServerCode(t *testing.T, err error, code string) {
+	t.Helper()
+	var typed *Error
+	if !errors.As(err, &typed) || typed.ServerCode != code {
+		t.Fatalf("got %v, want %s", err, code)
+	}
+}
+
+// extraValueOf returns a value of bitLength bits with zero padding.
+func extraValueOf(bitLength int, seed byte) ExtraValue {
+	value := ExtraValue{BitLength: bitLength, Bytes: denseBytes(extraValueBytes(bitLength), seed)}
+	value.Bytes[len(value.Bytes)-1] &= extraPaddingMask(bitLength)
+	return value
+}
+
+func equalExtra(a, b map[int]ExtraValue) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index, value := range a {
+		other, ok := b[index]
+		if !ok || other.BitLength != value.BitLength || !bytes.Equal(other.Bytes, value.Bytes) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestIntegrationExtraData(t *testing.T) {
+	server := startServer(t, serverConfig{workers: 4})
+	client := connectIntegration(t, server, nil)
+	ctx := t.Context()
+
+	hello := client.ServerInfo()
+	if !slices.Contains(hello.Capabilities, "extra-data") || hello.MaxExtraChunkBytes != 16<<20 {
+		t.Fatalf("got %+v", hello)
+	}
+	if options := hello.Table.Options; options.ExtraMaxBlockBits != 0 || options.ExtraMaxChunkBytes != 0 {
+		t.Fatalf("got default table options %+v, want no extra data", options)
+	}
+
+	// A table without extra data refuses every extra data command, and the
+	// connection stays usable.
+	geo := readGeometry(t, client)
+	connection := activeConn(client)
+	if err := client.Set(ctx, 0, 0, geo.blockPattern(1)); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	_, err := client.XGet(ctx, 0, 0)
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	requireServerCode(t, client.XPut(ctx, 0, 0, ExtraValue{BitLength: 3, Bytes: []byte{5}}), "INVALID_ARGUMENT")
+	requireServerCode(t, client.XDel(ctx, 0, 0), "INVALID_ARGUMENT")
+	_, err = client.GetChunkStateExtra(ctx, 0, 0, GetOptions{})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	_, err = client.PutChunkStateExtra(ctx, 0, 0, ChunkStateExtraInput{
+		Payload: make([]byte, geo.payloadBytes), Presence: allOnes(geo.presenceBytes),
+		Extra: map[int]ExtraValue{0: {BitLength: 3, Bytes: []byte{5}}},
+	}, PutOptions{ZRLE: true})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	_, err = client.ChunkBatch(ctx, 0, 0, []BatchOperation{XPutOp(0, 0, "101")})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	if err := client.Ping(ctx); err != nil || activeConn(client) != connection {
+		t.Fatalf("Ping: %v; the connection was replaced: %v", err, activeConn(client) != connection)
+	}
+
+	// 8x2 blocks of 4 bits, values of up to 64 bits, 64 bytes of extra data
+	// per chunk.
+	if err := client.CreateTable(ctx, "items", TableSpec{
+		BlockBits: 4, ChunkWidthBlocks: 8, ChunkHeightBlocks: 2,
+		Options: TableOptions{ExtraMaxBlockBits: 64, ExtraMaxChunkBytes: 64},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	if info, err := client.TableInfo(ctx, "items"); err != nil || info.Options.ExtraMaxBlockBits != 64 ||
+		info.Options.ExtraMaxChunkBytes != 64 {
+		t.Fatalf("TableInfo: %+v, %v", info.Options, err)
+	}
+	items := connectIntegration(t, server, func(o *Options) { o.Table = "items" })
+	if options := items.ServerInfo().Table.Options; options.ExtraMaxBlockBits != 64 || options.ExtraMaxChunkBytes != 64 {
+		t.Fatalf("got HELLO table options %+v", options)
+	}
+	connection = activeConn(items)
+
+	// A value belongs to a present block.
+	value := ExtraValue{BitLength: 12, Bytes: []byte{0xab, 0x0c}}
+	requireServerCode(t, items.XPut(ctx, 1, 1, value), "INVALID_ARGUMENT")
+	if err := items.Set(ctx, 1, 1, "1010"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := items.XPut(ctx, 1, 1, value); err != nil {
+		t.Fatalf("XPut: %v", err)
+	}
+	if got, err := items.XGet(ctx, 1, 1); err != nil || got == nil || got.BitLength != 12 || !bytes.Equal(got.Bytes, value.Bytes) {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	if got, err := items.XGet(ctx, 2, 1); err != nil || got != nil {
+		t.Fatalf("XGet of a block without a value: %+v, %v", got, err)
+	}
+	// Padding bits are ignored, and SET keeps the value.
+	if err := items.XPut(ctx, 1, 1, ExtraValue{BitLength: 12, Bytes: []byte{0xab, 0xfc}}); err != nil {
+		t.Fatalf("XPut with padding: %v", err)
+	}
+	if err := items.Set(ctx, 1, 1, "0101"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got, err := items.XGet(ctx, 1, 1); err != nil || got == nil || !bytes.Equal(got.Bytes, value.Bytes) {
+		t.Fatalf("XGet after a padded XPut and SET: %+v, %v", got, err)
+	}
+	// Over the table's limit: refused, and the connection stays usable.
+	requireServerCode(t, items.XPut(ctx, 1, 1, extraValueOf(65, 1)), "INVALID_ARGUMENT")
+	// XDEL removes it, also when there is none; UNSET removes it with the
+	// block.
+	for range 2 {
+		if err := items.XDel(ctx, 1, 1); err != nil {
+			t.Fatalf("XDel: %v", err)
+		}
+	}
+	if got, err := items.XGet(ctx, 1, 1); err != nil || got != nil {
+		t.Fatalf("XGet after XDel: %+v, %v", got, err)
+	}
+	if err := items.XPut(ctx, 1, 1, value); err != nil {
+		t.Fatalf("XPut: %v", err)
+	}
+	if err := items.Unset(ctx, 1, 1); err != nil {
+		t.Fatalf("Unset: %v", err)
+	}
+	if err := items.Set(ctx, 1, 1, "1010"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got, err := items.XGet(ctx, 1, 1); err != nil || got != nil {
+		t.Fatalf("XGet after Unset: %+v, %v", got, err)
+	}
+
+	// Block (-1, -1) is local block (7, 1) of chunk (-1, -1): index 15.
+	if err := items.Set(ctx, -1, -1, "1111"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := items.XPut(ctx, -1, -1, ExtraValue{BitLength: 3, Bytes: []byte{0x05}}); err != nil {
+		t.Fatalf("XPut: %v", err)
+	}
+	for _, zrle := range []bool{false, true} {
+		chunk, err := items.GetChunkStateExtra(ctx, -1, -1, GetOptions{ZRLE: zrle})
+		if err != nil {
+			t.Fatalf("GetChunkStateExtra zrle=%v: %v", zrle, err)
+		}
+		want := map[int]ExtraValue{15: {BitLength: 3, Bytes: []byte{0x05}}}
+		if !chunk.Exists || chunk.Presence[1] != 0x80 || !equalExtra(chunk.Extra, want) {
+			t.Fatalf("zrle=%v: got %+v", zrle, chunk)
+		}
+	}
+
+	// PutChunkStateExtra replaces the state and every value in one write.
+	version, err := items.ChunkVersion(ctx, 2, 0)
+	if err != nil {
+		t.Fatalf("ChunkVersion: %v", err)
+	}
+	// Blocks 0, 7 and 8 are present, with payload nibbles 1, 4 and 5.
+	payload := []byte{0x01, 0, 0, 0x40, 0x05, 0, 0, 0}
+	presence := []byte{0x81, 0x01}
+	extra := map[int]ExtraValue{0: extraValueOf(1, 1), 7: extraValueOf(64, 2), 8: extraValueOf(9, 3)}
+	result, err := items.PutChunkStateExtra(ctx, 2, 0, ChunkStateExtraInput{Payload: payload, Presence: presence, Extra: extra},
+		PutOptions{IfVersion: &version, ZRLE: true})
+	if err != nil || !result.OK || result.Version == version {
+		t.Fatalf("PutChunkStateExtra: %+v, %v", result, err)
+	}
+	for _, zrle := range []bool{false, true} {
+		chunk, err := items.GetChunkStateExtra(ctx, 2, 0, GetOptions{ZRLE: zrle})
+		if err != nil || !bytes.Equal(chunk.Payload, payload) || !bytes.Equal(chunk.Presence, presence) ||
+			!equalExtra(chunk.Extra, extra) {
+			t.Fatalf("GetChunkStateExtra zrle=%v: %+v, %v", zrle, chunk, err)
+		}
+	}
+	// Block 7 of chunk (2, 0) is block (23, 0).
+	if got, err := items.XGet(ctx, 23, 0); err != nil || got == nil || !bytes.Equal(got.Bytes, extra[7].Bytes) {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	stale, err := items.PutChunkStateExtra(ctx, 2, 0, ChunkStateExtraInput{Payload: payload, Presence: presence},
+		PutOptions{IfVersion: &version})
+	if err != nil || stale.OK || stale.Version != result.Version {
+		t.Fatalf("PutChunkStateExtra with a stale version: %+v, %v", stale, err)
+	}
+	// A value of an absent block, or more than the chunk's 64 bytes.
+	_, err = items.PutChunkStateExtra(ctx, 2, 0, ChunkStateExtraInput{
+		Payload: payload, Presence: presence, Extra: map[int]ExtraValue{1: extraValueOf(1, 1)},
+	}, PutOptions{})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	tooMuch := map[int]ExtraValue{}
+	for index := range 8 {
+		tooMuch[index] = extraValueOf(1, 1)
+	}
+	_, err = items.PutChunkStateExtra(ctx, 2, 0, ChunkStateExtraInput{
+		Payload: payload, Presence: allOnes(2), Extra: tooMuch,
+	}, PutOptions{})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	// Without values, all of them go.
+	if _, err := items.PutChunkStateExtra(ctx, 2, 0, ChunkStateExtraInput{Payload: payload, Presence: presence}, PutOptions{}); err != nil {
+		t.Fatalf("PutChunkStateExtra: %v", err)
+	}
+	if chunk, err := items.GetChunkStateExtra(ctx, 2, 0, GetOptions{}); err != nil || len(chunk.Extra) != 0 || !chunk.Exists {
+		t.Fatalf("GetChunkStateExtra: %+v, %v", chunk, err)
+	}
+
+	// CHUNKBATCH sets and removes values together with the blocks; bits
+	// "1011" are the value 0x0d.
+	if _, err := items.ChunkBatch(ctx, 3, 0, []BatchOperation{
+		SetOp(24, 0, "1000"), XPutOp(24, 0, "1011"), SetOp(25, 0, "0001"), XPutOp(25, 0, "1"), XDelOp(25, 0),
+	}); err != nil {
+		t.Fatalf("ChunkBatch: %v", err)
+	}
+	if got, err := items.XGet(ctx, 24, 0); err != nil || got == nil || got.BitLength != 4 || !bytes.Equal(got.Bytes, []byte{0x0d}) {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	if got, err := items.XGet(ctx, 25, 0); err != nil || got != nil {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	// A batch XPUT of an absent block fails the whole batch.
+	_, err = items.ChunkBatch(ctx, 3, 0, []BatchOperation{XDelOp(24, 0), XPutOp(26, 0, "1")})
+	requireServerCode(t, err, "INVALID_ARGUMENT")
+	if got, err := items.XGet(ctx, 24, 0); err != nil || got == nil {
+		t.Fatalf("XGet after a failed batch: %+v, %v", got, err)
+	}
+
+	// Limits can be raised and not lowered. The client does not hold them:
+	// a longer value fits once another connection raised the limit.
+	if err := client.SetTableOptions(ctx, "items", TableOptions{ExtraMaxBlockBits: 128, ExtraMaxChunkBytes: 4096}); err != nil {
+		t.Fatalf("SetTableOptions: %v", err)
+	}
+	if info, err := client.TableInfo(ctx, "items"); err != nil || info.Options.ExtraMaxBlockBits != 128 ||
+		info.Options.ExtraMaxChunkBytes != 4096 {
+		t.Fatalf("TableInfo: %+v, %v", info.Options, err)
+	}
+	requireServerCode(t, client.SetTableOptions(ctx, "items", TableOptions{ExtraMaxBlockBits: 32}), "INVALID_ARGUMENT")
+	if err := items.XPut(ctx, 24, 0, extraValueOf(100, 4)); err != nil {
+		t.Fatalf("XPut after raising the limit: %v", err)
+	}
+	if got, err := items.XGet(ctx, 24, 0); err != nil || got == nil || got.BitLength != 100 {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	// A chunk with more extra data than the 64 bytes this connection's HELLO
+	// reported still reads back, also zrle-compressed.
+	if _, err := items.PutChunkStateExtra(ctx, 2, 0, ChunkStateExtraInput{
+		Payload: payload, Presence: allOnes(2), Extra: tooMuch,
+	}, PutOptions{ZRLE: true}); err != nil {
+		t.Fatalf("PutChunkStateExtra after raising the limit: %v", err)
+	}
+	for _, zrle := range []bool{false, true} {
+		if chunk, err := items.GetChunkStateExtra(ctx, 2, 0, GetOptions{ZRLE: zrle}); err != nil || !equalExtra(chunk.Extra, tooMuch) {
+			t.Fatalf("GetChunkStateExtra zrle=%v: %+v, %v", zrle, chunk, err)
+		}
+	}
+
+	// Every refusal kept the connection.
+	if err := items.Ping(ctx); err != nil || activeConn(items) != connection {
+		t.Fatalf("Ping: %v; the connection was replaced: %v", err, activeConn(items) != connection)
+	}
+}
+
+func TestIntegrationExtraDataPoolAndPipelining(t *testing.T) {
+	// The admin client, two pooled and one pipelined connection.
+	server := startServer(t, serverConfig{workers: 6})
+	admin := connectIntegration(t, server, nil)
+	ctx := t.Context()
+	if err := admin.CreateTable(ctx, "items", TableSpec{
+		BlockBits: 1, ChunkWidthBlocks: 4, ChunkHeightBlocks: 4,
+		Options: TableOptions{ExtraMaxBlockBits: 256},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+
+	pool, err := ConnectPool(ctx, PoolOptions{
+		Options:        Options{URI: server.uri, Table: "items"},
+		MaxConnections: 2,
+		MinConnections: 1,
+	})
+	if err != nil {
+		t.Fatalf("ConnectPool: %v", err)
+	}
+	defer pool.Close()
+
+	value := extraValueOf(200, 9)
+	if err := pool.Set(ctx, 0, 0, "1"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := pool.XPut(ctx, 0, 0, value); err != nil {
+		t.Fatalf("XPut: %v", err)
+	}
+	if got, err := pool.XGet(ctx, 0, 0); err != nil || got == nil || !bytes.Equal(got.Bytes, value.Bytes) {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	if chunk, err := pool.GetChunkStateExtra(ctx, 0, 0, GetOptions{ZRLE: true}); err != nil ||
+		!equalExtra(chunk.Extra, map[int]ExtraValue{0: value}) {
+		t.Fatalf("GetChunkStateExtra: %+v, %v", chunk, err)
+	}
+	// Block index 5 of chunk (1, 0) is local (1, 1): block (5, 1).
+	if _, err := pool.PutChunkStateExtra(ctx, 1, 0, ChunkStateExtraInput{
+		Payload: allOnes(2), Presence: allOnes(2), Extra: map[int]ExtraValue{5: value},
+	}, PutOptions{}); err != nil {
+		t.Fatalf("PutChunkStateExtra: %v", err)
+	}
+	if got, err := pool.XGet(ctx, 5, 1); err != nil || got == nil || !bytes.Equal(got.Bytes, value.Bytes) {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	if _, err := pool.ChunkBatch(ctx, 1, 0, []BatchOperation{XDelOp(5, 1), XPutOp(6, 1, "01")}); err != nil {
+		t.Fatalf("ChunkBatch: %v", err)
+	}
+	if got, err := pool.XGet(ctx, 6, 1); err != nil || got == nil || got.BitLength != 2 || got.Bytes[0] != 0x02 {
+		t.Fatalf("XGet: %+v, %v", got, err)
+	}
+	if err := pool.XDel(ctx, 0, 0); err != nil {
+		t.Fatalf("XDel: %v", err)
+	}
+	if got, err := pool.XGet(ctx, 0, 0); err != nil || got != nil {
+		t.Fatalf("XGet after XDel: %+v, %v", got, err)
+	}
+
+	// Eight writers share one pipelined connection.
+	client := connectIntegration(t, server, func(o *Options) {
+		o.Table = "items"
+		o.PipelineDepth = 8
+	})
+	var group sync.WaitGroup
+	errs := make(chan error, 8)
+	for writer := range 8 {
+		group.Go(func() {
+			for i := range 16 {
+				x, y := int64(writer*16+i), int64(10)
+				want := extraValueOf(1+(writer*16+i)%256, byte(i))
+				if err := client.Set(ctx, x, y, "1"); err != nil {
+					errs <- err
+					return
+				}
+				if err := client.XPut(ctx, x, y, want); err != nil {
+					errs <- err
+					return
+				}
+				got, err := client.XGet(ctx, x, y)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if got == nil || got.BitLength != want.BitLength || !bytes.Equal(got.Bytes, want.Bytes) {
+					errs <- fmt.Errorf("block (%d, %d): got %+v, want %+v", x, y, got, want)
+					return
+				}
+			}
+		})
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	chunk, err := client.GetChunkStateExtra(ctx, 0, 2, GetOptions{})
+	if err != nil || len(chunk.Extra) != 4 {
+		t.Fatalf("GetChunkStateExtra: %d values, %v", len(chunk.Extra), err)
 	}
 }

@@ -134,7 +134,8 @@ func (c *Client) CreateTable(ctx context.Context, name string, spec TableSpec) e
 }
 
 // SetTableOptions changes the non-zero options of a table; the server
-// reopens the table.
+// reopens the table. Extra data cannot be turned off and its limits cannot be
+// lowered; the server refuses that with INVALID_ARGUMENT.
 func (c *Client) SetTableOptions(ctx context.Context, name string, options TableOptions) error {
 	args := tableOptionArgs(options)
 	if len(args) == 0 {
@@ -186,6 +187,12 @@ func tableOptionArgs(options TableOptions) []string {
 	if options.CheckpointCompression != "" {
 		args = append(args, "checkpoint_compression", options.CheckpointCompression)
 	}
+	if options.ExtraMaxBlockBits != 0 {
+		args = append(args, "extra_max_block_bits", strconv.Itoa(options.ExtraMaxBlockBits))
+	}
+	if options.ExtraMaxChunkBytes != 0 {
+		args = append(args, "extra_max_chunk_bytes", strconv.Itoa(options.ExtraMaxChunkBytes))
+	}
 	return args
 }
 
@@ -228,6 +235,25 @@ func parseTableValues(values map[string]string, command string) (TableInfo, erro
 		value, err := strconv.Atoi(values[field.key])
 		if err != nil || value <= 0 {
 			return TableInfo{}, protocolErrorf(command, "%s missing valid %s", command, field.key)
+		}
+		*field.target = value
+	}
+	// The extra data limits are 0 for a table without extra data, and
+	// absent from servers without the extra-data capability.
+	for _, field := range []struct {
+		key    string
+		target *int
+	}{
+		{"extra_max_block_bits", &info.Options.ExtraMaxBlockBits},
+		{"extra_max_chunk_bytes", &info.Options.ExtraMaxChunkBytes},
+	} {
+		text, ok := values[field.key]
+		if !ok {
+			continue
+		}
+		value, err := strconv.Atoi(text)
+		if err != nil || value < 0 {
+			return TableInfo{}, protocolErrorf(command, "%s has an invalid %s: %s", command, field.key, text)
 		}
 		*field.target = value
 	}

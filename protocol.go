@@ -80,6 +80,21 @@ func SerializeCommand(parts ...string) ([]byte, error) {
 
 // ReadFrame decodes the next response frame from r.
 func ReadFrame(r *bufio.Reader) (Frame, error) {
+	return readFrameBounded(r, nil)
+}
+
+// readFrameBounded is ReadFrame with the bulk payload limit given by
+// bulkLimit when the length header arrives (MaxBulkBytes when nil or 0): a
+// chunk read whose state and extra data exceed MaxBulkBytes is legal.
+func readFrameBounded(r *bufio.Reader, bulkLimit func() int) (Frame, error) {
+	limit := func() int {
+		if bulkLimit != nil {
+			if n := bulkLimit(); n > MaxBulkBytes {
+				return n
+			}
+		}
+		return MaxBulkBytes
+	}
 	prefix, err := r.ReadByte()
 	if err != nil {
 		return Frame{}, err
@@ -102,7 +117,7 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 		return Frame{Kind: FrameError, Code: code, Message: message, Raw: line}, nil
 
 	case '$':
-		return readBulk(r)
+		return readBulk(r, limit())
 
 	case '*':
 		header, err := readLine(r)
@@ -125,7 +140,7 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 			if itemPrefix != '$' {
 				return Frame{}, protocolErrorf("", "expected bulk item in array response")
 			}
-			item, err := readBulk(r)
+			item, err := readBulk(r, MaxBulkBytes)
 			if err != nil {
 				return Frame{}, err
 			}
@@ -192,7 +207,7 @@ func readLine(r *bufio.Reader) (string, error) {
 
 // readBulk reads a "$<LEN>" header, its payload, and the payload terminator,
 // or a "$-1" null.
-func readBulk(r *bufio.Reader) (Frame, error) {
+func readBulk(r *bufio.Reader, maxBytes int) (Frame, error) {
 	header, err := readLine(r)
 	if err != nil {
 		return Frame{}, err
@@ -205,8 +220,8 @@ func readBulk(r *bufio.Reader) (Frame, error) {
 	if err != nil || length < 0 {
 		return Frame{}, protocolErrorf("", "invalid bulk length: %s", header)
 	}
-	if length > MaxBulkBytes {
-		return Frame{}, protocolErrorf("", "bulk payload of %d bytes exceeds the %d-byte limit", length, MaxBulkBytes)
+	if length > maxBytes {
+		return Frame{}, protocolErrorf("", "bulk payload of %d bytes exceeds the %d-byte limit", length, maxBytes)
 	}
 
 	payload := make([]byte, length)

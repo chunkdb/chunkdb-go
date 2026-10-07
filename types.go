@@ -67,6 +67,17 @@ type TableOptions struct {
 	WalGroupCommitUpdates int
 	// CheckpointCompression is "none" or "zrle".
 	CheckpointCompression string
+	// ExtraMaxBlockBits is the longest per-block extra data value, in bits;
+	// a non-zero value enables extra data on the table. Enabling is
+	// permanent, and both extra data limits can only be raised. Zero in a
+	// [TableInfo] means the table has no extra data.
+	ExtraMaxBlockBits int
+	// ExtraMaxChunkBytes is the most extra data one chunk can hold, 9 to
+	// 16777216 (default 65536): each value costs 8 bytes plus ceil(bits/8).
+	// It is refused on a table without extra data unless ExtraMaxBlockBits
+	// enables it in the same call. Zero in a [TableInfo] means the table has
+	// no extra data.
+	ExtraMaxChunkBytes int
 }
 
 // TableSpec describes a new table for [Client.CreateTable]. Its geometry is
@@ -104,7 +115,8 @@ type HelloInfo struct {
 	// Protocol is the protocol version, always 2.
 	Protocol      int
 	ServerVersion string
-	// Capabilities lists optional features, for example "zrle".
+	// Capabilities lists optional features, for example "zrle" and
+	// "extra-data".
 	Capabilities []string
 	// MaxLineBytes bounds one request line.
 	MaxLineBytes int
@@ -118,6 +130,11 @@ type HelloInfo struct {
 	MaxScanLimit int
 	// MaxBatchOps is the most operations one [Client.ChunkBatch] may carry.
 	MaxBatchOps int
+	// MaxExtraChunkBytes is the most extra data any chunk can hold on this
+	// server, whatever its table options; it bounds [Client.XPut] values and
+	// the extra data of [Client.PutChunkStateExtra]. Zero when the server
+	// does not report it.
+	MaxExtraChunkBytes int
 	// Table is the connection's table at HELLO time, or nil when the
 	// connection has none (the server has no default table and none was
 	// named). [Client.Use] reports later selections.
@@ -161,6 +178,39 @@ type ChunkState struct {
 type ChunkStateInput struct {
 	Payload  []byte
 	Presence []byte
+}
+
+// ExtraValue is the extra data of one block: BitLength bits (at least 1)
+// held in Bytes, ceil(BitLength/8) of them. Bit n of the value is
+// Bytes[n/8] >> (n%8) & 1. Padding bits past BitLength in the last byte are
+// ignored when writing and zero when reading.
+type ExtraValue struct {
+	BitLength int
+	Bytes     []byte
+}
+
+// ChunkStateExtra is a chunk's state and extra data, as read by
+// [Client.GetChunkStateExtra]. Payload, Presence and Exists are as in
+// [ChunkState].
+type ChunkStateExtra struct {
+	Exists   bool
+	Payload  []byte
+	Presence []byte
+	// Extra holds the value of every block that has one, by block index:
+	// local_y * ChunkWidthBlocks + local_x, where the local coordinates are
+	// the block coordinates modulo the chunk size (never negative). It is
+	// empty, not nil, when no block has a value.
+	Extra map[int]ExtraValue
+}
+
+// ChunkStateExtraInput is the chunk state and extra data written by
+// [Client.PutChunkStateExtra], in the layout of [ChunkStateExtra]. Extra
+// replaces all of the chunk's values; each must belong to a block that
+// Presence marks present.
+type ChunkStateExtraInput struct {
+	Payload  []byte
+	Presence []byte
+	Extra    map[int]ExtraValue
 }
 
 // GetOptions configure a chunk read.
@@ -224,6 +274,11 @@ const (
 	BatchSet BatchOpType = iota + 1
 	// BatchUnset clears explicit presence for one block.
 	BatchUnset
+	// BatchXPut sets the extra data of one block, which must be present at
+	// that point of the batch.
+	BatchXPut
+	// BatchXDel removes the extra data of one block, if it has any.
+	BatchXDel
 )
 
 // BatchOperation is one block operation inside a [Client.ChunkBatch] call.
@@ -231,7 +286,7 @@ type BatchOperation struct {
 	Type BatchOpType
 	X    int64
 	Y    int64
-	// Bits is used by [BatchSet] only.
+	// Bits is used by [BatchSet] and [BatchXPut].
 	Bits string
 }
 
@@ -245,8 +300,19 @@ func UnsetOp(x, y int64) BatchOperation {
 	return BatchOperation{Type: BatchUnset, X: x, Y: y}
 }
 
+// XPutOp returns a [BatchXPut] operation. bits is the value as 0/1 text:
+// character n is bit n, and the value is len(bits) bits long.
+func XPutOp(x, y int64, bits string) BatchOperation {
+	return BatchOperation{Type: BatchXPut, X: x, Y: y, Bits: bits}
+}
+
+// XDelOp returns a [BatchXDel] operation.
+func XDelOp(x, y int64) BatchOperation {
+	return BatchOperation{Type: BatchXDel, X: x, Y: y}
+}
+
 // MutationResult is the result of a chunk write ([Client.PutChunk],
-// [Client.PutChunkState], [Client.ChunkBatch]).
+// [Client.PutChunkState], [Client.PutChunkStateExtra], [Client.ChunkBatch]).
 //
 // Version is the chunk's version after the write. Versions are opaque tokens:
 // they change on every content mutation and survive eviction and restart; a
