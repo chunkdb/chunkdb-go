@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/chunkdb/chunkdb-go"
+	"github.com/chunkdb/chunkdb-go/v2"
 )
 
 func Example() {
@@ -24,11 +24,11 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	state, err := client.ReadBlock(ctx, 0, 0)
+	block, err := client.Get(ctx, 0, 0)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(state.Exists, state.Bits)
+	fmt.Println(block.Exists, block.Bits)
 }
 
 func ExampleConnect() {
@@ -129,7 +129,7 @@ func ExampleClient_ChunkScan() {
 
 // Read-modify-write against an opaque chunk version. On a mismatch, re-read the
 // chunk, reconcile, and retry with the fresh version.
-func ExampleClient_ChunkCompareAndSet() {
+func ExampleClient_PutChunkState() {
 	ctx := context.Background()
 
 	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
@@ -144,15 +144,18 @@ func ExampleClient_ChunkCompareAndSet() {
 			log.Fatal(err)
 		}
 
-		state, err := client.ReadChunk(ctx, 0, 0)
+		state, err := client.GetChunkState(ctx, 0, 0, chunkdb.GetOptions{})
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		next := chunkdb.ChunkStateInput{Bits: state.Bits, Presence: state.Presence}
-		// ... derive next from state ...
+		// Mark block 0 present and set its lowest payload bit.
+		state.Presence[0] |= 0x01
+		state.Payload[0] |= 0x01
 
-		result, err := client.ChunkCompareAndSet(ctx, 0, 0, version, next)
+		result, err := client.PutChunkState(ctx, 0, 0,
+			chunkdb.ChunkStateInput{Payload: state.Payload, Presence: state.Presence},
+			chunkdb.PutOptions{IfVersion: &version, ZRLE: true})
 		if err != nil {
 			log.Fatal(err)
 		}

@@ -33,8 +33,9 @@ const (
 	KindProtocol
 	// KindServer covers "-ERR <code> <message>" responses.
 	KindServer
-	// KindAuth covers AUTH_FAILED responses. It is a specialization of
-	// KindServer and matches both [ErrServer] and [ErrAuth].
+	// KindAuth covers AUTH_FAILED (wrong token) and AUTH_REQUIRED (missing
+	// token) responses. It is a specialization of KindServer and matches both
+	// [ErrServer] and [ErrAuth].
 	KindAuth
 	// KindTLS covers TLS configuration and handshake failures.
 	KindTLS
@@ -119,7 +120,7 @@ func timeoutErrorf(command string, cause error, format string, args ...any) *Err
 
 func serverError(phase Phase, command, code, message string) *Error {
 	kind := KindServer
-	if code == codeAuthFailed {
+	if code == codeAuthFailed || code == codeAuthRequired {
 		kind = KindAuth
 	}
 	text := "server error " + code
@@ -142,7 +143,9 @@ func closedError(command string) *Error {
 
 const (
 	codeAuthFailed      = "AUTH_FAILED"
+	codeAuthRequired    = "AUTH_REQUIRED"
 	codeVersionMismatch = "VERSION_MISMATCH"
+	codeUnknownCommand  = "UNKNOWN_COMMAND"
 
 	// CodeNoTable is the [Error.ServerCode] for an unknown table, and for any
 	// command on a connection whose table was dropped.

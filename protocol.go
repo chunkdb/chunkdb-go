@@ -26,8 +26,10 @@ const (
 	FrameError
 	// FrameBulk is "$<LEN>\r\n<PAYLOAD>".
 	FrameBulk
-	// FrameArray is "*<N>" followed by N bulk frames.
+	// FrameArray is "*<N>" followed by N bulk or null frames.
 	FrameArray
+	// FrameNull is "$-1": no value, such as an unset block.
+	FrameNull
 )
 
 // Frame is one decoded server response. Only the fields belonging to Kind are
@@ -46,8 +48,9 @@ type Frame struct {
 	// Bulk holds the payload of a [FrameBulk] response.
 	Bulk []byte
 
-	// Array holds the payloads of a [FrameArray] response.
-	Array [][]byte
+	// Array holds the items of a [FrameArray] response, each a [FrameBulk] or
+	// a [FrameNull] frame.
+	Array []Frame
 }
 
 // SerializeCommand encodes one command line. Parts are joined with spaces and
@@ -99,11 +102,7 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 		return Frame{Kind: FrameError, Code: code, Message: message, Raw: line}, nil
 
 	case '$':
-		payload, err := readBulk(r)
-		if err != nil {
-			return Frame{}, err
-		}
-		return Frame{Kind: FrameBulk, Bulk: payload}, nil
+		return readBulk(r)
 
 	case '*':
 		header, err := readLine(r)
@@ -117,7 +116,7 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 
 		// The capacity hint is clamped so a bogus count cannot preallocate an
 		// arbitrarily large slice before any payload has arrived.
-		items := make([][]byte, 0, min(count, 1024))
+		items := make([]Frame, 0, min(count, 1024))
 		for range count {
 			itemPrefix, err := r.ReadByte()
 			if err != nil {
@@ -126,11 +125,11 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 			if itemPrefix != '$' {
 				return Frame{}, protocolErrorf("", "expected bulk item in array response")
 			}
-			payload, err := readBulk(r)
+			item, err := readBulk(r)
 			if err != nil {
 				return Frame{}, err
 			}
-			items = append(items, payload)
+			items = append(items, item)
 		}
 		return Frame{Kind: FrameArray, Array: items}, nil
 
@@ -139,7 +138,8 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 	}
 }
 
-// ParseInfo parses an INFO payload into its key/value pairs. A line without
+// ParseInfo parses a key=value payload (INFO, HELLO, TABLEINFO) into its
+// key/value pairs. A line without
 // "=" maps to an empty value.
 func ParseInfo(payload []byte) map[string]string {
 	values := make(map[string]string)
@@ -190,43 +190,47 @@ func readLine(r *bufio.Reader) (string, error) {
 	return strings.TrimSuffix(line, "\r"), nil
 }
 
-// readBulk reads a "$<LEN>" header, its payload, and the payload terminator.
-func readBulk(r *bufio.Reader) ([]byte, error) {
+// readBulk reads a "$<LEN>" header, its payload, and the payload terminator,
+// or a "$-1" null.
+func readBulk(r *bufio.Reader) (Frame, error) {
 	header, err := readLine(r)
 	if err != nil {
-		return nil, err
+		return Frame{}, err
+	}
+	if header == "-1" {
+		return Frame{Kind: FrameNull}, nil
 	}
 
 	length, err := strconv.Atoi(header)
 	if err != nil || length < 0 {
-		return nil, protocolErrorf("", "invalid bulk length: %s", header)
+		return Frame{}, protocolErrorf("", "invalid bulk length: %s", header)
 	}
 	if length > MaxBulkBytes {
-		return nil, protocolErrorf("", "bulk payload of %d bytes exceeds the %d-byte limit", length, MaxBulkBytes)
+		return Frame{}, protocolErrorf("", "bulk payload of %d bytes exceeds the %d-byte limit", length, MaxBulkBytes)
 	}
 
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
+		return Frame{}, err
 	}
 
 	terminator, err := r.ReadByte()
 	if err != nil {
-		return nil, err
+		return Frame{}, err
 	}
 	switch terminator {
 	case '\n':
-		return payload, nil
+		return Frame{Kind: FrameBulk, Bulk: payload}, nil
 	case '\r':
 		next, err := r.ReadByte()
 		if err != nil {
-			return nil, err
+			return Frame{}, err
 		}
 		if next != '\n' {
-			return nil, protocolErrorf("", "invalid bulk terminator")
+			return Frame{}, protocolErrorf("", "invalid bulk terminator")
 		}
-		return payload, nil
+		return Frame{Kind: FrameBulk, Bulk: payload}, nil
 	default:
-		return nil, protocolErrorf("", "invalid bulk terminator")
+		return Frame{}, protocolErrorf("", "invalid bulk terminator")
 	}
 }

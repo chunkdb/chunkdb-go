@@ -35,7 +35,7 @@ func newTestPool(t *testing.T, server *fakeServer, configure func(*PoolOptions))
 }
 
 func TestPoolReusesOneConnectionWhenSequential(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, nil)
 
 	for range 5 {
@@ -49,7 +49,7 @@ func TestPoolReusesOneConnectionWhenSequential(t *testing.T) {
 }
 
 func TestPoolWarmsMinConnections(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	newTestPool(t, server, func(o *PoolOptions) {
 		o.MaxConnections = 4
 		o.MinConnections = 3
@@ -79,7 +79,7 @@ func TestPoolRunsUpToMaxConnectionsConcurrently(t *testing.T) {
 	const maxConnections = 3
 
 	requests := make(chan net.Conn, maxConnections*2)
-	server := newFakeServer(t, withAuth(func(_ *fakeServer, conn net.Conn, _ string) {
+	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, _ string) {
 		requests <- conn
 	}))
 	pool := newTestPool(t, server, func(o *PoolOptions) { o.MaxConnections = maxConnections })
@@ -115,7 +115,7 @@ func TestPoolRunsUpToMaxConnectionsConcurrently(t *testing.T) {
 func TestPoolAcquireTimesOutWhenSaturated(t *testing.T) {
 	release := make(chan struct{})
 	leased := make(chan struct{})
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, func(o *PoolOptions) {
 		o.MaxConnections = 1
 		o.AcquireTimeout = 100 * time.Millisecond
@@ -150,7 +150,7 @@ func TestPoolRecoversCapacityAfterTransportFailure(t *testing.T) {
 	// open a replacement within its one-connection ceiling.
 	var dropped bool
 	var mu sync.Mutex
-	server := newFakeServer(t, withAuth(func(s *fakeServer, conn net.Conn, _ string) {
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, _ string) {
 		mu.Lock()
 		first := !dropped
 		dropped = true
@@ -176,7 +176,7 @@ func TestPoolRecoversCapacityAfterTransportFailure(t *testing.T) {
 }
 
 func TestPoolWithClientPropagatesCallbackError(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, nil)
 
 	sentinel := errors.New("callback failed")
@@ -196,7 +196,7 @@ func TestPoolWithClientPropagatesCallbackError(t *testing.T) {
 }
 
 func TestPoolReturnsLeaseWhenTheCallbackPanics(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, func(o *PoolOptions) {
 		o.MaxConnections = 1
 		o.AcquireTimeout = 500 * time.Millisecond
@@ -219,7 +219,7 @@ func TestPoolReturnsLeaseWhenTheCallbackPanics(t *testing.T) {
 }
 
 func TestPoolCloseWaitsForLeases(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, nil)
 
 	leased := make(chan struct{})
@@ -258,7 +258,7 @@ func TestPoolCloseWaitsForLeases(t *testing.T) {
 }
 
 func TestPoolClosedRejectsOperations(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, nil)
 
 	if err := pool.Close(); err != nil {
@@ -273,7 +273,7 @@ func TestPoolClosedRejectsOperations(t *testing.T) {
 }
 
 func TestPoolConcurrentMixedOperations(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, func(o *PoolOptions) { o.MaxConnections = 4 })
 
 	var group sync.WaitGroup
@@ -285,8 +285,8 @@ func TestPoolConcurrentMixedOperations(t *testing.T) {
 				t.Errorf("Set: %v", err)
 				return
 			}
-			if _, err := pool.ReadBlock(t.Context(), int64(i), 0); err != nil {
-				t.Errorf("ReadBlock: %v", err)
+			if _, err := pool.Get(t.Context(), int64(i), 0); err != nil {
+				t.Errorf("Get: %v", err)
 			}
 		}()
 	}
@@ -316,7 +316,7 @@ func TestNewPoolRejectsBadOptions(t *testing.T) {
 }
 
 func TestPoolMirrorsClientCommands(t *testing.T) {
-	server := newFakeServer(t, withAuth(genericHandler))
+	server := newFakeServer(t, withHello(genericHandler))
 	pool := newTestPool(t, server, nil)
 	ctx := t.Context()
 
@@ -328,53 +328,51 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 		{"ping", func() error { return pool.Ping(ctx) }, "PING"},
 		{"info", func() error { _, err := pool.Info(ctx); return err }, "INFO"},
 		{"get", func() error { _, err := pool.Get(ctx, 1, 2); return err }, "GET 1 2"},
-		{"read block", func() error { _, err := pool.ReadBlock(ctx, 1, 2); return err }, "EXISTS 1 2"},
-		{"exists", func() error { _, err := pool.Exists(ctx, 1, 2); return err }, "EXISTS 1 2"},
 		{"set", func() error { return pool.Set(ctx, 1, 2, "1010") }, "SET 1 2 1010"},
 		{"unset", func() error { return pool.Unset(ctx, 1, 2) }, "UNSET 1 2"},
 		{"mset", func() error { return pool.MSet(ctx, []Block{{X: 1, Y: 2, Bits: "1010"}}) }, "MSET 1 2 1010"},
 		{"mget", func() error { _, err := pool.MGet(ctx, []BlockRef{{X: 1, Y: 2}}); return err }, "MGET 1 2"},
 		{"chunk exists", func() error { _, err := pool.ChunkExists(ctx, 1, 2); return err }, "CHUNKEXISTS 1 2"},
-		{"read chunk", func() error { _, err := pool.ReadChunk(ctx, 1, 2); return err }, "CHUNK 1 2 STATE"},
-		{"chunk", func() error { _, err := pool.Chunk(ctx, 1, 2); return err }, "CHUNK 1 2"},
-		{"set chunk", func() error { return pool.SetChunk(ctx, 1, 2, "1010") }, "CHUNKSET 1 2 1010"},
+		{"get chunk", func() error { _, err := pool.GetChunk(ctx, 1, 2, GetOptions{}); return err }, "CHUNKGET 1 2"},
 		{
-			"set chunk state",
-			func() error {
-				return pool.SetChunkState(ctx, 1, 2, ChunkStateInput{
-					Bits:     strings.Repeat("1", testChunkPayloadBits),
-					Presence: strings.Repeat("1", testChunkBlockCount),
-				})
-			},
-			"CHUNKSET 1 2 STATE 1111111111111111|1111",
+			"get chunk state",
+			func() error { _, err := pool.GetChunkState(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
+			"CHUNKGET 1 2 STATE ZRLE",
 		},
-		{"chunkbin", func() error { _, err := pool.ChunkBin(ctx, 1, 2); return err }, "CHUNKBIN 1 2"},
-		{"chunkbin state", func() error { _, err := pool.ChunkBinState(ctx, 1, 2); return err }, "CHUNKBIN 1 2 STATE"},
-		{"chunkbinc", func() error { _, err := pool.ChunkBinCompressed(ctx, 1, 2); return err }, "CHUNKBINC 1 2"},
 		{
-			"chunkbinc state",
-			func() error { _, err := pool.ChunkBinStateCompressed(ctx, 1, 2); return err },
-			"CHUNKBINC 1 2 STATE",
+			"put chunk",
+			func() error { _, err := pool.PutChunk(ctx, 1, 2, []byte{1, 2}, PutOptions{}); return err },
+			"CHUNKPUT 1 2 2",
 		},
-		{"scan", func() error { _, err := pool.ChunkScan(ctx, 10, nil); return err }, "CHUNKSCAN 10"},
-		{"range", func() error { _, err := pool.ChunkRange(ctx, 1, 2, 3, 4); return err }, "CHUNKRANGE 1 2 3 4"},
-		{"radius", func() error { _, err := pool.ChunkRadius(ctx, 1, 2, 3); return err }, "CHUNKRADIUS 1 2 3"},
-		{"version", func() error { _, err := pool.ChunkVersion(ctx, 1, 2); return err }, "CHUNKVER 1 2"},
 		{
-			"compare and set",
+			"put chunk state",
 			func() error {
-				_, err := pool.ChunkCompareAndSet(ctx, 1, 2, 5, ChunkStateInput{Bits: "1111", Presence: "1"})
+				version := uint64(5)
+				_, err := pool.PutChunkState(ctx, 1, 2, ChunkStateInput{Payload: []byte{1, 2}, Presence: []byte{3}},
+					PutOptions{IfVersion: &version})
 				return err
 			},
-			"CHUNKCAS 1 2 5 STATE 1111|1",
+			"CHUNKPUT 1 2 STATE IF 5 3",
 		},
+		{"scan", func() error { _, err := pool.ChunkScan(ctx, 10, nil); return err }, "CHUNKSCAN 10"},
+		{
+			"range",
+			func() error { _, err := pool.ChunkRange(ctx, 1, 2, 3, 4, GetOptions{}); return err },
+			"CHUNKRANGE 1 2 3 4 STATE",
+		},
+		{
+			"radius",
+			func() error { _, err := pool.ChunkRadius(ctx, 1, 2, 3, GetOptions{ZRLE: true}); return err },
+			"CHUNKRADIUS 1 2 3 STATE ZRLE",
+		},
+		{"version", func() error { _, err := pool.ChunkVersion(ctx, 1, 2); return err }, "CHUNKVER 1 2"},
 		{
 			"batch",
 			func() error {
 				_, err := pool.ChunkBatch(ctx, 1, 2, []BatchOperation{UnsetOp(3, 4)})
 				return err
 			},
-			"CHUNKBATCH 1 2 - UNSET 3 4",
+			"CHUNKBATCH 1 2 UNSET 3 4",
 		},
 		{
 			"batch with version",
@@ -382,7 +380,7 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 				_, err := pool.ChunkBatchIfVersion(ctx, 1, 2, 9, []BatchOperation{UnsetOp(3, 4)})
 				return err
 			},
-			"CHUNKBATCH 1 2 9 UNSET 3 4",
+			"CHUNKBATCH 1 2 IF 9 UNSET 3 4",
 		},
 		{"wal flush", func() error { return pool.WALFlush(ctx) }, "WALFLUSH"},
 		{"metrics", func() error { _, err := pool.Metrics(ctx); return err }, "METRICS"},
