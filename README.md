@@ -27,6 +27,9 @@ This package is intentionally small:
 - optimistic concurrency: `ChunkVersion`, `ChunkCompareAndSet`, and atomic
   single-chunk `ChunkBatch` / `ChunkBatchIfVersion`
 - `WALFlush` durability barrier and `Metrics` (Prometheus text format)
+- tables (chunkdb 2.0+): `CreateTable`, `DropTable`, `Tables`, `TableInfo`,
+  `SetTableOptions`, `Use`, per-table clients (`client.Table(ctx, name)`), and
+  the table named in the URI path (`chunk://host:4242/terrain`)
 - batch `MSet` / `MGet` (single round-trip for many blocks) and configurable request pipelining for high-latency links
 - `context.Context` on every request, for per-call deadlines and cancellation
 - typed errors with `errors.Is` sentinels and protocol error codes
@@ -177,6 +180,59 @@ The server occupies one worker for as long as a client connection is open, so
 keep `MaxConnections` at or below the server's `--workers` setting. Extra
 connections wait in the server's pending queue instead of being served.
 
+## Tables
+
+A chunkdb 2.0 server holds named tables, each with its own geometry and
+options. A client works on one table: `Options.Table`, else the URI path,
+else the server's `default` table. The client selects it again on every
+reconnect.
+
+```go
+admin, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
+if err != nil {
+	log.Fatal(err)
+}
+defer admin.Close()
+
+err = admin.CreateTable(ctx, "terrain", chunkdb.TableSpec{
+	BlockBits:         4,
+	ChunkWidthBlocks:  32,
+	ChunkHeightBlocks: 32,
+	Options:           chunkdb.TableOptions{DurabilityMode: "fsync-wal"},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+// A per-table client has its own connection.
+terrain, err := admin.Table(ctx, "terrain")
+if err != nil {
+	log.Fatal(err)
+}
+defer terrain.Close()
+if err := terrain.Set(ctx, 0, 0, "1011"); err != nil {
+	log.Fatal(err)
+}
+
+// Or name the table in the URI.
+same, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/terrain")
+if err != nil {
+	log.Fatal(err)
+}
+defer same.Close()
+```
+
+- Geometry is fixed when a table is created; `SetTableOptions` changes its
+  options (zero fields stay unchanged).
+- A pool works on one table: set `Options.Table` or the URI path in
+  `PoolOptions`. Use one pool per table, and do not call `Use` on a client
+  from `WithClient`: the pooled connection would keep that table.
+- After `DropTable`, commands from clients on that table fail with an `*Error`
+  whose `ServerCode` is `CodeNoTable`, even if a table of the same name is
+  created again; `Use` selects a table again.
+- `Use` changes the table for every later command on the client; commands
+  running concurrently with it may run on either table.
+
 ## API
 
 Package functions:
@@ -186,13 +242,22 @@ Package functions:
 - `NewClient(Options) (*Client, error)` — build without connecting
 - `ConnectPool(ctx, PoolOptions) (*Pool, error)`
 - `NewPool(PoolOptions) (*Pool, error)`
-- `ParseURI(string) (URI, error)`
+- `ParseURI(string) (URI, error)`; `URI.Table()` and `TableFromPath(path)`
+  report the table a path names (empty for `/`)
 - `SerializeCommand(parts ...string) ([]byte, error)`, `ReadFrame(*bufio.Reader) (Frame, error)`, `ParseInfo([]byte) map[string]string`
 - `ZRLECompress([]byte) []byte`, `ZRLEDecompress([]byte, int) ([]byte, error)`
 
 `Client` methods:
 
-- `Connect(ctx)` / `Close()` / `URI()`
+- `Connect(ctx)` / `Close()` / `URI()` — the URI path is the selected table
+- `CurrentTable()` — the table this client works on
+- `Tables(ctx) ([]string, error)`
+- `TableInfo(ctx, name) (TableInfo, error)` — geometry, options and store id
+- `Use(ctx, name) (TableInfo, error)` — selects a table for this client; an
+  unknown name fails with `CodeNoTable` and keeps the current one
+- `Table(ctx, name) (*Client, error)` — a new connected client on `name`
+- `CreateTable(ctx, name, TableSpec)`, `SetTableOptions(ctx, name, TableOptions)`,
+  `DropTable(ctx, name)`
 - `Auth(ctx, token)` — an empty token uses the configured one
 - `Ping(ctx)`
 - `Info(ctx)`
@@ -287,7 +352,8 @@ type Info struct {
 
 `Values` contains the parsed `INFO` key/value pairs exactly as reported by the
 server. `SetChunkState` and the `ChunkBin*` size checks derive the chunk
-geometry from `INFO` once per client and cache it.
+geometry of the selected table from `INFO` (or from the `USE` reply) once per
+selection and cache it.
 
 ## Versions
 

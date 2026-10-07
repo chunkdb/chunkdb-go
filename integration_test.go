@@ -1,6 +1,7 @@
 package chunkdb
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1005,4 +1007,103 @@ func TestIntegrationTLS(t *testing.T) {
 			t.Fatalf("got %v, want ErrTLS", err)
 		}
 	})
+}
+
+func TestIntegrationTables(t *testing.T) {
+	// Up to three connections are open at once.
+	server := startServer(t, serverConfig{workers: 4})
+	client := connectIntegration(t, server, nil)
+	ctx := t.Context()
+
+	if client.CurrentTable() != "default" {
+		t.Fatalf("got %q, want default", client.CurrentTable())
+	}
+	if err := client.CreateTable(ctx, "terrain", TableSpec{
+		BlockBits: 4, ChunkWidthBlocks: 8, ChunkHeightBlocks: 2,
+		Options: TableOptions{DurabilityMode: "fsync-wal"},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	var serverErr *Error
+	if err := client.CreateTable(ctx, "terrain", TableSpec{BlockBits: 4}); !errors.As(err, &serverErr) ||
+		serverErr.ServerCode != CodeTableExists {
+		t.Fatalf("got %v, want %s", err, CodeTableExists)
+	}
+	names, err := client.Tables(ctx)
+	if err != nil || !slices.Equal(names, []string{"default", "terrain"}) {
+		t.Fatalf("Tables: %q, %v", names, err)
+	}
+	info, err := client.TableInfo(ctx, "terrain")
+	if err != nil {
+		t.Fatalf("TableInfo: %v", err)
+	}
+	if info.BlockBits != 4 || info.ChunkWidthBlocks != 8 || info.ChunkHeightBlocks != 2 ||
+		info.LargeChunkWidthChunks != 8 || info.Options.DurabilityMode != "fsync-wal" ||
+		len(info.StoreID) != 32 {
+		t.Fatalf("got %+v", info)
+	}
+
+	// A handle is its own connection on the table.
+	terrain, err := client.Table(ctx, "terrain")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+	defer terrain.Close()
+	if err := terrain.Set(ctx, 1, 1, "1010"); err != nil {
+		t.Fatalf("Set on terrain: %v", err)
+	}
+	if err := client.Set(ctx, 1, 1, "1111000011110000"); err != nil {
+		t.Fatalf("Set on default: %v", err)
+	}
+	if bits, err := terrain.Get(ctx, 1, 1); err != nil || bits != "1010" {
+		t.Fatalf("Get on terrain: %q, %v", bits, err)
+	}
+
+	// Binary sizes follow the table's geometry: 8x2 blocks of 4 bits.
+	payload := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	if err := terrain.SetChunkBin(ctx, 3, 3, payload); err != nil {
+		t.Fatalf("SetChunkBin: %v", err)
+	}
+	if got, err := terrain.ChunkBin(ctx, 3, 3); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("ChunkBin: %v, %v", got, err)
+	}
+
+	// The URI path selects the table too.
+	sky := strings.TrimSuffix(server.uri, "/") + "/terrain"
+	byPath, err := Connect(ctx, Options{URI: sky})
+	if err != nil {
+		t.Fatalf("Connect by path: %v", err)
+	}
+	if bits, err := byPath.Get(ctx, 1, 1); err != nil || bits != "1010" {
+		t.Fatalf("Get by path: %q, %v", bits, err)
+	}
+	_ = byPath.Close()
+
+	if _, err := client.Use(ctx, "terrain"); err != nil {
+		t.Fatalf("Use: %v", err)
+	}
+	if bits, err := client.Get(ctx, 1, 1); err != nil || bits != "1010" {
+		t.Fatalf("Get after Use: %q, %v", bits, err)
+	}
+	if err := client.SetTableOptions(ctx, "terrain", TableOptions{CheckpointUpdates: 3}); err != nil {
+		t.Fatalf("SetTableOptions: %v", err)
+	}
+	if info, err := client.TableInfo(ctx, "terrain"); err != nil || info.Options.CheckpointUpdates != 3 {
+		t.Fatalf("TableInfo after SetTableOptions: %+v, %v", info, err)
+	}
+
+	// A drop reaches every connection on the table.
+	if _, err := client.Use(ctx, "default"); err != nil {
+		t.Fatalf("Use default: %v", err)
+	}
+	if err := client.DropTable(ctx, "terrain"); err != nil {
+		t.Fatalf("DropTable: %v", err)
+	}
+	if _, err := terrain.Get(ctx, 1, 1); !errors.As(err, &serverErr) || serverErr.ServerCode != CodeNoTable {
+		t.Fatalf("got %v, want %s", err, CodeNoTable)
+	}
+	if _, err := Connect(ctx, Options{URI: sky}); !errors.As(err, &serverErr) ||
+		serverErr.ServerCode != CodeNoTable {
+		t.Fatalf("got %v, want %s for a dropped table in the URI", err, CodeNoTable)
+	}
 }

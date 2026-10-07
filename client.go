@@ -24,6 +24,7 @@ type resolvedOptions struct {
 	cert           []byte
 	key            []byte
 	pipelineDepth  int
+	table          string
 }
 
 // resolveTimeout maps the [Options] convention onto an internal duration where
@@ -61,6 +62,14 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		scheme = "chunks"
 	}
 
+	table := opts.Table
+	if table == "" {
+		var err error
+		if table, err = TableFromPath(parsed.Path); err != nil {
+			return resolvedOptions{}, err
+		}
+	}
+
 	return resolvedOptions{
 		uri: URI{
 			Scheme: scheme,
@@ -68,7 +77,7 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 			Host:   cmp.Or(opts.Host, parsed.Host, defaultHost),
 			Port:   port,
 			Token:  token,
-			Path:   cmp.Or(parsed.Path, "/"),
+			Path:   "/" + table,
 		},
 		autoAuth:       !opts.DisableAutoAuth && token != "",
 		connectTimeout: resolveTimeout(opts.ConnectTimeout),
@@ -80,6 +89,7 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		cert:           opts.Cert,
 		key:            opts.Key,
 		pipelineDepth:  max(1, opts.PipelineDepth),
+		table:          table,
 	}, nil
 }
 
@@ -91,8 +101,10 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 // next request after a transport failure, but no request is ever retried
 // automatically.
 type Client struct {
-	opts  resolvedOptions
-	slots chan struct{}
+	// options is what the client was built with; [Client.Table] reuses it.
+	options Options
+	opts    resolvedOptions
+	slots   chan struct{}
 	// dialGate serializes connection attempts so concurrent callers share one
 	// dial instead of opening redundant sockets.
 	dialGate chan struct{}
@@ -103,6 +115,11 @@ type Client struct {
 
 	geoMu sync.Mutex
 	geo   *geometry
+
+	// table is the selected table, empty for the server's default. Every
+	// new connection selects it.
+	tableMu sync.Mutex
+	table   string
 }
 
 // NewClient builds a client without connecting. The connection is opened on
@@ -113,9 +130,11 @@ func NewClient(opts Options) (*Client, error) {
 		return nil, err
 	}
 	return &Client{
+		options:  opts,
 		opts:     resolved,
 		slots:    make(chan struct{}, resolved.pipelineDepth),
 		dialGate: make(chan struct{}, 1),
+		table:    resolved.table,
 	}, nil
 }
 
@@ -138,9 +157,19 @@ func ConnectURI(ctx context.Context, uri string) (*Client, error) {
 	return Connect(ctx, Options{URI: uri})
 }
 
-// URI reports the resolved endpoint. Note that [URI.String] renders the token
-// into the userinfo component.
-func (c *Client) URI() URI { return c.opts.uri }
+// URI reports the resolved endpoint, with the selected table as its path. Note
+// that [URI.String] renders the token into the userinfo component.
+func (c *Client) URI() URI {
+	uri := c.opts.uri
+	uri.Path = "/" + c.selectedTable()
+	return uri
+}
+
+func (c *Client) selectedTable() string {
+	c.tableMu.Lock()
+	defer c.tableMu.Unlock()
+	return c.table
+}
 
 // Connect opens the connection if it is not already established.
 func (c *Client) Connect(ctx context.Context) error {
@@ -271,6 +300,12 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 
 	if c.opts.autoAuth {
 		if err := c.authOn(ctx, established, c.opts.token()); err != nil {
+			_ = established.shutdown(err)
+			return nil, err
+		}
+	}
+	if table := c.selectedTable(); table != "" {
+		if _, err := c.useOn(ctx, established, table); err != nil {
 			_ = established.shutdown(err)
 			return nil, err
 		}

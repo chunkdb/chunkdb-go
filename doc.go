@@ -10,6 +10,10 @@
 //   - opt-in pooling via [Pool]
 //   - no automatic retries or background reconnect loops
 //
+// A chunkdb 2.0 server holds named tables; a client works on one of them,
+// chosen by [Options.Table], the URI path, or [Client.Use], and the server's
+// default table otherwise.
+//
 // Every request method takes a [context.Context]. Cancelling it aborts the
 // call; because protocol v1 has no request identifiers, an aborted in-flight
 // request also drops the connection, since the client cannot resynchronize

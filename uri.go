@@ -92,6 +92,22 @@ func (u URI) String() string {
 	return scheme + "://" + auth + host + ":" + strconv.Itoa(u.Port) + path
 }
 
+// Table reports the table the path names: "terrain" for /terrain, empty for
+// / (the server's default table). A path with more than one segment is an
+// error.
+func (u URI) Table() (string, error) {
+	return TableFromPath(u.Path)
+}
+
+// TableFromPath is [URI.Table] for a bare path.
+func TableFromPath(path string) (string, error) {
+	name := strings.TrimPrefix(path, "/")
+	if strings.Contains(name, "/") {
+		return "", connectionErrorf("", nil, "chunk URI path must name one table: %s", path)
+	}
+	return name, nil
+}
+
 // Address is the host:port dial target.
 func (u URI) Address() string {
 	return net.JoinHostPort(u.Host, strconv.Itoa(u.Port))
