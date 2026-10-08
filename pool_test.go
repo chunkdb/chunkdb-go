@@ -15,7 +15,7 @@ func newTestPool(t *testing.T, server *fakeServer, configure func(*PoolOptions))
 
 	opts := PoolOptions{
 		Options: Options{
-			URI:            server.uri("tok"),
+			URI:            server.uri(""),
 			ConnectTimeout: 2 * time.Second,
 			CommandTimeout: 2 * time.Second,
 		},
@@ -62,11 +62,11 @@ func TestPoolWarmsMinConnections(t *testing.T) {
 
 func TestPoolWarmFailureIsReported(t *testing.T) {
 	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
-		writeServerError(conn, "ERR AUTH_FAILED invalid token")
+		writeServerError(conn, "ERR AUTH_FAILED invalid user or password")
 	})
 
 	_, err := ConnectPool(t.Context(), PoolOptions{
-		Options:        Options{URI: server.uri("wrong")},
+		Options:        Options{URI: server.uri("bot:wrong")},
 		MaxConnections: 2,
 		MinConnections: 1,
 	})

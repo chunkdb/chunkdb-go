@@ -13,8 +13,8 @@ go get github.com/chunkdb/chunkdb-go/v2
 ```go
 ctx := context.Background()
 
-// The URI path is the client's default table; "" in a method means that table.
-client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+// Log in as bot; the URI path is the client's default table ("" in a method).
+client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/world")
 if err != nil {
 	log.Fatal(err)
 }
@@ -39,6 +39,10 @@ if err != nil {
 block, err := client.GetBlock(ctx, "", 10, 4) // nil when the block is absent
 fmt.Println(version, block["id"], block["light"], block["sign"]) // <chunk version> 23 15 hello
 ```
+
+## Logging in
+
+Every connection logs in with a user and password, from the URI (`chunk://user:password@host:4242/`, with `%XX` escapes for `:`, `@` or `/` in the password) or `Options.User` and `Options.Password`. The login is SCRAM-SHA-256: the password never crosses the network, and the client refuses a server that cannot prove it holds the user's verifier. Without a user the client sends `HELLO 3` alone, which only a server started with `--auth none` accepts.
 
 ## Values
 
@@ -65,10 +69,20 @@ A value that does not fit its column (out of range, too long, wrong type) fails 
 - areas: `GetArea(ctx, table, cx0, cy0, cx1, cy1, columns...)` and `GetAreaAround(ctx, table, cx, cy, radius, columns...)` return the chunks with a present block (at most `ServerInfo().MaxAreaChunks` per read)
 - scans: `ScanChunks(ctx, table, after, limit)` returns one page (`Chunks`, `More`); `AllChunks(ctx, table, limit)` iterates every page
 - tables: `CreateTable`, `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` (`ConvertNone`, `ConvertClamp`, `ConvertDefault`, `ConvertTruncate`), `SetTableOption`, `DropTable`, `Tables`, `Describe`, `Schema`
+- users: `CreateUser(ctx, name, password, CreateUserOptions{ManagesUsers})`, `SetPassword`, `SetManagesUsers`, `DropUser`, `Grant(ctx, right, table, user)`, `Revoke`, `Users` (name, `ManagesUsers`, `Grants` per table); see below
 - server: `Ping`, `FlushWAL` (returns once every acknowledged write is durable), `Metrics` (Prometheus text), `ServerInfo()` (version and limits from `HELLO 3`)
 - any statement: `Do(ctx, statement, params...)` sends raw parameter frames (`EncodeValue` builds them; `nil` is NULL) and returns the decoded `Reply`
 
 `Pool` mirrors the statement methods and adds `WithClient(ctx, fn)`.
+
+## Users
+
+```go
+err := admin.CreateUser(ctx, "bot", password, chunkdb.CreateUserOptions{})
+err = admin.Grant(ctx, chunkdb.RightWrite, "world", "bot") // chunkdb.AllTables is every table
+```
+
+The client computes the user's SCRAM verifier from the password and sends only that. Rights are `RightRead`, `RightWrite` (includes read) and `RightAdmin` (includes write); user statements and grants need a user who manages users, and a user may change their own password with `SetPassword`. `ComputeVerifier(password, iterations)` returns the verifier for `CREATE USER ... VERIFIER $1` sent with `Do`; `Options.VerifierIterations` raises the PBKDF2 iterations from 4096.
 
 ## Conditional writes
 
@@ -98,7 +112,7 @@ The client refreshes a table's cached schema after its own `CREATE`, `ALTER` or 
 
 ```go
 client, err := chunkdb.Connect(ctx, chunkdb.Options{
-	URI:            "chunks://chunk-token@127.0.0.1:4242/world",
+	URI:            "chunks://bot:secret@127.0.0.1:4242/world",
 	CA:             caPEM,
 	ConnectTimeout: 2 * time.Second,
 	CommandTimeout: 3 * time.Second,
@@ -106,7 +120,7 @@ client, err := chunkdb.Connect(ctx, chunkdb.Options{
 })
 ```
 
-- explicit `Host`, `Port`, `Token` and `Table` win over the URI
+- explicit `Host`, `Port`, `User`, `Password` and `Table` win over the URI
 - `ConnectTimeout` bounds dialing, TLS and `HELLO`; `CommandTimeout` bounds one reply; both default to 5 seconds, and a negative value leaves deadlines to the context
 - `PipelineDepth` keeps that many requests in flight on one connection (default 1); replies come back in request order
 - TLS: `chunks://` or `TLS: true`; `CA`, `Cert`, `Key` take PEM bytes; `TLSServerName` overrides SNI; `TLSInsecure` skips verification (local testing only); TLS 1.2 or newer
@@ -119,7 +133,7 @@ A `Client` is one socket, safe for concurrent use. It connects lazily and reconn
 
 ## Errors
 
-Every failure is an `*Error` with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` or `AUTH_REQUIRED`, also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrTLS`, `ErrClosed`.
+Every failure is an `*Error` with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` for a wrong user or password, `AUTH_REQUIRED` for no user; also `ErrServer`), `ErrPermissionDenied` (`*PermissionDeniedError` with the `Right` and `Table` the statement needs; also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrTLS`, `ErrClosed`. A table the user has no right on reads as `NO_TABLE`. A server whose SCRAM signature does not match fails the login with `ErrConnection`.
 
 ## Limits
 

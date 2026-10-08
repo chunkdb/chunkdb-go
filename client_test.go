@@ -3,11 +3,13 @@ package chunkdb
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,7 +20,7 @@ func newTestClient(t *testing.T, server *fakeServer, configure func(*Options)) *
 	t.Helper()
 
 	opts := Options{
-		URI:            server.uri("tok"),
+		URI:            server.uri(""),
 		ConnectTimeout: 2 * time.Second,
 		CommandTimeout: 2 * time.Second,
 	}
@@ -94,32 +96,99 @@ func TestClientHelloAndPing(t *testing.T) {
 	}
 
 	commands := server.commands()
-	want := []string{"HELLO 3 AUTH tok", "PING"}
+	want := []string{"HELLO 3", "PING"}
 	if strings.Join(commands, "|") != strings.Join(want, "|") {
 		t.Fatalf("got statements %q, want %q", commands, want)
 	}
 }
 
-func TestClientHelloWithoutToken(t *testing.T) {
-	server := newFakeServer(t, withHello(genericHandler))
-	client, err := Connect(t.Context(), Options{URI: server.uri("")})
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
+func TestClientLogin(t *testing.T) {
+	login := &fakeLogin{user: "bot", password: "p@ss:word/1"}
+	server := newFakeServer(t, login.handler(genericHandler))
+	// %XX escapes in the URI.
+	client := newTestClient(t, server, func(o *Options) { o.URI = server.uri("bot:p%40ss%3Aword%2F1") })
 
 	if err := client.Ping(t.Context()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
-	if commands := server.commands(); len(commands) != 2 || commands[0] != "HELLO 3" {
-		t.Fatalf("got %q, want HELLO 3 then PING", commands)
+	commands := server.commands()
+	if want := []string{"HELLO 3 USER bot $1", "AUTH $1", "PING"}; !slices.Equal(commands, want) {
+		t.Fatalf("got statements %q, want %q", commands, want)
+	}
+	server.mu.Lock()
+	first, final := string(server.params[0][0]), string(server.params[1][0])
+	server.mu.Unlock()
+	nonce, ok := strings.CutPrefix(first, "n,,n=bot,r=")
+	if raw, err := base64.StdEncoding.DecodeString(nonce); !ok || err != nil || len(raw) < 18 {
+		t.Fatalf("got client-first %q, want n,,n=bot,r=<base64 of at least 18 bytes>", first)
+	}
+	if !strings.HasPrefix(final, "c=biws,r="+nonce+fakeServerNonce+",p=") {
+		t.Fatalf("got client-final %q", final)
+	}
+	if info := client.ServerInfo(); info == nil || !strings.HasPrefix(info.ServerSignature, "v=") {
+		t.Fatalf("got ServerInfo %+v, want the server signature", info)
+	}
+
+	// The options win over the URI, and every connection logs in afresh.
+	other := newTestClient(t, server, func(o *Options) {
+		o.URI = server.uri("someone:else")
+		o.User, o.Password = "bot", "p@ss:word/1"
+	})
+	if err := other.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+}
+
+func TestClientLoginRefusesWrongServerSignature(t *testing.T) {
+	login := &fakeLogin{user: "bot", password: "secret", tamper: true}
+	server := newFakeServer(t, login.handler(genericHandler))
+
+	_, err := Connect(t.Context(), Options{URI: server.uri("bot:secret")})
+	if !errors.Is(err, ErrConnection) || errors.Is(err, ErrAuth) || errors.Is(err, ErrServer) {
+		t.Fatalf("got %v, want ErrConnection only", err)
+	}
+	if !strings.Contains(err.Error(), "could not prove it knows the password") {
+		t.Fatalf("got %q", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Phase != PhaseAuth || typed.Command != "HELLO" {
+		t.Fatalf("got %+v, want phase auth of HELLO", typed)
+	}
+	waitForFinishedConns(t, server, 1)
+}
+
+func TestClientLoginRejectsBadServerFirst(t *testing.T) {
+	// Each case builds the reply to HELLO 3 USER from the client nonce.
+	cases := map[string]func(nonce string) string{
+		"not SCRAM":         func(string) string { return "+OK\r\n" },
+		"a map":             func(string) string { return helloReply },
+		"foreign nonce":     func(string) string { return "+SCRAM r=other,s=c2FsdA==,i=4096\r\n" },
+		"the client nonce":  func(nonce string) string { return "+SCRAM r=" + nonce + ",s=c2FsdA==,i=4096\r\n" },
+		"bad salt":          func(nonce string) string { return "+SCRAM r=" + nonce + "x,s=!!,i=4096\r\n" },
+		"too few rounds":    func(nonce string) string { return "+SCRAM r=" + nonce + "x,s=c2FsdA==,i=1000\r\n" },
+		"no iteration part": func(nonce string) string { return "+SCRAM r=" + nonce + "x,s=c2FsdA==\r\n" },
+	}
+	for name, reply := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := newFakeServer(t, func(s *fakeServer, conn net.Conn, _ string) {
+				writeRaw(conn, reply(strings.TrimPrefix(string(s.paramsOf(conn)[0]), "n,,n=bot,r=")))
+			})
+			_, err := Connect(t.Context(), Options{URI: server.uri("bot:secret")})
+			if !errors.Is(err, ErrProtocol) {
+				t.Fatalf("got %v, want ErrProtocol", err)
+			}
+			if got := server.commands(); len(got) != 1 {
+				t.Fatalf("got %q, want HELLO alone and no AUTH", got)
+			}
+			waitForFinishedConns(t, server, 1)
+		})
 	}
 }
 
 func TestClientServerInfo(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
 
-	client, err := NewClient(Options{URI: server.uri("tok")})
+	client, err := NewClient(Options{URI: server.uri("")})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -147,26 +216,27 @@ func TestClientServerInfo(t *testing.T) {
 }
 
 func TestClientHelloAuthFailureIsTyped(t *testing.T) {
-	// A protocol 3 server answers AUTH_REQUIRED only to a HELLO without a
-	// token.
 	cases := []struct {
-		token   string
-		reply   string
-		code    string
-		message string
+		userinfo string
+		command  string
+		code     string
+		message  string
 	}{
-		{"wrong", "ERR AUTH_FAILED invalid token", CodeAuthFailed, "invalid token"},
-		{"", "ERR AUTH_REQUIRED use HELLO 3 AUTH <token>", CodeAuthRequired, "use HELLO 3 AUTH <token>"},
+		{"bot:wrong", "AUTH", CodeAuthFailed, "invalid user or password"},
+		{"nobody:secret", "AUTH", CodeAuthFailed, "invalid user or password"},
+		{"", "HELLO", CodeAuthRequired, "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message"},
 	}
 
 	for _, testCase := range cases {
-		t.Run(testCase.code, func(t *testing.T) {
-			server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
-				writeServerError(conn, testCase.reply)
-			})
+		t.Run(testCase.userinfo, func(t *testing.T) {
+			login := &fakeLogin{user: "bot", password: "secret"}
+			server := newFakeServer(t, login.handler(func(_ *fakeServer, conn net.Conn, _ string) {
+				// HELLO 3 without a user.
+				writeServerError(conn, "ERR AUTH_REQUIRED use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message")
+			}))
 
-			_, err := Connect(t.Context(), Options{URI: server.uri(testCase.token)})
-			if !errors.Is(err, ErrAuth) || !errors.Is(err, ErrServer) {
+			_, err := Connect(t.Context(), Options{URI: server.uri(testCase.userinfo)})
+			if !errors.Is(err, ErrAuth) || !errors.Is(err, ErrServer) || errors.Is(err, ErrPermissionDenied) {
 				t.Fatalf("got %v, want ErrAuth and ErrServer", err)
 			}
 			var typed *Error
@@ -176,8 +246,8 @@ func TestClientHelloAuthFailureIsTyped(t *testing.T) {
 			if typed.ServerCode != testCase.code || typed.ServerMessage != testCase.message {
 				t.Fatalf("got code %q message %q", typed.ServerCode, typed.ServerMessage)
 			}
-			if typed.Phase != PhaseAuth || typed.Command != "HELLO" {
-				t.Fatalf("got phase %q command %q, want %q HELLO", typed.Phase, typed.Command, PhaseAuth)
+			if typed.Phase != PhaseAuth || typed.Command != testCase.command {
+				t.Fatalf("got phase %q command %q, want %q %s", typed.Phase, typed.Command, PhaseAuth, testCase.command)
 			}
 			// A failed handshake closes the socket.
 			waitForFinishedConns(t, server, 1)
@@ -187,19 +257,20 @@ func TestClientHelloAuthFailureIsTyped(t *testing.T) {
 
 func TestClientHelloRefusesOlderServers(t *testing.T) {
 	cases := map[string]struct {
-		token string
-		reply string
+		userinfo string
+		reply    string
 	}{
 		"protocol 2":            {"", "ERR PROTOCOL expected HELLO 2"},
+		"protocol 2 with user":  {"bot:secret", "ERR PROTOCOL expected HELLO 2"},
 		"1.x":                   {"", "ERR UNKNOWN_COMMAND HELLO"},
-		"1.x requiring a token": {"tok", "ERR AUTH_REQUIRED use AUTH <token>"},
+		"1.x requiring a token": {"bot:secret", "ERR AUTH_REQUIRED use AUTH <token>"},
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
 			server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
 				writeServerError(conn, testCase.reply)
 			})
-			_, err := Connect(t.Context(), Options{URI: server.uri(testCase.token)})
+			_, err := Connect(t.Context(), Options{URI: server.uri(testCase.userinfo)})
 			if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrServer) {
 				t.Fatalf("got %v, want ErrProtocol and not ErrServer", err)
 			}
@@ -246,7 +317,7 @@ func TestClientHelloRejectsBadReplies(t *testing.T) {
 			server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
 				writeRaw(conn, reply)
 			})
-			_, err := Connect(t.Context(), Options{URI: server.uri("tok")})
+			_, err := Connect(t.Context(), Options{URI: server.uri("")})
 			if !errors.Is(err, ErrProtocol) {
 				t.Fatalf("got %v, want ErrProtocol", err)
 			}
@@ -259,7 +330,7 @@ func TestClientHelloTimeout(t *testing.T) {
 	// The server never answers HELLO.
 	server := newFakeServer(t, func(*fakeServer, net.Conn, string) {})
 
-	_, err := Connect(t.Context(), Options{URI: server.uri("tok"), CommandTimeout: 100 * time.Millisecond})
+	_, err := Connect(t.Context(), Options{URI: server.uri(""), CommandTimeout: 100 * time.Millisecond})
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("got %v, want ErrTimeout", err)
 	}
@@ -444,7 +515,7 @@ func TestClientDefaultTable(t *testing.T) {
 				t.Fatalf("got %q", got)
 			}
 			// HELLO does not name the table.
-			if got := server.commands()[0]; got != "HELLO 3 AUTH tok" {
+			if got := server.commands()[0]; got != "HELLO 3" {
 				t.Fatalf("got %q", got)
 			}
 		})
@@ -532,10 +603,14 @@ func TestClientRefreshesTheSchemaForAnUnknownColumn(t *testing.T) {
 	}
 }
 
-func TestClientRejectsBadTokenAndTable(t *testing.T) {
+func TestClientRejectsBadLoginAndTable(t *testing.T) {
 	for _, opts := range []Options{
-		{Token: "two words"},
-		{Token: "line\r\nbreak"},
+		{User: "two words"},
+		{User: "line\r\nbreak"},
+		{User: "Upper"},
+		{Password: "no user"},
+		{URI: "chunk://:secret@h:1/"},
+		{User: "bot", VerifierIterations: 1000},
 		{URI: "chunk://h:1/Upper"},
 		{Table: "a b"},
 	} {
@@ -1054,7 +1129,7 @@ func TestClientReconnectsWhenTheConnectionDiesBeforeUse(t *testing.T) {
 		}
 	})
 
-	client, err := NewClient(Options{URI: server.uri("tok"), CommandTimeout: time.Second})
+	client, err := NewClient(Options{URI: server.uri(""), CommandTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -1232,13 +1307,13 @@ func TestClientOptionResolution(t *testing.T) {
 		},
 		{
 			name: "uri",
-			opts: Options{URI: "chunks://tok@example.test:9000/terrain"},
-			want: URI{Scheme: "chunks", Secure: true, Host: "example.test", Port: 9000, Token: "tok", Path: "/terrain"},
+			opts: Options{URI: "chunks://bot:pw@example.test:9000/terrain"},
+			want: URI{Scheme: "chunks", Secure: true, Host: "example.test", Port: 9000, User: "bot", Password: "pw", Path: "/terrain"},
 		},
 		{
 			name: "explicit fields win over uri",
-			opts: Options{URI: "chunk://tok@example.test:9000/", Host: "other.test", Port: 1, Token: "override", Table: "world"},
-			want: URI{Scheme: "chunk", Host: "other.test", Port: 1, Token: "override", Path: "/world"},
+			opts: Options{URI: "chunk://bot:pw@example.test:9000/", Host: "other.test", Port: 1, User: "admin", Password: "override", Table: "world"},
+			want: URI{Scheme: "chunk", Host: "other.test", Port: 1, User: "admin", Password: "override", Path: "/world"},
 		},
 		{
 			name: "tls option upgrades a chunk uri",
