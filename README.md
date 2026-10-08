@@ -71,9 +71,10 @@ A value that does not fit its column (out of range, too long, wrong type) fails 
 - tables: `CreateTable`, `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` (`ConvertNone`, `ConvertClamp`, `ConvertDefault`, `ConvertTruncate`), `SetTableOption`, `DropTable`, `Tables`, `Describe`, `Schema`
 - users: `CreateUser(ctx, name, password, CreateUserOptions{ManagesUsers})`, `SetPassword`, `SetManagesUsers`, `DropUser`, `Grant(ctx, right, table, user)`, `Revoke`, `Users` (name, `ManagesUsers`, `Grants` per table); see below
 - server: `Ping`, `FlushWAL` (returns once every acknowledged write is durable), `Metrics` (Prometheus text), `ServerInfo()` (version and limits from `HELLO 3`)
+- transactions: `Transaction(ctx, func(tx *Tx) error, opts...)` returns the commit version; see below
 - any statement: `Do(ctx, statement, params...)` sends raw parameter frames (`EncodeValue` builds them; `nil` is NULL) and returns the decoded `Reply`
 
-`Pool` mirrors the statement methods and adds `WithClient(ctx, fn)`.
+`Pool` mirrors the statement methods and `Transaction`, and adds `WithClient(ctx, fn)`.
 
 ## Users
 
@@ -99,6 +100,34 @@ if errors.As(err, &mismatch) {
 	// mismatch.Current is the chunk's version now: read again and retry.
 }
 ```
+
+## Transactions
+
+`Transaction` reads one snapshot of one table and writes several chunks together, or not at all:
+
+```go
+version, err := client.Transaction(ctx, func(tx *chunkdb.Tx) error {
+	from, err := tx.GetBlock(ctx, "", 10, 4, "gold")
+	if err != nil {
+		return err
+	}
+	to, err := tx.GetBlock(ctx, "", 300, 7, "gold")
+	if err != nil {
+		return err
+	}
+	if err := tx.SetBlock(ctx, "", 10, 4, chunkdb.Record{"gold": from["gold"].(uint64) - 10}); err != nil {
+		return err
+	}
+	return tx.SetBlock(ctx, "", 300, 7, chunkdb.Record{"gold": to["gold"].(uint64) + 10})
+})
+```
+
+- `tx` has the block, chunk and area methods of the client; reads see the snapshot taken by the first statement plus the transaction's own writes, and writes return no version: `Transaction` returns the version every written chunk has after `COMMIT`, or 0 when nothing was written
+- `IfVersion` is not offered inside a transaction: `COMMIT` checks every chunk the transaction read or wrote
+- when another write changed one of them, or the server ends the transaction for another reason, it answers `CONFLICT` and nothing is written; `Transaction` then runs the function again after a pause of a few milliseconds, up to 5 times (`TxRetries(n)` changes the limit), and returns a `*ConflictError` (`Reason`: `chunk_changed`, `duration`, `history_limit` or `table_changed`) after the last one. Keep the function free of other side effects
+- after a statement answers `CONFLICT`, the transaction's other statements return the same error and send nothing; returning it from the function is enough
+- when the function returns an error, the transaction rolls back and `Transaction` returns that error without running it again; other statement errors leave the transaction open
+- the transaction holds the client's connection until it ends, and the client's other requests wait for it; `Pool.Transaction` runs it on a leased connection while the pool serves other requests. A dropped connection rolls the transaction back
 
 ## Schema changes
 
@@ -133,7 +162,7 @@ A `Client` is one socket, safe for concurrent use. It connects lazily and reconn
 
 ## Errors
 
-Every failure is an `*Error` with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` for a wrong user or password, `AUTH_REQUIRED` for no user; also `ErrServer`), `ErrPermissionDenied` (`*PermissionDeniedError` with the `Right` and `Table` the statement needs; also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrTLS`, `ErrClosed`. A table the user has no right on reads as `NO_TABLE`. A server whose SCRAM signature does not match fails the login with `ErrConnection`.
+Every failure is an `*Error` with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` for a wrong user or password, `AUTH_REQUIRED` for no user; also `ErrServer`), `ErrPermissionDenied` (`*PermissionDeniedError` with the `Right` and `Table` the statement needs; also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrConflict` (`*ConflictError`), `ErrTLS`, `ErrClosed`. A table the user has no right on reads as `NO_TABLE`. A server whose SCRAM signature does not match fails the login with `ErrConnection`.
 
 ## Limits
 

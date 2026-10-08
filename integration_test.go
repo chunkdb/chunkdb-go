@@ -92,6 +92,8 @@ type serverConfig struct {
 	// as a client connection is open, so a test that keeps N connections alive
 	// needs at least N workers.
 	workers int
+	// args are further server flags.
+	args []string
 }
 
 func startServer(t *testing.T, config serverConfig) *testServer {
@@ -130,6 +132,7 @@ func startServer(t *testing.T, config serverConfig) *testServer {
 		args = append(args, "--admin-user", testAdmin, "--admin-password-file", passwordFile)
 		server.uri = server.uriAs(testAdmin, testAdminPassword)
 	}
+	args = append(args, config.args...)
 	if config.tls {
 		certPath, keyPath, caPEM := writeTLSFixture(t)
 		args = append(args, "--tls-cert", certPath, "--tls-key", keyPath)
@@ -1205,4 +1208,443 @@ func TestIntegrationTLS(t *testing.T) {
 			t.Fatalf("got %v, want ErrTLS", err)
 		}
 	})
+}
+
+func TestIntegrationTransactionCommit(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+	observer := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+
+	if _, err := client.SetBlock(ctx, "", 0, 0, Record{"id": 1, "name": "old"}); err != nil {
+		t.Fatalf("SetBlock: %v", err)
+	}
+	// Two chunks, (0, 0) and (5, 5), written together.
+	version, err := client.Transaction(ctx, func(tx *Tx) error {
+		block, err := tx.GetBlock(ctx, "", 0, 0, "id")
+		if err != nil {
+			return err
+		}
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": block["id"].(uint64) + 1, "name": "new"}); err != nil {
+			return err
+		}
+		if err := tx.SetBlock(ctx, "", 20, 20, Record{"id": 7}); err != nil {
+			return err
+		}
+		// The transaction reads its own writes.
+		own, err := tx.GetBlock(ctx, "", 0, 0, "id", "name")
+		if err != nil || !sameRecord(own, Record{"id": uint64(2), "name": "new"}) {
+			t.Errorf("own write: got %v, %v", own, err)
+		}
+		// Nobody else sees them before COMMIT.
+		if got, err := observer.GetBlock(ctx, "", 20, 20); err != nil || got != nil {
+			t.Errorf("another client sees an uncommitted write: %v, %v", got, err)
+		}
+		return nil
+	})
+	if err != nil || version == 0 {
+		t.Fatalf("Transaction: %d, %v", version, err)
+	}
+	for _, at := range []ChunkCoord{{0, 0}, {5, 5}} {
+		chunk, err := client.GetChunk(ctx, "", at.CX, at.CY)
+		if err != nil || chunk.Version != version {
+			t.Fatalf("chunk %v: version %v, %v; want %d", at, chunk, err, version)
+		}
+	}
+	if got, err := client.GetBlock(ctx, "", 20, 20, "id"); err != nil || got["id"] != uint64(7) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+
+	// A transaction that writes nothing commits with no version, and one that
+	// sends nothing sends no BEGIN.
+	version, err = client.Transaction(ctx, func(tx *Tx) error {
+		_, err := tx.GetChunk(ctx, "", 0, 0)
+		return err
+	})
+	if err != nil || version != 0 {
+		t.Fatalf("read-only Transaction: %d, %v", version, err)
+	}
+	if version, err := client.Transaction(ctx, func(*Tx) error { return nil }); err != nil || version != 0 {
+		t.Fatalf("empty Transaction: %d, %v", version, err)
+	}
+
+	// Chunk writes, deletes and area reads inside a transaction.
+	version, err = client.Transaction(ctx, func(tx *Tx) error {
+		chunk, err := tx.GetChunk(ctx, "", 5, 5)
+		if err != nil {
+			return err
+		}
+		chunk.SetBlock(1, 1, Record{"id": 11})
+		if err := tx.SetChunk(ctx, "", 9, 9, chunk); err != nil {
+			return err
+		}
+		if err := tx.DeleteBlock(ctx, "", 20, 20); err != nil {
+			return err
+		}
+		area, err := tx.GetArea(ctx, "", 5, 5, 9, 9, "id")
+		if err != nil {
+			return err
+		}
+		if len(area) != 1 || area[0].CX != 9 || area[0].CY != 9 {
+			t.Errorf("area: got %+v", area)
+		}
+		return nil
+	})
+	if err != nil || version == 0 {
+		t.Fatalf("Transaction: %d, %v", version, err)
+	}
+	if got, err := client.GetBlock(ctx, "", 37, 37, "id"); err != nil || got["id"] != uint64(11) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if got, err := client.GetBlock(ctx, "", 20, 20); err != nil || got != nil {
+		t.Fatalf("got %v, %v; want the deleted block absent", got, err)
+	}
+}
+
+func TestIntegrationTransactionSnapshotAndConflict(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	other := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+	if _, err := client.SetBlock(ctx, "", 0, 0, Record{"id": 100}); err != nil {
+		t.Fatalf("SetBlock: %v", err)
+	}
+	if _, err := client.SetBlock(ctx, "", 8, 0, Record{"id": 1}); err != nil {
+		t.Fatalf("SetBlock: %v", err)
+	}
+
+	// The first attempt reads chunk (0, 0), then another client changes it:
+	// the transaction keeps reading its snapshot, and COMMIT answers CONFLICT.
+	// The second attempt reads the new value and commits.
+	attempts := 0
+	var seen []uint64
+	version, err := client.Transaction(ctx, func(tx *Tx) error {
+		attempts++
+		block, err := tx.GetBlock(ctx, "", 0, 0, "id")
+		if err != nil {
+			return err
+		}
+		if attempts == 1 {
+			if _, err := other.SetBlock(ctx, "", 1, 1, Record{"id": 5}); err != nil {
+				t.Errorf("SetBlock: %v", err)
+			}
+			if _, err := other.SetBlock(ctx, "", 0, 0, Record{"id": 200}); err != nil {
+				t.Errorf("SetBlock: %v", err)
+			}
+			again, err := tx.GetBlock(ctx, "", 0, 0, "id")
+			if err != nil || again["id"] != uint64(100) {
+				t.Errorf("the snapshot moved: got %v, %v", again, err)
+			}
+			if absent, err := tx.GetBlock(ctx, "", 1, 1); err != nil || absent != nil {
+				t.Errorf("the snapshot moved: got %v, %v", absent, err)
+			}
+		}
+		seen = append(seen, block["id"].(uint64))
+		// Move 10 from block (0, 0) to block (8, 0), another chunk.
+		from := block["id"].(uint64)
+		to, err := tx.GetBlock(ctx, "", 8, 0, "id")
+		if err != nil {
+			return err
+		}
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": from - 10}); err != nil {
+			return err
+		}
+		return tx.SetBlock(ctx, "", 8, 0, Record{"id": to["id"].(uint64) + 10})
+	})
+	if err != nil || version == 0 {
+		t.Fatalf("Transaction: %d, %v", version, err)
+	}
+	if attempts != 2 || !slices.Equal(seen, []uint64{100, 200}) {
+		t.Fatalf("got %d attempts that saw %v, want 2 that saw [100 200]", attempts, seen)
+	}
+	if got, _ := client.GetBlock(ctx, "", 0, 0, "id"); got["id"] != uint64(190) {
+		t.Fatalf("got %v, want 190", got)
+	}
+	if got, _ := client.GetBlock(ctx, "", 8, 0, "id"); got["id"] != uint64(11) {
+		t.Fatalf("got %v, want 11", got)
+	}
+
+	// Past the retry limit, Transaction returns the conflict.
+	attempts = 0
+	_, err = client.Transaction(ctx, func(tx *Tx) error {
+		attempts++
+		if _, err := tx.GetBlock(ctx, "", 0, 0); err != nil {
+			return err
+		}
+		if _, err := other.SetBlock(ctx, "", 0, 0, Record{"id": attempts}); err != nil {
+			t.Errorf("SetBlock: %v", err)
+		}
+		return tx.SetBlock(ctx, "", 0, 0, Record{"id": 0})
+	}, TxRetries(1))
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) || conflict.Reason != ConflictChunkChanged || !errors.Is(err, ErrConflict) ||
+		!errors.Is(err, ErrServer) || attempts != 2 {
+		t.Fatalf("got %v after %d attempts, want a chunk_changed conflict after 2", err, attempts)
+	}
+	if got, _ := client.GetBlock(ctx, "", 0, 0, "id"); got["id"] != uint64(2) {
+		t.Fatalf("got %v, want the other client's 2", got)
+	}
+}
+
+func TestIntegrationTransactionRollback(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+	createTable(t, client, "others", typesSpec)
+
+	errStop := errors.New("stop")
+	attempts := 0
+	_, err := client.Transaction(ctx, func(tx *Tx) error {
+		attempts++
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": 1}); err != nil {
+			return err
+		}
+		return errStop
+	})
+	if !errors.Is(err, errStop) || attempts != 1 {
+		t.Fatalf("got %v after %d attempts, want errStop after 1", err, attempts)
+	}
+	if got, err := client.GetBlock(ctx, "", 0, 0); err != nil || got != nil {
+		t.Fatalf("a rolled back write applied: %v, %v", got, err)
+	}
+
+	// A failed statement leaves the transaction open, also one on another
+	// table, whose schema the transaction fetches on its own connection.
+	version, err := client.Transaction(ctx, func(tx *Tx) error {
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": 1, "small": 8}); !errors.Is(err, ErrProtocol) {
+			t.Errorf("got %v, want a request error", err)
+		}
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"small": 1}); !isServerCode(err, CodeInvalidArgument) {
+			t.Errorf("got %v, want INVALID_ARGUMENT for a missing REQUIRED column", err)
+		}
+		if _, err := tx.GetBlock(ctx, "others", 0, 0); !isServerCode(err, CodeInvalidArgument) {
+			t.Errorf("got %v, want INVALID_ARGUMENT for another table", err)
+		}
+		return tx.SetBlock(ctx, "", 0, 0, Record{"id": 3})
+	})
+	if err != nil || version == 0 {
+		t.Fatalf("Transaction: %d, %v", version, err)
+	}
+	if got, _ := client.GetBlock(ctx, "", 0, 0, "id"); got["id"] != uint64(3) {
+		t.Fatalf("got %v", got)
+	}
+
+	// A Tx used after its function returned refuses statements.
+	var escaped *Tx
+	if _, err := client.Transaction(ctx, func(tx *Tx) error { escaped = tx; return nil }); err != nil {
+		t.Fatalf("Transaction: %v", err)
+	}
+	if err := escaped.SetBlock(ctx, "", 0, 0, Record{"id": 9}); err == nil || !strings.Contains(err.Error(), "ended") {
+		t.Fatalf("got %v, want a refusal", err)
+	}
+}
+
+func TestIntegrationTransactionRefusedStatements(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, nil)
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+
+	// Statements sent with Do on one connection: the server refuses all but
+	// the block, chunk and area statements, DESCRIBE and PING inside a
+	// transaction, and IF VERSION, and keeps the transaction open.
+	steps := []struct {
+		statement string
+		code      string
+	}{
+		{"BEGIN", ""},
+		{"SET BLOCK 0 0 IN things id = 4", ""},
+		{"SCAN CHUNKS FROM things", CodeInvalidArgument},
+		{"DESCRIBE things", ""},
+		{"SHOW TABLES", CodeInvalidArgument},
+		{"FLUSH WAL", CodeInvalidArgument},
+		{"SET BLOCK 0 0 IN things id = 5 IF VERSION 1", CodeInvalidArgument},
+		{"PING", ""},
+	}
+	for _, step := range steps {
+		reply, err := client.Do(ctx, step.statement)
+		if step.code == "" && err != nil {
+			t.Fatalf("%s: %v", step.statement, err)
+		}
+		if step.code != "" && !isServerCode(err, step.code) {
+			t.Fatalf("%s: got %v, %v; want %s", step.statement, reply, err, step.code)
+		}
+	}
+	reply, err := client.Do(ctx, "COMMIT")
+	if version, ok := reply.Uint64(); err != nil || !ok || version == 0 {
+		t.Fatalf("COMMIT: %v, %v", reply, err)
+	}
+	if got, _ := client.GetBlock(ctx, "things", 0, 0, "id"); got["id"] != uint64(4) {
+		t.Fatalf("got %v", got)
+	}
+	if _, err := client.Do(ctx, "COMMIT"); !isServerCode(err, CodeInvalidArgument) {
+		t.Fatalf("COMMIT without a transaction: got %v", err)
+	}
+	if reply, err := client.Do(ctx, "ROLLBACK"); err != nil || reply.Text != "OK" {
+		t.Fatalf("ROLLBACK without a transaction: %v, %v", reply, err)
+	}
+}
+
+func TestIntegrationTransactionDisconnectRollsBack(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+
+	// A cancelled statement drops the connection, which rolls the
+	// transaction back; the client reconnects outside any transaction.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_, err := client.Transaction(ctx, func(tx *Tx) error {
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": 1}); err != nil {
+			return err
+		}
+		_, err := tx.GetBlock(cancelled, "", 0, 0)
+		if !errors.Is(err, ErrTimeout) {
+			t.Errorf("got %v, want a timeout", err)
+		}
+		// Later statements fail with the dropped connection's error and are
+		// never sent on a new connection.
+		if err := tx.SetBlock(ctx, "", 1, 1, Record{"id": 2}); err == nil {
+			t.Error("a statement after the dropped connection succeeded")
+		}
+		return err
+	})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want a timeout", err)
+	}
+	for _, at := range [][2]int64{{0, 0}, {1, 1}} {
+		if got, err := client.GetBlock(ctx, "", at[0], at[1]); err != nil || got != nil {
+			t.Fatalf("block %v: got %v, %v; want it absent", at, got, err)
+		}
+	}
+	// The new connection is not inside a transaction: a write has a version.
+	if version, err := client.SetBlock(ctx, "", 0, 0, Record{"id": 1}); err != nil || version == 0 {
+		t.Fatalf("SetBlock: %d, %v", version, err)
+	}
+}
+
+func TestIntegrationTransactionConflictAtAStatement(t *testing.T) {
+	server := startServer(t, serverConfig{workers: 4, args: []string{"--txn-max-duration-ms", "200"}})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+
+	// A transaction open longer than the server allows ends with CONFLICT
+	// duration at its next statement; the second attempt is quick.
+	attempts := 0
+	version, err := client.Transaction(ctx, func(tx *Tx) error {
+		attempts++
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": attempts}); err != nil {
+			return err
+		}
+		if attempts == 1 {
+			time.Sleep(400 * time.Millisecond)
+			_, err := tx.GetBlock(ctx, "", 0, 0)
+			var conflict *ConflictError
+			if !errors.As(err, &conflict) || conflict.Reason != ConflictDuration {
+				t.Errorf("got %v, want a duration conflict", err)
+			}
+			// A statement after the conflict is not applied.
+			if err := tx.SetBlock(ctx, "", 20, 20, Record{"id": 9}); !errors.Is(err, ErrConflict) {
+				t.Errorf("got %v, want the conflict again", err)
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil || version == 0 || attempts != 2 {
+		t.Fatalf("Transaction: %d, %v after %d attempts", version, err, attempts)
+	}
+	if got, _ := client.GetBlock(ctx, "", 0, 0, "id"); got["id"] != uint64(2) {
+		t.Fatalf("got %v, want the second attempt's write", got)
+	}
+	if got, err := client.GetBlock(ctx, "", 20, 20); err != nil || got != nil {
+		t.Fatalf("got %v, %v; want the write after the conflict absent", got, err)
+	}
+
+	// On the wire: after a statement's CONFLICT every statement answers the
+	// same CONFLICT and nothing applies, until ROLLBACK closes the
+	// transaction.
+	raw := connectIntegration(t, server, nil)
+	if _, err := raw.Do(ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if _, err := raw.Do(ctx, "SET BLOCK 30 30 IN things id = 1"); err != nil {
+		t.Fatalf("SET BLOCK: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	for _, statement := range []string{"GET BLOCK 30 30 FROM things", "SET BLOCK 31 31 IN things id = 1", "PING", "BEGIN"} {
+		if _, err := raw.Do(ctx, statement); !errors.Is(err, ErrConflict) {
+			t.Fatalf("%s: got %v, want CONFLICT", statement, err)
+		}
+	}
+	if reply, err := raw.Do(ctx, "ROLLBACK"); err != nil || reply.Text != "OK" {
+		t.Fatalf("ROLLBACK: %v, %v", reply, err)
+	}
+	for _, at := range [][2]int64{{30, 30}, {31, 31}} {
+		if got, err := raw.GetBlock(ctx, "things", at[0], at[1]); err != nil || got != nil {
+			t.Fatalf("block %v: got %v, %v; want it absent", at, got, err)
+		}
+	}
+
+	// ALTER TABLE during a transaction ends it with CONFLICT table_changed;
+	// the next attempt uses the new schema.
+	other := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	attempts = 0
+	_, err = client.Transaction(ctx, func(tx *Tx) error {
+		attempts++
+		if _, err := tx.GetBlock(ctx, "", 0, 0); err != nil {
+			return err
+		}
+		if attempts == 1 {
+			if err := other.AddColumn(ctx, "", ColumnDef{Name: "extra", Type: TypeUint(8), Default: 3}); err != nil {
+				t.Errorf("AddColumn: %v", err)
+			}
+		}
+		return tx.SetBlock(ctx, "", 0, 0, Record{"extra": 4})
+	})
+	if err != nil || attempts != 2 {
+		t.Fatalf("Transaction: %v after %d attempts", err, attempts)
+	}
+	if got, _ := client.GetBlock(ctx, "", 0, 0, "extra"); got["extra"] != uint64(4) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestIntegrationPoolTransaction(t *testing.T) {
+	server := startServer(t, serverConfig{workers: 4})
+	pool, err := ConnectPool(t.Context(), PoolOptions{
+		Options:        Options{URI: server.uri + "things", ConnectTimeout: 5 * time.Second, CommandTimeout: 5 * time.Second},
+		MaxConnections: 2,
+	})
+	if err != nil {
+		t.Fatalf("ConnectPool: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+	ctx := t.Context()
+	if err := pool.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.CreateTable(ctx, "", typesSpec) }); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+
+	version, err := pool.Transaction(ctx, func(tx *Tx) error {
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": 1}); err != nil {
+			return err
+		}
+		// Another operation of the pool runs on another connection, outside
+		// the transaction.
+		if got, err := pool.GetBlock(ctx, "", 0, 0); err != nil || got != nil {
+			t.Errorf("got %v, %v; want the uncommitted block absent", got, err)
+		}
+		return nil
+	})
+	if err != nil || version == 0 {
+		t.Fatalf("Transaction: %d, %v", version, err)
+	}
+	if got, err := pool.GetBlock(ctx, "", 0, 0, "id"); err != nil || got["id"] != uint64(1) {
+		t.Fatalf("got %v, %v", got, err)
+	}
 }

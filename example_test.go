@@ -177,6 +177,40 @@ func ExampleIfVersion() {
 	}
 }
 
+// Moving gold between two blocks in different chunks: both writes apply
+// together, and a conflict with another write runs the function again.
+func ExampleClient_Transaction() {
+	ctx := context.Background()
+
+	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/world")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	version, err := client.Transaction(ctx, func(tx *chunkdb.Tx) error {
+		from, err := tx.GetBlock(ctx, "", 10, 4, "gold")
+		if err != nil {
+			return err
+		}
+		to, err := tx.GetBlock(ctx, "", 300, 7, "gold")
+		if err != nil {
+			return err
+		}
+		if err := tx.SetBlock(ctx, "", 10, 4, chunkdb.Record{"gold": from["gold"].(uint64) - 10}); err != nil {
+			return err
+		}
+		return tx.SetBlock(ctx, "", 300, 7, chunkdb.Record{"gold": to["gold"].(uint64) + 10})
+	})
+	if errors.Is(err, chunkdb.ErrConflict) {
+		log.Fatal("still conflicting after the retries: ", err)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(version)
+}
+
 // An administrator creates a user who reads and writes one table.
 func ExampleClient_CreateUser() {
 	ctx := context.Background()

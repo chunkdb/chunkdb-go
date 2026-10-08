@@ -19,6 +19,7 @@ the engine's
 - Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
+- Transactions: `Client.Transaction(ctx, func(tx *Tx) error, opts...)` and `Pool.Transaction` run `BEGIN` ... `COMMIT` on one connection held for the whole transaction and return the commit version (0 when nothing was written); `Tx` has the block, chunk and area methods without `IfVersion`. On `CONFLICT` the function runs again after a short pause, up to `DefaultTxRetries` (5) times (`TxRetries`); an error from the function rolls back. `CONFLICT` is a `*ConflictError` with its `Reason`, matching `ErrConflict` and `ErrServer`
 - Users: `CreateUser` (`CreateUserOptions`), `SetPassword`, `SetManagesUsers`, `DropUser`, `Grant`, `Revoke` (`Right`, `AllTables`) and `Users` (`User`); the client computes verifiers from passwords (`ComputeVerifier`, `Options.VerifierIterations`, 4096 by default)
 - `PERMISSION_DENIED` is a `*PermissionDeniedError` matching `ErrPermissionDenied` and `ErrServer`; `ServerInfo.ServerSignature`
 - Typed values by column type (`uN`, `iN`, `bool`, `f32`, `f64`, `bits(N)`, `text(max)`, `bytes(max)`, NULL), sent as parameters and checked before sending; `Record`, `Bits`, `ParseBits`, `EncodeValue`, `ColumnType`, `ParseColumnType`
