@@ -35,9 +35,9 @@ const (
 	KindProtocol
 	// KindServer covers "-ERR <code> <message>" replies.
 	KindServer
-	// KindAuth covers AUTH_FAILED (wrong token) and AUTH_REQUIRED (missing
-	// token) replies. It is a specialization of KindServer and matches both
-	// [ErrServer] and [ErrAuth].
+	// KindAuth covers AUTH_FAILED (wrong user or password) and AUTH_REQUIRED
+	// (no user) replies. It is a specialization of KindServer and matches
+	// both [ErrServer] and [ErrAuth].
 	KindAuth
 	// KindTLS covers TLS configuration and handshake failures.
 	KindTLS
@@ -60,6 +60,9 @@ var (
 	// for another schema version than the table's. The error is a
 	// [*SchemaMismatchError].
 	ErrSchemaMismatch = errors.New("chunkdb: schema mismatch")
+	// ErrPermissionDenied matches a statement refused because the user lacks
+	// the right it needs. The error is a [*PermissionDeniedError].
+	ErrPermissionDenied = errors.New("chunkdb: permission denied")
 )
 
 // Server error codes, as reported in [Error.ServerCode].
@@ -67,10 +70,14 @@ const (
 	// CodeProtocol: no HELLO 3 yet, another protocol version, or a second
 	// HELLO.
 	CodeProtocol = "PROTOCOL"
-	// CodeAuthRequired: the server needs a token and none was sent.
+	// CodeAuthRequired: the server has users and the client logged in
+	// without one.
 	CodeAuthRequired = "AUTH_REQUIRED"
-	// CodeAuthFailed: the token is wrong.
+	// CodeAuthFailed: the user or the password is wrong.
 	CodeAuthFailed = "AUTH_FAILED"
+	// CodePermissionDenied: the user lacks the right the statement needs.
+	// See [PermissionDeniedError].
+	CodePermissionDenied = "PERMISSION_DENIED"
 	// CodeSyntax: the statement does not parse.
 	CodeSyntax = "SYNTAX"
 	// CodeInvalidArgument: a value, column, option or size the statement
@@ -142,6 +149,8 @@ func (e *Error) Is(target error) bool {
 		return e.ServerCode == CodeVersionMismatch
 	case ErrSchemaMismatch:
 		return e.ServerCode == CodeSchemaMismatch
+	case ErrPermissionDenied:
+		return e.ServerCode == CodePermissionDenied
 	}
 	return false
 }
@@ -178,6 +187,31 @@ func (e *SchemaMismatchError) Error() string {
 }
 
 func (e *SchemaMismatchError) Unwrap() error { return e.Err }
+
+// PermissionDeniedError is returned when the user lacks the right a
+// statement needs. Nothing was changed. It wraps the server's [*Error] (code
+// [CodePermissionDenied]) and matches [ErrPermissionDenied] and [ErrServer].
+//
+// A table the user has no right on at all is reported as one that does not
+// exist ([CodeNoTable]), not as this error.
+type PermissionDeniedError struct {
+	// Right is the right the statement needs: "READ", "WRITE", "ADMIN" or
+	// "MANAGES USERS".
+	Right string
+	// Table is the table the right is needed on, "*" for every table, and
+	// empty for MANAGES USERS.
+	Table string
+	Err   *Error
+}
+
+func (e *PermissionDeniedError) Error() string {
+	if e.Table == "" {
+		return fmt.Sprintf("chunkdb: %s: permission denied, %s needed", e.Err.Command, e.Right)
+	}
+	return fmt.Sprintf("chunkdb: %s: permission denied, %s on %s needed", e.Err.Command, e.Right, e.Table)
+}
+
+func (e *PermissionDeniedError) Unwrap() error { return e.Err }
 
 func newError(kind Kind, phase Phase, command, message string, cause error) *Error {
 	return &Error{Kind: kind, Phase: phase, Command: command, Message: message, Err: cause}
@@ -222,9 +256,15 @@ func serverError(phase Phase, command, code, message string) *Error {
 
 // replyError converts an error reply into the error a call returns: a
 // [*VersionMismatchError] for VERSION_MISMATCH, a [*SchemaMismatchError] for
-// SCHEMA_MISMATCH, an [*Error] otherwise.
+// SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, an
+// [*Error] otherwise.
 func replyError(phase Phase, command string, reply Reply) error {
 	base := serverError(phase, command, reply.Code, reply.Message)
+	if reply.Code == CodePermissionDenied {
+		// "<right> on <table>", or "MANAGES USERS".
+		right, table, _ := strings.Cut(reply.Message, " on ")
+		return &PermissionDeniedError{Right: right, Table: table, Err: base}
+	}
 	if reply.Code != CodeVersionMismatch && reply.Code != CodeSchemaMismatch {
 		return base
 	}

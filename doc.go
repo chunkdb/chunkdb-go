@@ -12,8 +12,12 @@
 //   - opt-in pooling via [Pool]
 //   - no background reconnect loops
 //
-// Every connection starts with the HELLO 3 handshake, which carries the token;
-// [Client.ServerInfo] returns the server's limits. Every statement names its
+// Every connection starts with the HELLO 3 handshake, which logs in the user
+// ([Options.User] and [Options.Password], or chunk://user:password@host/)
+// with SCRAM-SHA-256: the password never crosses the network, and the server
+// proves it holds the user's verifier. [Client.ServerInfo] returns the
+// server's limits. [Client.CreateUser], [Client.Grant] and the other user
+// methods manage users and their rights. Every statement names its
 // table; the methods take the table as their first argument after the
 // context, and "" means the client's default table ([Options.Table], the URI
 // path, else "default").
@@ -30,7 +34,7 @@
 //
 // Basic use:
 //
-//	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+//	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/world")
 //	if err != nil {
 //		return err
 //	}

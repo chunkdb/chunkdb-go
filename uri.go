@@ -13,12 +13,18 @@ type URI struct {
 	Secure bool
 	Host   string
 	Port   int
-	Token  string
-	Path   string
+	// User and Password are the login, percent-decoded. An empty User logs
+	// in without a user, which only a server started with --auth none
+	// accepts.
+	User     string
+	Password string
+	Path     string
 }
 
-// ParseURI parses a chunk:// or chunks:// endpoint. The port defaults to
-// [DefaultPort] and the token is taken from the userinfo component.
+// ParseURI parses a chunk:// or chunks:// endpoint, for example
+// chunk://user:password@host:4242/table. The port defaults to [DefaultPort];
+// the user and password are taken from the userinfo component, where %XX
+// escapes let them hold ':', '@' or '/'.
 func ParseURI(raw string) (URI, error) {
 	parsed, err := neturl.Parse(raw)
 	if err != nil {
@@ -43,9 +49,13 @@ func ParseURI(raw string) (URI, error) {
 		}
 	}
 
-	token := ""
+	var user, password string
 	if parsed.User != nil {
-		token = parsed.User.Username()
+		user = parsed.User.Username()
+		password, _ = parsed.User.Password()
+		if user == "" {
+			return URI{}, connectionErrorf("", nil, "chunk URI userinfo has no user")
+		}
 	}
 
 	path := parsed.Path
@@ -54,17 +64,18 @@ func ParseURI(raw string) (URI, error) {
 	}
 
 	return URI{
-		Scheme: scheme,
-		Secure: scheme == "chunks",
-		Host:   host,
-		Port:   port,
-		Token:  token,
-		Path:   path,
+		Scheme:   scheme,
+		Secure:   scheme == "chunks",
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		Path:     path,
 	}, nil
 }
 
-// String formats the URI. The token, when present, is percent-encoded into the
-// userinfo component.
+// String formats the URI. The user and password, when present, are
+// percent-encoded into the userinfo component.
 func (u URI) String() string {
 	scheme := u.Scheme
 	if u.Secure {
@@ -75,8 +86,11 @@ func (u URI) String() string {
 	}
 
 	auth := ""
-	if u.Token != "" {
-		auth = neturl.User(u.Token).String() + "@"
+	switch {
+	case u.Password != "":
+		auth = neturl.UserPassword(u.User, u.Password).String() + "@"
+	case u.User != "":
+		auth = neturl.User(u.User).String() + "@"
 	}
 
 	host := u.Host

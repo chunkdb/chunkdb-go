@@ -17,18 +17,26 @@ const (
 
 // Options configure a [Client].
 //
-// Explicit fields win over values taken from URI. A zero Host, Port, or Token
-// falls back to URI and then to the package default.
+// Explicit fields win over values taken from URI. A zero Host, Port, User or
+// Password falls back to URI and then to the package default.
 type Options struct {
-	// URI is a chunk:// or chunks:// endpoint, optionally carrying the token
-	// as its userinfo component and the default table as its path.
+	// URI is a chunk:// or chunks:// endpoint, optionally carrying the user
+	// and password as its userinfo component
+	// (chunk://user:password@host:4242/) and the default table as its path.
 	URI string
 
 	Host string
 	Port int
-	// Token is sent as HELLO 3 AUTH <token> when a connection opens. It must
-	// not contain spaces or control characters.
-	Token string
+	// User and Password log in with SCRAM-SHA-256 when a connection opens;
+	// the password never crosses the network. Without a user the client
+	// sends HELLO 3 alone, which only a server started with --auth none
+	// accepts.
+	User     string
+	Password string
+	// VerifierIterations is the PBKDF2 iteration count of the verifiers
+	// [Client.CreateUser] and [Client.SetPassword] compute. Zero means
+	// [DefaultVerifierIterations]; fewer are refused.
+	VerifierIterations int
 
 	// ConnectTimeout bounds establishing the socket, the TLS handshake and
 	// HELLO. Zero means [DefaultTimeout]; a negative value disables the
@@ -78,6 +86,9 @@ type ServerInfo struct {
 	MaxResponseBytes int
 	// MaxScanLimit is the largest [Client.ScanChunks] limit.
 	MaxScanLimit int
+	// ServerSignature is the SCRAM server-final message (v=...) the client
+	// checked when it logged in with a user; empty without a user.
+	ServerSignature string
 }
 
 // Record is one block: column name to value. See [EncodeValue] for the Go

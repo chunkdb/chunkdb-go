@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"cmp"
 	"context"
+	"crypto/hmac"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 )
 
 // protocolVersion is the chunkdb protocol this client speaks.
@@ -29,6 +29,8 @@ type resolvedOptions struct {
 	key            []byte
 	pipelineDepth  int
 	table          string
+	// verifierIterations is the PBKDF2 iteration count of new verifiers.
+	verifierIterations int
 }
 
 // resolveTimeout maps the [Options] convention onto an internal duration where
@@ -58,7 +60,8 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		return resolvedOptions{}, connectionErrorf("", nil, "invalid port: %d", port)
 	}
 
-	token := cmp.Or(opts.Token, parsed.Token)
+	user := cmp.Or(opts.User, parsed.User)
+	password := cmp.Or(opts.Password, parsed.Password)
 	secure := opts.TLS || parsed.Secure
 
 	scheme := "chunk"
@@ -66,8 +69,17 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		scheme = "chunks"
 	}
 
-	if strings.ContainsFunc(token, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
-		return resolvedOptions{}, connectionErrorf("", nil, "the token must not contain spaces or control characters")
+	if user == "" && password != "" {
+		return resolvedOptions{}, connectionErrorf("", nil, "a password needs a user")
+	}
+	if user != "" && !isName(user) {
+		return resolvedOptions{}, connectionErrorf("", nil, "invalid user name %q: names are [a-z_][a-z0-9_]*", user)
+	}
+
+	iterations := cmp.Or(opts.VerifierIterations, DefaultVerifierIterations)
+	if iterations < DefaultVerifierIterations {
+		return resolvedOptions{}, connectionErrorf("", nil, "VerifierIterations must be at least %d, got %d",
+			DefaultVerifierIterations, iterations)
 	}
 
 	table := opts.Table
@@ -83,23 +95,25 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 
 	return resolvedOptions{
 		uri: URI{
-			Scheme: scheme,
-			Secure: secure,
-			Host:   cmp.Or(opts.Host, parsed.Host, defaultHost),
-			Port:   port,
-			Token:  token,
-			Path:   "/" + table,
+			Scheme:   scheme,
+			Secure:   secure,
+			Host:     cmp.Or(opts.Host, parsed.Host, defaultHost),
+			Port:     port,
+			User:     user,
+			Password: password,
+			Path:     "/" + table,
 		},
-		connectTimeout: resolveTimeout(opts.ConnectTimeout),
-		commandTimeout: resolveTimeout(opts.CommandTimeout),
-		tls:            secure,
-		tlsInsecure:    opts.TLSInsecure,
-		tlsServerName:  opts.TLSServerName,
-		ca:             opts.CA,
-		cert:           opts.Cert,
-		key:            opts.Key,
-		pipelineDepth:  max(1, opts.PipelineDepth),
-		table:          table,
+		connectTimeout:     resolveTimeout(opts.ConnectTimeout),
+		commandTimeout:     resolveTimeout(opts.CommandTimeout),
+		tls:                secure,
+		tlsInsecure:        opts.TLSInsecure,
+		tlsServerName:      opts.TLSServerName,
+		ca:                 opts.CA,
+		cert:               opts.Cert,
+		key:                opts.Key,
+		pipelineDepth:      max(1, opts.PipelineDepth),
+		table:              table,
+		verifierIterations: iterations,
 	}, nil
 }
 
@@ -150,9 +164,10 @@ func NewClient(opts Options) (*Client, error) {
 }
 
 // Connect builds a client and opens its connection. Every connection starts
-// with the HELLO 3 handshake, which carries the token; a wrong or missing
-// token fails with [ErrAuth], and a server of an older chunkdb protocol with
-// [ErrProtocol].
+// with the HELLO 3 handshake, which logs in the user with SCRAM-SHA-256. A
+// wrong user or password, or a missing user, fails with [ErrAuth]; a server
+// that cannot prove it holds the user's verifier with [ErrConnection]; and a
+// server of an older chunkdb protocol with [ErrProtocol].
 func Connect(ctx context.Context, opts Options) (*Client, error) {
 	client, err := NewClient(opts)
 	if err != nil {
@@ -171,8 +186,8 @@ func ConnectURI(ctx context.Context, uri string) (*Client, error) {
 }
 
 // URI reports the resolved endpoint, with the default table as its path when
-// one was configured. Note that [URI.String] renders the token into the
-// userinfo component.
+// one was configured. Note that [URI.String] renders the user and password
+// into the userinfo component.
 func (c *Client) URI() URI {
 	return c.opts.uri
 }
@@ -335,36 +350,79 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 // published yet, so it bypasses the pipeline slots held by the request that
 // triggered the dial.
 func (c *Client) helloOn(ctx context.Context, established *conn) error {
-	statement := "HELLO 3"
-	if token := c.opts.uri.Token; token != "" {
-		statement += " AUTH " + token
+	var (
+		reply     Reply
+		signature string
+		err       error
+	)
+	if c.opts.uri.User == "" {
+		reply, err = c.execOn(ctx, established, "HELLO", "HELLO 3", nil)
+		err = c.helloError(err)
+	} else {
+		reply, signature, err = c.login(ctx, established)
 	}
-
-	reply, err := c.execOn(ctx, established, "HELLO", statement, nil)
 	if err != nil {
-		// A server of protocol 2 answers "-ERR PROTOCOL expected HELLO 2"; a
-		// 1.x server does not know HELLO, or, when it requires a token,
-		// answers AUTH_REQUIRED although HELLO carried one, which a protocol
-		// 3 server never does. The server error is not wrapped, so the result
-		// matches ErrProtocol and not ErrServer.
-		var typed *Error
-		if errors.As(err, &typed) && ((typed.ServerCode == CodeProtocol && strings.Contains(typed.ServerMessage, "HELLO 2")) ||
-			typed.ServerCode == "UNKNOWN_COMMAND" || (typed.ServerCode == CodeAuthRequired && c.opts.uri.Token != "")) {
-			return protocolErrorf("HELLO",
-				"the server speaks an older chunkdb protocol (it replied %q); this client needs a server of protocol 3",
-				typed.ServerCode+" "+typed.ServerMessage)
-		}
 		return err
 	}
 	info, err := parseServerInfo(reply)
 	if err != nil {
 		return err
 	}
+	if c.opts.uri.User != "" && !hmac.Equal([]byte(info.ServerSignature), []byte(signature)) {
+		return newError(KindConnection, PhaseAuth, "HELLO",
+			"the server could not prove it knows the password: its SCRAM signature does not match", nil)
+	}
 	established.info = info
 	c.helloMu.Lock()
 	c.hello = info
 	c.helloMu.Unlock()
 	return nil
+}
+
+// login runs the SCRAM-SHA-256 exchange: HELLO 3 USER with the client-first
+// message, then AUTH with the client-final message. It returns the HELLO
+// reply and the server signature that reply must carry.
+func (c *Client) login(ctx context.Context, established *conn) (Reply, string, error) {
+	nonce, err := newScramNonce()
+	if err != nil {
+		return Reply{}, "", err
+	}
+	exchange := newScramLogin(c.opts.uri.User, nonce)
+	reply, err := c.execOn(ctx, established, "HELLO", "HELLO 3 USER "+c.opts.uri.User+" $1",
+		[][]byte{[]byte(exchange.clientFirst())})
+	if err != nil {
+		return Reply{}, "", c.helloError(err)
+	}
+	serverFirst, ok := strings.CutPrefix(reply.Text, "SCRAM ")
+	if reply.Kind != ReplySimple || !ok {
+		return Reply{}, "", protocolErrorf("HELLO", "expected +SCRAM <server-first message>, got a reply of kind %d %q",
+			reply.Kind, reply.Text)
+	}
+	final, signature, err := exchange.clientFinal(c.opts.uri.Password, serverFirst)
+	if err != nil {
+		return Reply{}, "", err
+	}
+	reply, err = c.execOn(ctx, established, "AUTH", "AUTH $1", [][]byte{[]byte(final)})
+	if err != nil {
+		return Reply{}, "", err
+	}
+	return reply, signature, nil
+}
+
+// helloError reports a server of an older protocol as such. A server of
+// protocol 2 answers "-ERR PROTOCOL expected HELLO 2"; a 1.x server does not
+// know HELLO, or, when it requires a token, answers AUTH_REQUIRED although
+// HELLO named a user, which a protocol 3 server never does. The server error
+// is not wrapped, so the result matches ErrProtocol and not ErrServer.
+func (c *Client) helloError(err error) error {
+	var typed *Error
+	if errors.As(err, &typed) && ((typed.ServerCode == CodeProtocol && strings.Contains(typed.ServerMessage, "HELLO 2")) ||
+		typed.ServerCode == "UNKNOWN_COMMAND" || (typed.ServerCode == CodeAuthRequired && c.opts.uri.User != "")) {
+		return protocolErrorf("HELLO",
+			"the server speaks an older chunkdb protocol (it replied %q); this client needs a server of protocol 3",
+			typed.ServerCode+" "+typed.ServerMessage)
+	}
+	return err
 }
 
 func (c *Client) tlsConfig() (*tls.Config, error) {
@@ -497,7 +555,7 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 
 	if reply.Kind == ReplyError {
 		phase := PhaseResponse
-		if command == "HELLO" && (reply.Code == CodeAuthFailed || reply.Code == CodeAuthRequired) {
+		if (command == "HELLO" || command == "AUTH") && (reply.Code == CodeAuthFailed || reply.Code == CodeAuthRequired) {
 			phase = PhaseAuth
 		}
 		if closesConnection(reply, len(params) > 0) {
@@ -701,6 +759,10 @@ func parseServerInfo(reply Reply) (*ServerInfo, error) {
 			return nil, protocolErrorf("HELLO", "HELLO reply has no valid %s", field.key)
 		}
 		*field.target = int(number)
+	}
+	// A bulk string after a login with a user, null without one.
+	if signature, ok := reply.Lookup("server_signature"); ok && signature.Kind == ReplyBulk {
+		info.ServerSignature = string(signature.Bulk)
 	}
 	return info, nil
 }

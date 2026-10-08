@@ -15,7 +15,7 @@ func Example() {
 	ctx := context.Background()
 
 	// The path names the default table: "" in a method means "world".
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/world")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,7 +38,8 @@ func ExampleConnect() {
 	client, err := chunkdb.Connect(ctx, chunkdb.Options{
 		Host:           "127.0.0.1",
 		Port:           4242,
-		Token:          "chunk-token",
+		User:           "bot",
+		Password:       os.Getenv("CHUNKDB_PASSWORD"),
 		ConnectTimeout: 2 * time.Second,
 		CommandTimeout: 3 * time.Second,
 	})
@@ -62,7 +63,7 @@ func ExampleConnect_tls() {
 	}
 
 	client, err := chunkdb.Connect(ctx, chunkdb.Options{
-		URI:           "chunks://chunk-token@chunkdb.local:4242/",
+		URI:           "chunks://bot:secret@chunkdb.local:4242/",
 		CA:            ca,
 		TLSServerName: "chunkdb.local",
 	})
@@ -76,7 +77,7 @@ func ExampleConnectPool() {
 	ctx := context.Background()
 
 	pool, err := chunkdb.ConnectPool(ctx, chunkdb.PoolOptions{
-		Options:        chunkdb.Options{URI: "chunk://chunk-token@127.0.0.1:4242/world"},
+		Options:        chunkdb.Options{URI: "chunk://bot:secret@127.0.0.1:4242/world"},
 		MaxConnections: 4,
 		MinConnections: 1,
 		AcquireTimeout: 2 * time.Second,
@@ -105,7 +106,7 @@ func ExampleConnectPool() {
 func ExampleClient_CreateTable() {
 	ctx := context.Background()
 
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
+	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -129,7 +130,7 @@ func ExampleClient_CreateTable() {
 func ExampleClient_AllChunks() {
 	ctx := context.Background()
 
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/world")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -147,7 +148,7 @@ func ExampleClient_AllChunks() {
 func ExampleIfVersion() {
 	ctx := context.Background()
 
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:secret@127.0.0.1:4242/world")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -176,12 +177,37 @@ func ExampleIfVersion() {
 	}
 }
 
+// An administrator creates a user who reads and writes one table.
+func ExampleClient_CreateUser() {
+	ctx := context.Background()
+
+	client, err := chunkdb.ConnectURI(ctx, "chunk://admin:secret@127.0.0.1:4242/")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.CreateUser(ctx, "bot", "bot-password", chunkdb.CreateUserOptions{}); err != nil {
+		log.Fatal(err)
+	}
+	if err := client.Grant(ctx, chunkdb.RightWrite, "world", "bot"); err != nil {
+		log.Fatal(err)
+	}
+	users, err := client.Users(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, user := range users {
+		fmt.Println(user.Name, user.ManagesUsers, user.Grants)
+	}
+}
+
 // Server errors carry their code, and the sentinels classify failures without
 // unwrapping.
 func ExampleError() {
 	ctx := context.Background()
 
-	client, err := chunkdb.ConnectURI(ctx, "chunk://wrong-token@127.0.0.1:4242/")
+	client, err := chunkdb.ConnectURI(ctx, "chunk://bot:wrong@127.0.0.1:4242/")
 	if err == nil {
 		defer client.Close()
 		err = client.Ping(ctx)
@@ -193,6 +219,10 @@ func ExampleError() {
 		var typed *chunkdb.Error
 		errors.As(err, &typed)
 		fmt.Println("auth failed:", typed.ServerCode, typed.ServerMessage)
+	case errors.Is(err, chunkdb.ErrPermissionDenied):
+		var denied *chunkdb.PermissionDeniedError
+		errors.As(err, &denied)
+		fmt.Println("needs", denied.Right, "on", denied.Table)
 	case errors.Is(err, chunkdb.ErrServer):
 		fmt.Println("server rejected the statement:", err)
 	case errors.Is(err, chunkdb.ErrTimeout):

@@ -2,6 +2,9 @@ package chunkdb
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -30,9 +33,12 @@ type fakeServer struct {
 	received []string
 	// params holds the parameter frames of each received statement; nil is
 	// NULL.
-	params   [][][]byte
-	conns    []net.Conn
-	accepted int
+	params [][][]byte
+	// connParams holds the parameter frames of each connection's most recent
+	// statement.
+	connParams map[net.Conn][][]byte
+	conns      []net.Conn
+	accepted   int
 	// finished counts connections the client closed or the server dropped.
 	finished int
 	stopped  bool
@@ -149,6 +155,10 @@ func (s *fakeServer) serve(conn net.Conn) {
 		s.mu.Lock()
 		s.received = append(s.received, statement)
 		s.params = append(s.params, params)
+		if s.connParams == nil {
+			s.connParams = make(map[net.Conn][][]byte)
+		}
+		s.connParams[conn] = params
 		s.mu.Unlock()
 
 		s.handle(s, conn, statement)
@@ -187,11 +197,20 @@ func (s *fakeServer) dropConnections() {
 
 func (s *fakeServer) addr() string { return s.listener.Addr().String() }
 
-func (s *fakeServer) uri(token string) string {
-	if token == "" {
+// uri is the server's chunk:// URI with userinfo ("user:password"), or
+// without a login when userinfo is empty.
+func (s *fakeServer) uri(userinfo string) string {
+	if userinfo == "" {
 		return "chunk://" + s.addr() + "/"
 	}
-	return "chunk://" + token + "@" + s.addr() + "/"
+	return "chunk://" + userinfo + "@" + s.addr() + "/"
+}
+
+// paramsOf returns the parameter frames of the most recent statement on conn.
+func (s *fakeServer) paramsOf(conn net.Conn) [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.connParams[conn]
 }
 
 func (s *fakeServer) commands() []string {
@@ -262,16 +281,23 @@ func respBool(v bool) string {
 
 const respNull = "_\r\n"
 
-// helloReply is the fake server's HELLO 3 reply.
-var helloReply = respMap(
-	"protocol", respInt(3),
-	"server_version", respBulk("test"),
-	"max_line_bytes", respInt(65536),
-	"max_parameters", respInt(65535),
-	"max_area_chunks", respInt(256),
-	"max_response_bytes", respInt(64<<20),
-	"max_scan_limit", respInt(1024),
-)
+// helloReply is the fake server's HELLO 3 reply without a user.
+var helloReply = helloReplyWith(respNull)
+
+// helloReplyWith is a HELLO 3 reply with server_signature set to signature
+// (a RESP3 value).
+func helloReplyWith(signature string) string {
+	return respMap(
+		"protocol", respInt(3),
+		"server_version", respBulk("test"),
+		"max_line_bytes", respInt(65536),
+		"max_parameters", respInt(65535),
+		"max_area_chunks", respInt(256),
+		"max_response_bytes", respInt(64<<20),
+		"max_scan_limit", respInt(1024),
+		"server_signature", signature,
+	)
+}
 
 func fakeColumn(id int64, name, typ string, null, required bool, def string) string {
 	return respMap("id", respInt(id), "name", respBulk(name), "type", respBulk(typ), "null", respBool(null),
@@ -326,8 +352,8 @@ func emptyWorldForm(size int) string {
 // worldSectionBytes is the part of an empty chunk form each column takes.
 var worldSectionBytes = map[string]int{"id": 5, "temp": 4 + 1, "solid": 1, "h": 16, "d": 32, "mask": 2 + 1}
 
-// answerHello answers a HELLO line like a protocol 3 server, ignoring the
-// token.
+// answerHello answers a HELLO line like a protocol 3 server started with
+// --auth none.
 func answerHello(conn net.Conn, _ string) {
 	writeRaw(conn, helloReply)
 }
@@ -378,4 +404,91 @@ func writeSimple(conn net.Conn, text string) {
 
 func writeServerError(conn net.Conn, text string) {
 	writeRaw(conn, "-"+text+"\r\n")
+}
+
+// fakeLogin is the server side of SCRAM-SHA-256 logins of one user, as a
+// protocol 3 server runs them.
+type fakeLogin struct {
+	user     string
+	password string
+	// tamper makes the server answer a wrong server signature.
+	tamper bool
+
+	mu sync.Mutex
+	// pending holds, per connection, the client-first-bare and server-first
+	// messages of a login waiting for AUTH.
+	pending map[net.Conn][2]string
+}
+
+const fakeServerNonce = "3rfcNHYJY1ZVvWVs7j"
+
+// handler answers HELLO 3 USER and AUTH, and forwards everything else to
+// handle.
+func (l *fakeLogin) handler(handle func(*fakeServer, net.Conn, string)) func(*fakeServer, net.Conn, string) {
+	return func(s *fakeServer, conn net.Conn, command string) {
+		switch {
+		case strings.HasPrefix(command, "HELLO 3 USER "):
+			params := s.paramsOf(conn)
+			bare, ok := strings.CutPrefix(string(params[0]), "n,,")
+			_, nonce, found := strings.Cut(bare, ",r=")
+			if !ok || !found {
+				writeServerError(conn, "ERR INVALID_ARGUMENT bad client-first message")
+				return
+			}
+			salt := base64.StdEncoding.EncodeToString([]byte("fake-salt-16byte"))
+			serverFirst := "r=" + nonce + fakeServerNonce + ",s=" + salt + ",i=4096"
+			l.mu.Lock()
+			if l.pending == nil {
+				l.pending = make(map[net.Conn][2]string)
+			}
+			l.pending[conn] = [2]string{bare, serverFirst}
+			l.mu.Unlock()
+			writeSimple(conn, "SCRAM "+serverFirst)
+		case command == "AUTH $1":
+			l.mu.Lock()
+			messages, ok := l.pending[conn]
+			delete(l.pending, conn)
+			l.mu.Unlock()
+			if !ok {
+				writeServerError(conn, "ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1")
+				return
+			}
+			signature, valid := l.check(messages[0], messages[1], string(s.paramsOf(conn)[0]))
+			if !valid {
+				writeServerError(conn, "ERR AUTH_FAILED invalid user or password")
+				return
+			}
+			if l.tamper {
+				signature = "v=" + base64.StdEncoding.EncodeToString(make([]byte, 32))
+			}
+			writeRaw(conn, helloReplyWith(respBulk(signature)))
+		default:
+			handle(s, conn, command)
+		}
+	}
+}
+
+// check verifies a client-final message like the server does, from the
+// StoredKey alone, and returns the server signature.
+func (l *fakeLogin) check(firstBare, serverFirst, clientFinal string) (string, bool) {
+	withoutProof, proofText, ok := strings.Cut(clientFinal, ",p=")
+	proof, err := base64.StdEncoding.DecodeString(proofText)
+	nonce, _, _ := strings.Cut(serverFirst, ",")
+	if !ok || err != nil || len(proof) != 32 || withoutProof != "c=biws,"+nonce || !strings.HasPrefix(firstBare, "n="+l.user+",") {
+		return "", false
+	}
+	keys, err := deriveScramKeys(l.password, []byte("fake-salt-16byte"), 4096)
+	if err != nil {
+		return "", false
+	}
+	authMessage := firstBare + "," + serverFirst + "," + withoutProof
+	clientKey := hmacSHA256(keys.storedKey, authMessage)
+	for i := range clientKey {
+		clientKey[i] ^= proof[i]
+	}
+	stored := sha256.Sum256(clientKey)
+	if !bytes.Equal(stored[:], keys.storedKey) {
+		return "", false
+	}
+	return "v=" + base64.StdEncoding.EncodeToString(hmacSHA256(keys.serverKey, authMessage)), true
 }

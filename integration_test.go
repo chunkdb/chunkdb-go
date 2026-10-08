@@ -37,7 +37,12 @@ import (
 //
 //	cmake -S . -B build-js-tests -DCHUNKDB_WITH_TLS=ON && cmake --build build-js-tests --target chunkdb_server
 
-const testToken = "chunk-token"
+// The administrator every test server starts with, unless it runs with
+// --auth none. The password needs %XX escapes in a URI.
+const (
+	testAdmin         = "admin"
+	testAdminPassword = "admin:p@ss/word"
+)
 
 func serverBinary(t *testing.T) string {
 	t.Helper()
@@ -64,15 +69,25 @@ func serverBinary(t *testing.T) string {
 }
 
 type testServer struct {
+	// uri logs in as the administrator; base has no login.
 	uri   string
+	base  string
 	host  string
 	port  int
 	caPEM []byte
 }
 
+// uriAs is the server's URI logging in as user with password.
+func (s *testServer) uriAs(user, password string) string {
+	parsed, _ := ParseURI(s.base)
+	parsed.User, parsed.Password = user, password
+	return parsed.String()
+}
+
 type serverConfig struct {
-	tls   bool
-	token string
+	tls bool
+	// authNone starts the server without users (--auth none).
+	authNone bool
 	// workers sizes the server's worker pool. A worker is occupied for as long
 	// as a client connection is open, so a test that keeps N connections alive
 	// needs at least N workers.
@@ -84,16 +99,12 @@ func startServer(t *testing.T, config serverConfig) *testServer {
 
 	binary := serverBinary(t)
 	port := freePort(t)
-	token := config.token
-	if token == "" {
-		token = testToken
-	}
 
 	scheme := "chunk"
 	if config.tls {
 		scheme = "chunks"
 	}
-	uri := scheme + "://" + token + "@127.0.0.1:" + strconv.Itoa(port) + "/"
+	base := scheme + "://127.0.0.1:" + strconv.Itoa(port) + "/"
 
 	workers := config.workers
 	if workers == 0 {
@@ -101,14 +112,24 @@ func startServer(t *testing.T, config serverConfig) *testServer {
 	}
 
 	args := []string{
-		"--listen-uri", uri,
+		"--listen-uri", base,
 		"--data-dir", t.TempDir(),
 		"--durability", "relaxed",
 		"--workers", strconv.Itoa(workers),
 		"--log-level", "warn",
 	}
 
-	server := &testServer{uri: uri, host: "127.0.0.1", port: port}
+	server := &testServer{uri: base, base: base, host: "127.0.0.1", port: port}
+	if config.authNone {
+		args = append(args, "--auth", "none")
+	} else {
+		passwordFile := filepath.Join(t.TempDir(), "admin.password")
+		if err := os.WriteFile(passwordFile, []byte(testAdminPassword+"\n"), 0o600); err != nil {
+			t.Fatalf("write admin password: %v", err)
+		}
+		args = append(args, "--admin-user", testAdmin, "--admin-password-file", passwordFile)
+		server.uri = server.uriAs(testAdmin, testAdminPassword)
+	}
 	if config.tls {
 		certPath, keyPath, caPEM := writeTLSFixture(t)
 		args = append(args, "--tls-cert", certPath, "--tls-key", keyPath)
@@ -866,15 +887,26 @@ func TestIntegrationDurabilityAndMetrics(t *testing.T) {
 	}
 }
 
-func TestIntegrationAuthFailure(t *testing.T) {
+func TestIntegrationLogin(t *testing.T) {
 	server := startServer(t, serverConfig{})
+
+	client := connectIntegration(t, server, nil)
+	if info := client.ServerInfo(); info == nil || !strings.HasPrefix(info.ServerSignature, "v=") {
+		t.Fatalf("got ServerInfo %+v, want the server signature", info)
+	}
+	// The options log in as well.
+	_ = connectIntegration(t, server, func(o *Options) {
+		o.URI = server.base
+		o.User, o.Password = testAdmin, testAdminPassword
+	}).Close()
 
 	cases := map[string]struct {
 		uri  string
 		code string
 	}{
-		"wrong token":   {strings.Replace(server.uri, testToken, "wrong-token", 1), CodeAuthFailed},
-		"missing token": {strings.Replace(server.uri, testToken+"@", "", 1), CodeAuthRequired},
+		"wrong password": {server.uriAs(testAdmin, "wrong"), CodeAuthFailed},
+		"unknown user":   {server.uriAs("nobody", testAdminPassword), CodeAuthFailed},
+		"no user":        {server.base, CodeAuthRequired},
 	}
 	for name, testCase := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -903,6 +935,128 @@ func TestIntegrationAuthFailure(t *testing.T) {
 				t.Fatal("a failed handshake left ServerInfo set")
 			}
 		})
+	}
+}
+
+func TestIntegrationAuthNone(t *testing.T) {
+	server := startServer(t, serverConfig{authNone: true})
+	ctx := t.Context()
+
+	client := connectIntegration(t, server, nil)
+	if info := client.ServerInfo(); info == nil || info.ServerSignature != "" {
+		t.Fatalf("got ServerInfo %+v, want no server signature", info)
+	}
+	createTable(t, client, "world", typesSpec)
+	if _, err := client.SetBlock(ctx, "world", 0, 0, Record{"id": 1}); err != nil {
+		t.Fatalf("SetBlock: %v", err)
+	}
+
+	// A user cannot log in where there are none.
+	_, err := Connect(ctx, Options{URI: server.uriAs(testAdmin, testAdminPassword), ConnectTimeout: 5 * time.Second})
+	if !errors.Is(err, ErrServer) || errors.Is(err, ErrAuth) {
+		t.Fatalf("got %v, want a server error", err)
+	}
+}
+
+func TestIntegrationUsers(t *testing.T) {
+	server := startServer(t, serverConfig{workers: 4})
+	ctx := t.Context()
+	admin := connectIntegration(t, server, nil)
+	createTable(t, admin, "world", typesSpec)
+	if _, err := admin.SetBlock(ctx, "world", 1, 1, Record{"id": 7}); err != nil {
+		t.Fatalf("SetBlock: %v", err)
+	}
+
+	if err := admin.CreateUser(ctx, "bot", "bot:p@ss", CreateUserOptions{}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if err := admin.Grant(ctx, RightRead, "world", "bot"); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	// A verifier computed for a raw statement.
+	verifier, err := ComputeVerifier("ops-password", 0)
+	if err != nil {
+		t.Fatalf("ComputeVerifier: %v", err)
+	}
+	if _, err := admin.Do(ctx, "CREATE USER ops VERIFIER $1 MANAGES USERS", []byte(verifier)); err != nil {
+		t.Fatalf("CREATE USER: %v", err)
+	}
+	_ = connectIntegration(t, server, func(o *Options) { o.URI = server.uriAs("ops", "ops-password") }).Close()
+
+	users, err := admin.Users(ctx)
+	if err != nil {
+		t.Fatalf("Users: %v", err)
+	}
+	byName := make(map[string]User)
+	for _, user := range users {
+		byName[user.Name] = user
+	}
+	if got := byName["admin"]; !got.ManagesUsers || got.Grants[AllTables] != RightAdmin {
+		t.Fatalf("got admin %+v", got)
+	}
+	if got := byName["bot"]; got.ManagesUsers || len(got.Grants) != 1 || got.Grants["world"] != RightRead {
+		t.Fatalf("got bot %+v", got)
+	}
+	if got := byName["ops"]; !got.ManagesUsers || len(got.Grants) != 0 {
+		t.Fatalf("got ops %+v", got)
+	}
+
+	bot := connectIntegration(t, server, func(o *Options) { o.URI = server.uriAs("bot", "bot:p@ss") + "world" })
+	if got, err := bot.GetBlock(ctx, "", 1, 1, "id"); err != nil || got["id"] != uint64(7) {
+		t.Fatalf("GetBlock: %v, %v", got, err)
+	}
+	_, err = bot.SetBlock(ctx, "", 1, 1, Record{"id": 8})
+	var denied *PermissionDeniedError
+	if !errors.As(err, &denied) || denied.Right != "WRITE" || denied.Table != "world" || !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("got %v, want PERMISSION_DENIED WRITE on world", err)
+	}
+	if _, err := bot.Users(ctx); !errors.As(err, &denied) || denied.Right != "MANAGES USERS" {
+		t.Fatalf("got %v, want PERMISSION_DENIED MANAGES USERS", err)
+	}
+	if err := bot.CreateUser(ctx, "other", "pw", CreateUserOptions{}); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("got %v, want ErrPermissionDenied", err)
+	}
+
+	// A user changes their own password; the connection stays logged in.
+	if err := bot.SetPassword(ctx, "bot", "new password"); err != nil {
+		t.Fatalf("SetPassword: %v", err)
+	}
+	_ = connectIntegration(t, server, func(o *Options) { o.URI = server.uriAs("bot", "new password") }).Close()
+	if _, err := Connect(ctx, Options{URI: server.uriAs("bot", "bot:p@ss")}); !isServerCode(err, CodeAuthFailed) {
+		t.Fatalf("got %v, want the old password refused", err)
+	}
+
+	// Rights apply from the next statement; no right at all hides the table.
+	if err := admin.Grant(ctx, RightWrite, "world", "bot"); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if _, err := bot.SetBlock(ctx, "", 1, 1, Record{"id": 8}); err != nil {
+		t.Fatalf("SetBlock after GRANT WRITE: %v", err)
+	}
+	if err := admin.Revoke(ctx, RightRead, "world", "bot"); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if _, err := bot.GetBlock(ctx, "", 1, 1); !isServerCode(err, CodeNoTable) {
+		t.Fatalf("got %v, want NO_TABLE after REVOKE READ", err)
+	}
+
+	if err := admin.SetManagesUsers(ctx, "bot", true); err != nil {
+		t.Fatalf("SetManagesUsers: %v", err)
+	}
+	if _, err := bot.Users(ctx); err != nil {
+		t.Fatalf("Users as a user who manages users: %v", err)
+	}
+	if err := admin.SetManagesUsers(ctx, "bot", false); err != nil {
+		t.Fatalf("SetManagesUsers: %v", err)
+	}
+	if err := admin.DropUser(ctx, "bot"); err != nil {
+		t.Fatalf("DropUser: %v", err)
+	}
+	if _, err := Connect(ctx, Options{URI: server.uriAs("bot", "new password")}); !isServerCode(err, CodeAuthFailed) {
+		t.Fatalf("got %v, want a dropped user refused", err)
+	}
+	if err := admin.Grant(ctx, RightRead, AllTables, "nobody"); !errors.Is(err, ErrServer) {
+		t.Fatalf("got %v, want a server error for an unknown user", err)
 	}
 }
 
@@ -1008,7 +1162,8 @@ func TestIntegrationTLS(t *testing.T) {
 		}
 		defer func() { _ = client.Close() }()
 
-		if info := client.ServerInfo(); info == nil || info.Protocol != 3 {
+		// Logged in as the administrator over TLS.
+		if info := client.ServerInfo(); info == nil || info.Protocol != 3 || !strings.HasPrefix(info.ServerSignature, "v=") {
 			t.Fatalf("got ServerInfo %+v", info)
 		}
 		createTable(t, client, "things", typesSpec)
