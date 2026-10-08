@@ -3,49 +3,29 @@
 All notable changes to this project will be documented in this file.
 
 This client follows [Semantic Versioning](https://semver.org/). Version 1.x
-speaks the `chunkdb` 1.x protocol, version 2.x speaks protocol 2 (chunkdb
-2.0); see the engine's
+speaks the `chunkdb` 1.x protocol, version 2.x speaks protocol 3 (CQL); see
+the engine's
 [compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
 
 ## Unreleased
 
 ### Breaking
 - The module path is `github.com/chunkdb/chunkdb-go/v2`
-- Protocol 2 (chunkdb 2.0). Every connection starts with `HELLO 2`, carrying
-  the token and the table; a 1.x server is refused with an `ErrProtocol`
-  error. The reply is available as `ServerInfo()`, a `HelloInfo` (server
-  version, capabilities, limits, table geometry and options). A wrong or
-  missing token fails `Connect` with `ErrAuth` (`AUTH_FAILED` /
-  `AUTH_REQUIRED`), an unknown table with `CodeNoTable`. Removed: `Auth` and
-  `Options.DisableAutoAuth`
-- `Get` returns a `BlockState` (`Exists` false for an unset block) and `MGet`
-  a `[]BlockState`; `ReadBlock` and `Exists` are removed
-- chunks are binary only. `GetChunk` / `GetChunkState` replace `Chunk`,
-  `ReadChunk`, `ChunkBin`, `ChunkBinState`, `ChunkBinCompressed` and
-  `ChunkBinStateCompressed`; `PutChunk` / `PutChunkState` replace `SetChunk`,
-  `SetChunkState`, `SetChunkBin`, `SetChunkBinState` and
-  `ChunkCompareAndSet` (`PutOptions.IfVersion`). `ChunkState` and
-  `ChunkStateInput` hold `Payload` / `Presence` bytes. `GetOptions.ZRLE` and
-  `PutOptions.ZRLE` compress a read or write on the wire. Writes return a
-  `MutationResult`
-- `ChunkRange` / `ChunkRadius` take `GetOptions`, and `RangeEntry` holds
-  `Payload` / `Presence` bytes instead of bit strings
-- chunk sizes come from the connection's table (`HELLO`, `Use`) instead of
-  `INFO`; without a table, the chunk methods fail until `Use` selects one
-- `ReadFrame` returns `FrameNull` frames for `$-1`, and `Frame.Array` holds
-  frames (`FrameBulk` or `FrameNull`) instead of byte slices
-- `Pool` mirrors the new methods and drops the removed ones
+- Protocol 3 (CQL). Every connection starts with `HELLO 3 [AUTH <token>]`; `ServerInfo()` returns a `ServerInfo` (server version and the limits `max_line_bytes`, `max_parameters`, `max_area_chunks`, `max_response_bytes`, `max_scan_limit`). A server of protocol 2 or 1.x is refused with an `ErrProtocol` error saying it speaks an older protocol
+- Every method names its table; `""` is the client's default table (`Options.Table`, else the URI path, else `default`). HELLO no longer carries a table
+- Removed the protocol 2 and 1.x API: `Get`, `Set`, `Unset`, `MGet`, `MSet`, `BlockState`, `Block`, `BlockRef`, `ChunkExists`, `GetChunk` / `GetChunkState` / `PutChunk` / `PutChunkState` on bit-packed payloads, `ChunkState`, `ChunkStateInput`, `GetOptions`, `PutOptions`, `MutationResult`, `ChunkScan`, `ChunkRange`, `ChunkRadius`, `RangeEntry`, `CoordPair`, `ScanResult`, `ChunkVersion`, `ChunkBatch`, `ChunkBatchIfVersion`, `BatchOperation`, `SetOp`, `UnsetOp`, `Info`, `WALFlush`, `Use`, `Table`, `CurrentTable`, `TableInfo`, `TableSpec.BlockBits` and the geometry fields, `SetTableOptions`, `HelloInfo`, bit-string block values, ZRLE on the wire and `ZRLECompress` / `ZRLEDecompress`, and the frame helpers `SerializeCommand`, `ReadFrame`, `Frame`, `ParseInfo`
+- A version mismatch is an error: `*VersionMismatchError` with the current version, matching `ErrVersionMismatch`
+- Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
-- Tables (chunkdb 2.0+): `CreateTable`, `DropTable`, `Tables`, `TableInfo`,
-  `SetTableOptions` and `Use`, with the `TableSpec`, `TableOptions` and
-  `TableInfo` types; `Table(ctx, name)` returns a new client on a table.
-  `Options.Table` or the URI path (`chunk://host:4242/terrain`) selects the
-  table at connect, and every reconnect names it again; `Pool` clients use
-  the pool's table. `URI()` reports the selected table as its path,
-  `CurrentTable()` reports it, and `URI.Table` / `TableFromPath` parse it.
-  `CodeNoTable` and `CodeTableExists` name the new server error codes. Chunk
-  size checks follow the selected table's geometry
+- Typed values by column type (`uN`, `iN`, `bool`, `f32`, `f64`, `bits(N)`, `text(max)`, `bytes(max)`, NULL), sent as parameters and checked before sending; `Record`, `Bits`, `ParseBits`, `EncodeValue`, `ColumnType`, `ParseColumnType`
+- Blocks: `GetBlock`, `SetBlock`, `DeleteBlock`; `IfVersion` makes writes conditional
+- Chunks: `GetChunk` / `SetChunk` on a decoded `Chunk`, `GetChunkRaw` / `SetChunkRaw` on the chunk form, `NewChunk`, `DecodeChunk`, `EncodeChunk`, `Schema.Locate`
+- Areas and scans: `GetArea`, `GetAreaAround`, `ScanChunks` (`ScanPage`), `AllChunks`
+- Tables: `CreateTable` with `ColumnDef` columns, `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` (`Conversion`), `SetTableOption`, `DropTable`, `Tables`, `Describe` and the cached `Schema`, refreshed after the client's own table statements and once when a write's parameter has the wrong size for its column
+- `Do(ctx, statement, params...)` sends any statement and returns the decoded RESP3 `Reply`
+- `FlushWAL`, `Metrics` (`SHOW METRICS`), `DefaultTable`; error codes as `Code*` constants
+- The client drops the connection after the error replies on which the server closes it
 
 ## 1.1.0 - 2026-09-03
 

@@ -3,6 +3,7 @@ package chunkdb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -45,53 +46,42 @@ func waitForFinishedConns(t *testing.T, server *fakeServer, want int) {
 	}
 }
 
-// genericInfo is the fake INFO reply.
-const genericInfo = "table=default\ntables=1\nloaded_chunks=0\n"
-
-// genericHandler answers every command with a well-formed, minimal response so
-// tests can focus on what the client sends. Chunk replies have the default
-// table's sizes.
+// genericHandler answers every statement with a well-formed, minimal reply so
+// tests can focus on what the client sends. Every table has the fake world
+// columns.
 func genericHandler(_ *fakeServer, conn net.Conn, command string) {
-	args := strings.Fields(command)
-	switch verbOf(command) {
+	fields := strings.Fields(command)
+	switch commandOf(command) {
 	case "PING":
 		writeSimple(conn, "PONG")
-	case "SET", "UNSET", "MSET", "WALFLUSH":
+	case "DESCRIBE":
+		writeRaw(conn, describeReply(fields[1], 1, worldColumns))
+	case "GET BLOCK":
+		writeRaw(conn, respNull)
+	case "SET BLOCK", "DELETE BLOCK", "SET CHUNK":
+		writeRaw(conn, respInt(7))
+	case "GET CHUNK":
+		// An empty form of the named columns, or of every column.
+		size := worldFormBytes
+		if _, names, ok := strings.Cut(command, " COLUMNS "); ok {
+			size = 17
+			for _, name := range strings.Split(names, ", ") {
+				size += worldSectionBytes[name]
+			}
+		}
+		writeRaw(conn, respBulk(emptyWorldForm(size)))
+	case "GET AREA":
+		writeRaw(conn, respArray())
+	case "SCAN CHUNKS":
+		writeRaw(conn, respMap("chunks", respArray(), "more", respBool(false)))
+	case "FLUSH WAL", "CREATE TABLE", "ALTER TABLE", "DROP TABLE":
 		writeSimple(conn, "OK")
-	case "CHUNKEXISTS":
-		writeSimple(conn, "0")
-	case "GET":
-		writeBulkString(conn, "0000")
-	case "CHUNKGET":
-		size := testChunkPayloadBytes
-		if strings.Contains(command, " STATE") {
-			size += testPresenceBytes
-		}
-		if strings.HasSuffix(command, " ZRLE") {
-			writeBulk(conn, ZRLECompress(make([]byte, size)))
-			return
-		}
-		writeBulk(conn, make([]byte, size))
-	case "INFO":
-		writeBulkString(conn, genericInfo)
-	case "METRICS":
-		writeBulkString(conn, "# HELP chunkdb_up\n")
-	case "MGET":
-		items := make([]string, 0, (len(args)-1)/2)
-		for range (len(args) - 1) / 2 {
-			items = append(items, "0000")
-		}
-		writeArray(conn, items...)
-	case "CHUNKSCAN":
-		writeArray(conn, "END")
-	case "CHUNKRANGE", "CHUNKRADIUS":
-		writeArray(conn)
-	case "CHUNKVER":
-		writeBulkString(conn, "7")
-	case "CHUNKPUT", "CHUNKBATCH":
-		writeBulkString(conn, "8")
+	case "SHOW TABLES":
+		writeRaw(conn, respArray(respBulk("default"), respBulk("world")))
+	case "SHOW METRICS":
+		writeRaw(conn, respBulk("# HELP chunkdb_up\n"))
 	default:
-		writeServerError(conn, "ERR UNKNOWN_COMMAND "+verbOf(command))
+		writeServerError(conn, "ERR SYNTAX column 1: unknown statement")
 	}
 }
 
@@ -104,14 +94,9 @@ func TestClientHelloAndPing(t *testing.T) {
 	}
 
 	commands := server.commands()
-	want := []string{"HELLO 2 AUTH tok", "PING"}
-	if len(commands) != len(want) {
-		t.Fatalf("got commands %q, want %q", commands, want)
-	}
-	for i, command := range want {
-		if commands[i] != command {
-			t.Fatalf("command %d: got %q, want %q", i, commands[i], command)
-		}
+	want := []string{"HELLO 3 AUTH tok", "PING"}
+	if strings.Join(commands, "|") != strings.Join(want, "|") {
+		t.Fatalf("got statements %q, want %q", commands, want)
 	}
 }
 
@@ -126,8 +111,8 @@ func TestClientHelloWithoutToken(t *testing.T) {
 	if err := client.Ping(t.Context()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
-	if commands := server.commands(); len(commands) != 2 || commands[0] != "HELLO 2" {
-		t.Fatalf("got %q, want HELLO 2 then PING", commands)
+	if commands := server.commands(); len(commands) != 2 || commands[0] != "HELLO 3" {
+		t.Fatalf("got %q, want HELLO 3 then PING", commands)
 	}
 }
 
@@ -139,45 +124,30 @@ func TestClientServerInfo(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	if info := client.ServerInfo(); info != nil {
-		t.Fatalf("got %+v before connecting, want nil", info)
+	if client.ServerInfo() != nil {
+		t.Fatal("got ServerInfo before connecting")
 	}
 	if err := client.Connect(t.Context()); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 
+	want := ServerInfo{
+		Protocol: 3, ServerVersion: "test", MaxLineBytes: 65536, MaxParameters: 65535,
+		MaxAreaChunks: 256, MaxResponseBytes: 64 << 20, MaxScanLimit: 1024,
+	}
 	info := client.ServerInfo()
-	if info == nil {
-		t.Fatal("got nil ServerInfo after connecting")
+	if info == nil || *info != want {
+		t.Fatalf("got %+v, want %+v", info, want)
 	}
-	if info.Protocol != 2 || info.ServerVersion != "test" || len(info.Capabilities) != 1 ||
-		info.Capabilities[0] != "zrle" || info.MaxLineBytes != 65536 || info.MaxAreaChunks != 256 ||
-		info.MaxResponseBytes != 67108864 || info.MaxScanLimit != 1024 || info.MaxBatchOps != 1024 {
-		t.Fatalf("got %+v", info)
-	}
-	if info.Table == nil || info.Table.Name != "default" || info.Table.BlockBits != 4 ||
-		info.Table.ChunkWidthBlocks != 2 || info.Table.ChunkHeightBlocks != 2 ||
-		info.Table.Options.DurabilityMode != "relaxed" {
-		t.Fatalf("got table %+v", info.Table)
-	}
-	if info.Values["server_version"] != "test" {
-		t.Fatalf("got values %v", info.Values)
-	}
-
 	// The result is a copy.
-	info.Capabilities[0] = "changed"
-	info.Values["server_version"] = "changed"
-	info.Table.Name = "changed"
-	info.Table.Values["table"] = "changed"
-	again := client.ServerInfo()
-	if again.Capabilities[0] != "zrle" || again.Values["server_version"] != "test" ||
-		again.Table.Name != "default" || again.Table.Values["table"] != "default" {
-		t.Fatalf("changing a ServerInfo result changed the client: %+v", again)
+	info.MaxLineBytes = 1
+	if client.ServerInfo().MaxLineBytes != 65536 {
+		t.Fatal("changing the result changed the client")
 	}
 }
 
 func TestClientHelloAuthFailureIsTyped(t *testing.T) {
-	// A protocol 2 server answers AUTH_REQUIRED only to a HELLO without a
+	// A protocol 3 server answers AUTH_REQUIRED only to a HELLO without a
 	// token.
 	cases := []struct {
 		token   string
@@ -185,8 +155,8 @@ func TestClientHelloAuthFailureIsTyped(t *testing.T) {
 		code    string
 		message string
 	}{
-		{"wrong", "ERR AUTH_FAILED invalid token", "AUTH_FAILED", "invalid token"},
-		{"", "ERR AUTH_REQUIRED use HELLO 2 AUTH <token>", "AUTH_REQUIRED", "use HELLO 2 AUTH <token>"},
+		{"wrong", "ERR AUTH_FAILED invalid token", CodeAuthFailed, "invalid token"},
+		{"", "ERR AUTH_REQUIRED use HELLO 3 AUTH <token>", CodeAuthRequired, "use HELLO 3 AUTH <token>"},
 	}
 
 	for _, testCase := range cases {
@@ -196,15 +166,9 @@ func TestClientHelloAuthFailureIsTyped(t *testing.T) {
 			})
 
 			_, err := Connect(t.Context(), Options{URI: server.uri(testCase.token)})
-			if !errors.Is(err, ErrAuth) {
-				t.Fatalf("got %v, want ErrAuth", err)
+			if !errors.Is(err, ErrAuth) || !errors.Is(err, ErrServer) {
+				t.Fatalf("got %v, want ErrAuth and ErrServer", err)
 			}
-			// An auth failure is a specialization of a server error, so it
-			// matches both.
-			if !errors.Is(err, ErrServer) {
-				t.Fatalf("got %v, want it to also match ErrServer", err)
-			}
-
 			var typed *Error
 			if !errors.As(err, &typed) {
 				t.Fatalf("got %T, want *chunkdb.Error", err)
@@ -215,96 +179,72 @@ func TestClientHelloAuthFailureIsTyped(t *testing.T) {
 			if typed.Phase != PhaseAuth || typed.Command != "HELLO" {
 				t.Fatalf("got phase %q command %q, want %q HELLO", typed.Phase, typed.Command, PhaseAuth)
 			}
-
 			// A failed handshake closes the socket.
 			waitForFinishedConns(t, server, 1)
 		})
 	}
 }
 
-func TestClientHelloUnknownTable(t *testing.T) {
-	server := newFakeServer(t, withHello(genericHandler))
-
-	_, err := Connect(t.Context(), Options{URI: server.uri("tok"), Table: "missing"})
-	var typed *Error
-	if !errors.As(err, &typed) || typed.ServerCode != CodeNoTable {
-		t.Fatalf("got %v, want %s", err, CodeNoTable)
+func TestClientHelloRefusesOlderServers(t *testing.T) {
+	cases := map[string]struct {
+		token string
+		reply string
+	}{
+		"protocol 2":            {"", "ERR PROTOCOL expected HELLO 2"},
+		"1.x":                   {"", "ERR UNKNOWN_COMMAND HELLO"},
+		"1.x requiring a token": {"tok", "ERR AUTH_REQUIRED use AUTH <token>"},
 	}
-	if errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v, want it not to match ErrAuth", err)
-	}
-	if got := server.lastCommand(t); got != "HELLO 2 AUTH tok TABLE missing" {
-		t.Fatalf("got %q", got)
-	}
-	waitForFinishedConns(t, server, 1)
-}
-
-func TestClientHelloRefusesProtocol1Server(t *testing.T) {
-	// A chunkdb 1.x server does not know HELLO.
-	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, command string) {
-		writeServerError(conn, "ERR UNKNOWN_COMMAND "+verbOf(command))
-	})
-
-	_, err := Connect(t.Context(), Options{URI: server.uri("")})
-	if !errors.Is(err, ErrProtocol) {
-		t.Fatalf("got %v, want ErrProtocol", err)
-	}
-	if errors.Is(err, ErrServer) {
-		t.Fatalf("got %v, want it not to match ErrServer", err)
-	}
-	if !strings.Contains(err.Error(), "protocol 2") || !strings.Contains(err.Error(), "chunkdb 1.x") {
-		t.Fatalf("got %q, want it to name protocol 2 and chunkdb 1.x", err)
-	}
-	waitForFinishedConns(t, server, 1)
-}
-
-func TestClientHelloRefusesProtocol1ServerWithToken(t *testing.T) {
-	// A chunkdb 1.x server that requires a token answers every command
-	// before AUTH with AUTH_REQUIRED, also a HELLO that carries the token.
-	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
-		writeServerError(conn, "ERR AUTH_REQUIRED use AUTH <token>")
-	})
-
-	_, err := Connect(t.Context(), Options{URI: server.uri("tok")})
-	if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v, want ErrProtocol and not ErrAuth", err)
-	}
-	if !strings.Contains(err.Error(), "chunkdb 1.x") {
-		t.Fatalf("got %q, want it to name chunkdb 1.x", err)
-	}
-
-	// Without a token the reply is ambiguous: it stays an auth error.
-	_, err = Connect(t.Context(), Options{URI: server.uri("")})
-	if !errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v, want ErrAuth", err)
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
+				writeServerError(conn, testCase.reply)
+			})
+			_, err := Connect(t.Context(), Options{URI: server.uri(testCase.token)})
+			if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrServer) {
+				t.Fatalf("got %v, want ErrProtocol and not ErrServer", err)
+			}
+			if !strings.Contains(err.Error(), "older chunkdb protocol") {
+				t.Fatalf("got %q, want it to say the server speaks an older protocol", err)
+			}
+			waitForFinishedConns(t, server, 1)
+		})
 	}
 }
 
 func TestClientHelloRejectsBadReplies(t *testing.T) {
-	withoutLimit := func(key string) string {
-		lines := strings.Split(helloLimits+defaultInfo, "\n")
-		kept := lines[:0]
-		for _, line := range lines {
-			if !strings.HasPrefix(line, key+"=") {
-				kept = append(kept, line)
+	limits := []string{
+		"server_version", respBulk("test"),
+		"max_line_bytes", respInt(65536),
+		"max_parameters", respInt(65535),
+		"max_area_chunks", respInt(256),
+		"max_response_bytes", respInt(64 << 20),
+		"max_scan_limit", respInt(1024),
+	}
+	without := func(key string) string {
+		pairs := []string{"protocol", respInt(3)}
+		for i := 0; i < len(limits); i += 2 {
+			if limits[i] != key {
+				pairs = append(pairs, limits[i], limits[i+1])
 			}
 		}
-		return strings.Join(kept, "\n")
+		return respMap(pairs...)
 	}
 
 	cases := map[string]string{
-		"protocol 1":             strings.Replace(helloLimits, "protocol=2", "protocol=1", 1) + defaultInfo,
-		"protocol missing":       withoutLimit("protocol"),
-		"max_line_bytes missing": withoutLimit("max_line_bytes"),
-		"max_batch_ops missing":  withoutLimit("max_batch_ops"),
-		"max_area_chunks zero":   strings.Replace(helloLimits, "max_area_chunks=256", "max_area_chunks=0", 1),
-		"table lines incomplete": helloLimits + "table=default\n",
+		"protocol 2":             respMap(append([]string{"protocol", respInt(2)}, limits...)...),
+		"protocol missing":       respMap(limits...),
+		"max_line_bytes missing": without("max_line_bytes"),
+		"max_parameters missing": without("max_parameters"),
+		"server_version missing": without("server_version"),
+		"max_scan_limit zero":    strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":1024", ":0", 1),
+		"not a map":              "+OK\r\n",
+		"a bulk string":          respBulk("protocol=3\n"),
 	}
 
 	for name, reply := range cases {
 		t.Run(name, func(t *testing.T) {
 			server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
-				writeBulkString(conn, reply)
+				writeRaw(conn, reply)
 			})
 			_, err := Connect(t.Context(), Options{URI: server.uri("tok")})
 			if !errors.Is(err, ErrProtocol) {
@@ -313,15 +253,6 @@ func TestClientHelloRejectsBadReplies(t *testing.T) {
 			waitForFinishedConns(t, server, 1)
 		})
 	}
-
-	t.Run("simple reply", func(t *testing.T) {
-		server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
-			writeSimple(conn, "OK")
-		})
-		if _, err := Connect(t.Context(), Options{URI: server.uri("tok")}); !errors.Is(err, ErrProtocol) {
-			t.Fatalf("got %v, want ErrProtocol", err)
-		}
-	})
 }
 
 func TestClientHelloTimeout(t *testing.T) {
@@ -339,218 +270,133 @@ func TestClientHelloTimeout(t *testing.T) {
 	waitForFinishedConns(t, server, 1)
 }
 
-func TestClientWithoutTable(t *testing.T) {
-	// A server without a default table: the connection has no table until Use.
-	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, command string) {
-		switch verbOf(command) {
-		case "HELLO":
-			writeBulkString(conn, helloLimits)
-		case "USE":
-			writeBulkString(conn, terrainInfo)
-		case "CHUNKGET":
-			writeBulk(conn, make([]byte, 10))
-		default:
-			genericHandler(nil, conn, command)
-		}
-	})
-	client := newTestClient(t, server, nil)
-	ctx := t.Context()
-
-	if info := client.ServerInfo(); info == nil || info.Table != nil {
-		t.Fatalf("got %+v, want a reply without a table", info)
-	}
-
-	calls := map[string]func() error{
-		"GetChunk":      func() error { _, err := client.GetChunk(ctx, 0, 0, GetOptions{}); return err },
-		"GetChunkState": func() error { _, err := client.GetChunkState(ctx, 0, 0, GetOptions{}); return err },
-		"PutChunk": func() error {
-			_, err := client.PutChunk(ctx, 0, 0, []byte{0}, PutOptions{})
-			return err
-		},
-		"PutChunkState": func() error {
-			_, err := client.PutChunkState(ctx, 0, 0, ChunkStateInput{}, PutOptions{})
-			return err
-		},
-		"ChunkRange":  func() error { _, err := client.ChunkRange(ctx, 0, 0, 1, 1, GetOptions{}); return err },
-		"ChunkRadius": func() error { _, err := client.ChunkRadius(ctx, 0, 0, 1, GetOptions{}); return err },
-	}
-	for name, call := range calls {
-		before := len(server.commands())
-		err := call()
-		if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "Use") {
-			t.Fatalf("%s: got %v, want a request error pointing to Use", name, err)
-		}
-		if len(server.commands()) != before {
-			t.Fatalf("%s reached the server", name)
-		}
-	}
-
-	if _, err := client.Use(ctx, "terrain"); err != nil {
-		t.Fatalf("Use: %v", err)
-	}
-	state, err := client.GetChunkState(ctx, 0, 0, GetOptions{})
-	if err != nil || len(state.Payload) != 8 || len(state.Presence) != 2 {
-		t.Fatalf("GetChunkState after Use: %+v, %v", state, err)
-	}
-}
-
 func TestClientServerErrorIsTyped(t *testing.T) {
 	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, _ string) {
-		writeServerError(conn, "ERR INVALID_ARGUMENT bits length mismatch")
+		writeServerError(conn, "ERR NO_TABLE table 'nowhere' does not exist")
 	}))
 	client := newTestClient(t, server, nil)
 
-	err := client.Set(t.Context(), 0, 0, "1010")
-	if !errors.Is(err, ErrServer) {
-		t.Fatalf("got %v, want ErrServer", err)
+	_, err := client.DeleteBlock(t.Context(), "nowhere", 0, 0)
+	if !errors.Is(err, ErrServer) || errors.Is(err, ErrAuth) || errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("got %v, want ErrServer only", err)
 	}
-	if errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v, want it not to match ErrAuth", err)
-	}
-
 	var typed *Error
 	if !errors.As(err, &typed) {
 		t.Fatalf("got %T, want *chunkdb.Error", err)
 	}
-	if typed.ServerCode != "INVALID_ARGUMENT" || typed.ServerMessage != "bits length mismatch" {
+	if typed.ServerCode != CodeNoTable || typed.ServerMessage != "table 'nowhere' does not exist" {
 		t.Fatalf("got code %q message %q", typed.ServerCode, typed.ServerMessage)
 	}
-	if typed.Command != "SET" || typed.Phase != PhaseResponse {
-		t.Fatalf("got command %q phase %q, want SET %q", typed.Command, typed.Phase, PhaseResponse)
+	if typed.Command != "DELETE BLOCK" || typed.Phase != PhaseResponse {
+		t.Fatalf("got command %q phase %q, want DELETE BLOCK %q", typed.Command, typed.Phase, PhaseResponse)
 	}
 }
 
-func TestClientCommandEncoding(t *testing.T) {
+func TestClientStatementEncoding(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
-	client := newTestClient(t, server, nil)
+	client := newTestClient(t, server, func(o *Options) { o.Table = "world" })
 	ctx := t.Context()
+	mask, _ := ParseBits("101")
 
 	cases := []struct {
-		name string
-		call func() error
-		want string
+		name   string
+		call   func() error
+		want   string
+		params [][]byte
 	}{
+		{"ping", func() error { return client.Ping(ctx) }, "PING", nil},
+		{"get block", func() error { _, err := client.GetBlock(ctx, "", -1, 2, "name", "id"); return err },
+			"GET BLOCK -1 2 FROM world COLUMNS name, id", nil},
+		{"get block of every column", func() error { _, err := client.GetBlock(ctx, "land", 1, 2); return err },
+			"GET BLOCK 1 2 FROM land COLUMNS id, temp, solid, h, d, mask, name, blob", nil},
 		{
-			name: "get",
-			call: func() error { _, err := client.Get(ctx, 1, -2); return err },
-			want: "GET 1 -2",
-		},
-		{
-			name: "int64 extremes",
-			call: func() error { return client.Set(ctx, math.MinInt64, math.MaxInt64, "1010") },
-			want: "SET -9223372036854775808 9223372036854775807 1010",
-		},
-		{
-			name: "unset",
-			call: func() error { return client.Unset(ctx, 4, 5) },
-			want: "UNSET 4 5",
-		},
-		{
-			name: "mset",
-			call: func() error {
-				return client.MSet(ctx, []Block{{X: 1, Y: 2, Bits: "1010"}, {X: 3, Y: 4, Bits: "0101"}})
-			},
-			want: "MSET 1 2 1010 3 4 0101",
-		},
-		{
-			name: "mget",
-			call: func() error { _, err := client.MGet(ctx, []BlockRef{{X: 1, Y: 2}, {X: 3, Y: 4}}); return err },
-			want: "MGET 1 2 3 4",
-		},
-		{
-			name: "chunk exists",
-			call: func() error { _, err := client.ChunkExists(ctx, 1, 2); return err },
-			want: "CHUNKEXISTS 1 2",
-		},
-		{
-			name: "chunk get",
-			call: func() error { _, err := client.GetChunk(ctx, 1, 2, GetOptions{}); return err },
-			want: "CHUNKGET 1 2",
-		},
-		{
-			name: "chunk get zrle",
-			call: func() error { _, err := client.GetChunk(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
-			want: "CHUNKGET 1 2 ZRLE",
-		},
-		{
-			name: "chunk get state",
-			call: func() error { _, err := client.GetChunkState(ctx, 1, 2, GetOptions{}); return err },
-			want: "CHUNKGET 1 2 STATE",
-		},
-		{
-			name: "chunk get state zrle",
-			call: func() error { _, err := client.GetChunkState(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
-			want: "CHUNKGET 1 2 STATE ZRLE",
-		},
-		{
-			name: "scan without cursor",
-			call: func() error { _, err := client.ChunkScan(ctx, 10, nil); return err },
-			want: "CHUNKSCAN 10",
-		},
-		{
-			name: "scan with cursor",
-			call: func() error { _, err := client.ChunkScan(ctx, 10, &CoordPair{CX: 3, CY: -4}); return err },
-			want: "CHUNKSCAN 10 3 -4",
-		},
-		{
-			name: "range",
-			call: func() error { _, err := client.ChunkRange(ctx, -1, -2, 3, 4, GetOptions{}); return err },
-			want: "CHUNKRANGE -1 -2 3 4 STATE",
-		},
-		{
-			name: "range zrle",
-			call: func() error { _, err := client.ChunkRange(ctx, -1, -2, 3, 4, GetOptions{ZRLE: true}); return err },
-			want: "CHUNKRANGE -1 -2 3 4 STATE ZRLE",
-		},
-		{
-			name: "radius",
-			call: func() error { _, err := client.ChunkRadius(ctx, 1, 2, 3, GetOptions{}); return err },
-			want: "CHUNKRADIUS 1 2 3 STATE",
-		},
-		{
-			name: "radius zrle",
-			call: func() error { _, err := client.ChunkRadius(ctx, 1, 2, 3, GetOptions{ZRLE: true}); return err },
-			want: "CHUNKRADIUS 1 2 3 STATE ZRLE",
-		},
-		{
-			name: "version",
-			call: func() error { _, err := client.ChunkVersion(ctx, 1, 2); return err },
-			want: "CHUNKVER 1 2",
-		},
-		{
-			name: "batch without version",
-			call: func() error {
-				_, err := client.ChunkBatch(ctx, 1, 2, []BatchOperation{SetOp(3, 4, "1010"), UnsetOp(5, 6)})
+			"set block",
+			func() error {
+				_, err := client.SetBlock(ctx, "", 3, -4, Record{
+					"id": 7, "temp": int8(-2), "solid": true, "h": float32(1.5), "d": 2.5,
+					"mask": mask, "name": "it's\r\n", "blob": []byte{0, '\r', '\n'},
+				})
 				return err
 			},
-			want: "CHUNKBATCH 1 2 SET 3 4 1010 UNSET 5 6",
+			"SET BLOCK 3 -4 IN world blob = $1, d = $2, h = $3, id = $4, mask = $5, name = $6, solid = $7, temp = $8",
+			[][]byte{
+				{0, '\r', '\n'},
+				{0, 0, 0, 0, 0, 0, 4, 0x40},
+				{0, 0, 0xc0, 0x3f},
+				{7, 0, 0, 0, 0, 0, 0, 0},
+				{5},
+				[]byte("it's\r\n"),
+				{1},
+				{0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+			},
 		},
 		{
-			name: "batch with version",
-			call: func() error {
-				_, err := client.ChunkBatchIfVersion(ctx, 1, 2, 9, []BatchOperation{UnsetOp(5, 6)})
+			"set block with NULL and IF VERSION",
+			func() error {
+				_, err := client.SetBlock(ctx, "", 0, 0, Record{"name": nil, "blob": []byte{}}, IfVersion(18446744073709551615))
 				return err
 			},
-			want: "CHUNKBATCH 1 2 IF 9 UNSET 5 6",
+			"SET BLOCK 0 0 IN world blob = $1, name = $2 IF VERSION 18446744073709551615",
+			[][]byte{{}, nil},
 		},
+		{"delete block", func() error { _, err := client.DeleteBlock(ctx, "", 5, 6, IfVersion(9)); return err },
+			"DELETE BLOCK 5 6 FROM world IF VERSION 9", nil},
+		{"get chunk", func() error { _, err := client.GetChunk(ctx, "", 1, -2, "h"); return err },
+			"GET CHUNK 1 -2 FROM world COLUMNS h", nil},
+		{"get chunk raw", func() error { _, err := client.GetChunkRaw(ctx, "", 1, 2); return err },
+			"GET CHUNK 1 2 FROM world", nil},
+		{"set chunk raw", func() error { _, err := client.SetChunkRaw(ctx, "", 1, 2, []byte("a\r\nb"), IfVersion(3)); return err },
+			"SET CHUNK 1 2 IN world $1 IF VERSION 3", [][]byte{[]byte("a\r\nb")}},
+		{"get area", func() error { _, err := client.GetArea(ctx, "", -1, -2, 3, 4, "id"); return err },
+			"GET AREA -1 -2 TO 3 4 FROM world COLUMNS id", nil},
+		{"get area around", func() error { _, err := client.GetAreaAround(ctx, "", 1, 2, 3); return err },
+			"GET AREA AROUND 1 2 RADIUS 3 FROM world COLUMNS id, temp, solid, h, d, mask, name, blob", nil},
+		{"scan", func() error { _, err := client.ScanChunks(ctx, "", nil, 0); return err }, "SCAN CHUNKS FROM world", nil},
+		{"scan after", func() error { _, err := client.ScanChunks(ctx, "", &ChunkCoord{CX: -1, CY: 2}, 10); return err },
+			"SCAN CHUNKS FROM world AFTER -1 2 LIMIT 10", nil},
+		{"flush", func() error { return client.FlushWAL(ctx) }, "FLUSH WAL", nil},
+		{"metrics", func() error { _, err := client.Metrics(ctx); return err }, "SHOW METRICS", nil},
+		{"tables", func() error { _, err := client.Tables(ctx); return err }, "SHOW TABLES", nil},
+		{"describe", func() error { _, err := client.Describe(ctx, "land"); return err }, "DESCRIBE land", nil},
 		{
-			name: "batch with the largest version",
-			call: func() error {
-				_, err := client.ChunkBatchIfVersion(ctx, 1, 2, math.MaxUint64, []BatchOperation{UnsetOp(5, 6)})
-				return err
+			"create table",
+			func() error {
+				return client.CreateTable(ctx, "land", TableSpec{
+					Columns: []ColumnDef{
+						{Name: "id", Type: TypeUint(10), Required: true},
+						{Name: "light", Type: TypeUint(4), Default: 15},
+						{Name: "sign", Type: TypeText(8), Null: true, Default: "it's"},
+						{Name: "h", Type: TypeF32(), Default: float32(1.5)},
+						{Name: "mask", Type: TypeBits(3), Default: mask},
+						{Name: "blob", Type: TypeBytes(4), Default: []byte{0x0a, 0xff}},
+						{Name: "far", Type: TypeF64(), Default: math.Inf(-1)},
+						{Name: "flag", Type: TypeBool(), Default: true},
+						{Name: "t", Type: TypeInt(8), Default: -3},
+					},
+					ChunkWidth: 16, ChunkHeight: 8, LargeWidth: 4, LargeHeight: 2,
+					Options: TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096},
+				})
 			},
-			want: "CHUNKBATCH 1 2 IF 18446744073709551615 UNSET 5 6",
+			"CREATE TABLE land (id u10 REQUIRED, light u4 DEFAULT 15, sign text(8) NULL DEFAULT 'it''s', " +
+				"h f32 DEFAULT 1.5, mask bits(3) DEFAULT b'101', blob bytes(4) DEFAULT x'0aff', far f64 DEFAULT -inf, " +
+				"flag bool DEFAULT TRUE, t i8 DEFAULT -3) CHUNK 16 x 8 LARGE 4 x 2 " +
+				"WITH durability_mode = 'fsync-wal', var_max_chunk_bytes = 4096",
+			nil,
 		},
-		{
-			name: "wal flush",
-			call: func() error { return client.WALFlush(ctx) },
-			want: "WALFLUSH",
-		},
-		{
-			name: "metrics",
-			call: func() error { _, err := client.Metrics(ctx); return err },
-			want: "METRICS",
-		},
+		{"add column", func() error { return client.AddColumn(ctx, "", ColumnDef{Name: "d2", Type: TypeInt(8), Null: true}) },
+			"ALTER TABLE world ADD COLUMN d2 i8 NULL", nil},
+		{"drop column", func() error { return client.DropColumn(ctx, "", "d2") }, "ALTER TABLE world DROP COLUMN d2", nil},
+		{"rename column", func() error { return client.RenameColumn(ctx, "", "name", "label") },
+			"ALTER TABLE world RENAME COLUMN name TO label", nil},
+		{"alter type", func() error { return client.AlterColumnType(ctx, "", "id", TypeUint(8), ConvertNone) },
+			"ALTER TABLE world ALTER COLUMN id TYPE u8", nil},
+		{"alter type using", func() error { return client.AlterColumnType(ctx, "", "name", TypeText(4), ConvertTruncate) },
+			"ALTER TABLE world ALTER COLUMN name TYPE text(4) USING TRUNCATE", nil},
+		{"set option text", func() error { return client.SetTableOption(ctx, "", "durability_mode", "relaxed") },
+			"ALTER TABLE world SET durability_mode = 'relaxed'", nil},
+		{"set option number", func() error { return client.SetTableOption(ctx, "", "checkpoint_updates", 64) },
+			"ALTER TABLE world SET checkpoint_updates = 64", nil},
+		{"drop table", func() error { return client.DropTable(ctx, "land") }, "DROP TABLE land", nil},
 	}
 
 	for _, testCase := range cases {
@@ -559,611 +405,554 @@ func TestClientCommandEncoding(t *testing.T) {
 				t.Fatalf("call: %v", err)
 			}
 			if got := server.lastCommand(t); got != testCase.want {
-				t.Fatalf("got %q, want %q", got, testCase.want)
+				t.Fatalf("got  %q\nwant %q", got, testCase.want)
+			}
+			params := server.lastParams(t)
+			if len(params) != len(testCase.params) {
+				t.Fatalf("got %d parameters, want %d", len(params), len(testCase.params))
+			}
+			for i, param := range params {
+				if (param == nil) != (testCase.params[i] == nil) || !bytes.Equal(param, testCase.params[i]) {
+					t.Fatalf("parameter %d: got %v, want %v", i+1, param, testCase.params[i])
+				}
 			}
 		})
 	}
-
-	// Chunk sizes come from HELLO; the client never asks INFO.
-	for _, command := range server.commands() {
-		if verbOf(command) == "INFO" {
-			t.Fatalf("the client sent %q", command)
-		}
-	}
 }
 
-func TestClientGet(t *testing.T) {
-	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
-		if command == "GET 0 0" {
-			writeNull(conn)
-			return
-		}
-		writeBulkString(conn, "0000")
-	}))
-	client := newTestClient(t, server, nil)
-
-	unset, err := client.Get(t.Context(), 0, 0)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if unset != (BlockState{}) {
-		t.Fatalf("got %+v, want an unset block", unset)
-	}
-
-	zero, err := client.Get(t.Context(), 1, 0)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if zero != (BlockState{Exists: true, Bits: "0000"}) {
-		t.Fatalf("got %+v, want an explicit zero block", zero)
-	}
-}
-
-func TestClientMGet(t *testing.T) {
-	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, _ string) {
-		_, _ = conn.Write([]byte("*3\r\n$4\r\n1010\r\n$-1\r\n$4\r\n0000\r\n"))
-	}))
-	client := newTestClient(t, server, nil)
-
-	values, err := client.MGet(t.Context(), []BlockRef{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 2, Y: 0}})
-	if err != nil {
-		t.Fatalf("MGet: %v", err)
-	}
-	want := []BlockState{{Exists: true, Bits: "1010"}, {}, {Exists: true, Bits: "0000"}}
-	if len(values) != len(want) {
-		t.Fatalf("got %+v, want %+v", values, want)
-	}
-	for i := range want {
-		if values[i] != want[i] {
-			t.Fatalf("item %d: got %+v, want %+v", i, values[i], want[i])
-		}
-	}
-
-	if _, err := client.MGet(t.Context(), []BlockRef{{X: 0, Y: 0}}); !errors.Is(err, ErrProtocol) {
-		t.Fatalf("got %v, want ErrProtocol for 3 items answering 1 block", err)
-	}
-}
-
-func TestClientGetChunk(t *testing.T) {
-	payload := []byte{0xab, 0xcd}
-	presence := []byte{0x05}
-	state := append(append([]byte{}, payload...), presence...)
-	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
-		body := payload
-		if strings.Contains(command, " STATE") {
-			body = state
-		}
-		if strings.HasSuffix(command, " ZRLE") {
-			body = ZRLECompress(body)
-		}
-		writeBulk(conn, body)
-	}))
-	client := newTestClient(t, server, nil)
-	ctx := t.Context()
-
-	for _, zrle := range []bool{false, true} {
-		got, err := client.GetChunk(ctx, 0, 0, GetOptions{ZRLE: zrle})
-		if err != nil || !bytes.Equal(got, payload) {
-			t.Fatalf("GetChunk zrle=%v: %x, %v", zrle, got, err)
-		}
-		chunk, err := client.GetChunkState(ctx, 0, 0, GetOptions{ZRLE: zrle})
-		if err != nil {
-			t.Fatalf("GetChunkState zrle=%v: %v", zrle, err)
-		}
-		if !chunk.Exists || !bytes.Equal(chunk.Payload, payload) || !bytes.Equal(chunk.Presence, presence) {
-			t.Fatalf("GetChunkState zrle=%v: got %+v", zrle, chunk)
-		}
-	}
-}
-
-func TestClientGetChunkStateAbsent(t *testing.T) {
+func TestClientDefaultTable(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
-	client := newTestClient(t, server, nil)
-
-	chunk, err := client.GetChunkState(t.Context(), 0, 0, GetOptions{})
-	if err != nil {
-		t.Fatalf("GetChunkState: %v", err)
-	}
-	if chunk.Exists || len(chunk.Payload) != testChunkPayloadBytes || len(chunk.Presence) != testPresenceBytes {
-		t.Fatalf("got %+v, want an absent chunk of zeros", chunk)
-	}
-}
-
-func TestClientChunkRange(t *testing.T) {
-	first := []byte{0xf0, 0x00, 0x01}
-	second := []byte{0x00, 0x0f, 0x08}
-	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
-		a, b := first, second
-		if strings.HasSuffix(command, " ZRLE") {
-			a, b = ZRLECompress(a), ZRLECompress(b)
-		}
-		writeArray(conn, "-1 -2", string(a), "3 4", string(b))
-	}))
-	client := newTestClient(t, server, nil)
-
-	for _, zrle := range []bool{false, true} {
-		entries, err := client.ChunkRange(t.Context(), -1, -2, 3, 4, GetOptions{ZRLE: zrle})
-		if err != nil {
-			t.Fatalf("ChunkRange zrle=%v: %v", zrle, err)
-		}
-		if len(entries) != 2 {
-			t.Fatalf("got %d entries, want 2", len(entries))
-		}
-		if entries[0].CX != -1 || entries[0].CY != -2 || !bytes.Equal(entries[0].Payload, first[:2]) ||
-			!bytes.Equal(entries[0].Presence, first[2:]) {
-			t.Fatalf("got %+v", entries[0])
-		}
-		if entries[1].CX != 3 || entries[1].CY != 4 || !bytes.Equal(entries[1].Payload, second[:2]) ||
-			!bytes.Equal(entries[1].Presence, second[2:]) {
-			t.Fatalf("got %+v", entries[1])
-		}
-	}
-}
-
-func TestClientPutChunkWireFormat(t *testing.T) {
-	server := newFakeServer(t, withHello(genericHandler))
-	client := newTestClient(t, server, nil)
-	// terrain chunks are 8x2 blocks of 4 bits: 8 payload and 2 presence bytes,
-	// large enough for zrle to pay off.
-	terrain := newTestClient(t, server, func(o *Options) { o.Table = "terrain" })
-	ctx := t.Context()
-
-	version := uint64(9)
-	maxVersion := uint64(math.MaxUint64)
-	zeroState := make([]byte, 10)
-	denseState := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-
-	cases := []struct {
-		name string
-		call func() (MutationResult, error)
-		want []byte
+	cases := map[string]struct {
+		configure func(*Options)
+		want      string
 	}{
-		{
-			name: "payload",
-			call: func() (MutationResult, error) {
-				return client.PutChunk(ctx, 1, -2, []byte{0xab, 0xcd}, PutOptions{})
-			},
-			want: []byte("CHUNKPUT 1 -2 2\r\n\xab\xcd\r\n"),
-		},
-		{
-			name: "state",
-			call: func() (MutationResult, error) {
-				return client.PutChunkState(ctx, 1, 2, ChunkStateInput{Payload: []byte{0xab, 0xcd}, Presence: []byte{0x0f}}, PutOptions{})
-			},
-			want: []byte("CHUNKPUT 1 2 STATE 3\r\n\xab\xcd\x0f\r\n"),
-		},
-		{
-			name: "if version",
-			call: func() (MutationResult, error) {
-				return client.PutChunk(ctx, 1, 2, []byte{0x0d, 0x0a}, PutOptions{IfVersion: &version})
-			},
-			want: []byte("CHUNKPUT 1 2 IF 9 2\r\n\r\n\r\n"),
-		},
-		{
-			name: "largest version and coordinates",
-			call: func() (MutationResult, error) {
-				return client.PutChunk(ctx, math.MinInt64, math.MaxInt64, []byte{0, 0}, PutOptions{IfVersion: &maxVersion})
-			},
-			want: []byte("CHUNKPUT -9223372036854775808 9223372036854775807 IF 18446744073709551615 2\r\n\x00\x00\r\n"),
-		},
-		{
-			name: "zrle that does not shrink is sent raw",
-			call: func() (MutationResult, error) {
-				return client.PutChunk(ctx, 1, 2, []byte{0, 0}, PutOptions{ZRLE: true})
-			},
-			want: []byte("CHUNKPUT 1 2 2\r\n\x00\x00\r\n"),
-		},
-		{
-			name: "zrle that shrinks",
-			call: func() (MutationResult, error) {
-				return terrain.PutChunkState(ctx, 1, 2, ChunkStateInput{Payload: zeroState[:8], Presence: zeroState[8:]},
-					PutOptions{ZRLE: true, IfVersion: &version})
-			},
-			want: append(append([]byte("CHUNKPUT 1 2 STATE ZRLE IF 9 7\r\n"), ZRLECompress(zeroState)...), '\r', '\n'),
-		},
-		{
-			name: "zrle of a dense chunk is sent raw",
-			call: func() (MutationResult, error) {
-				return terrain.PutChunkState(ctx, 1, 2, ChunkStateInput{Payload: denseState[:8], Presence: denseState[8:]},
-					PutOptions{ZRLE: true})
-			},
-			want: append(append([]byte("CHUNKPUT 1 2 STATE 10\r\n"), denseState...), '\r', '\n'),
-		},
+		"default":      {nil, "default"},
+		"uri path":     {func(o *Options) { o.URI = strings.TrimSuffix(o.URI, "/") + "/terrain" }, "terrain"},
+		"option wins":  {func(o *Options) { o.URI += "terrain"; o.Table = "world" }, "world"},
+		"option alone": {func(o *Options) { o.Table = "world" }, "world"},
 	}
-
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			result, err := testCase.call()
-			if err != nil {
-				t.Fatalf("call: %v", err)
-			}
-			if result != (MutationResult{OK: true, Version: 8}) {
-				t.Fatalf("got %+v, want {OK:true Version:8}", result)
-			}
-			if got := server.lastPut(t); !bytes.Equal(got, testCase.want) {
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			client := newTestClient(t, server, testCase.configure)
+			if got := client.DefaultTable(); got != testCase.want {
 				t.Fatalf("got %q, want %q", got, testCase.want)
+			}
+			if _, err := client.DeleteBlock(t.Context(), "", 0, 0); err != nil {
+				t.Fatalf("DeleteBlock: %v", err)
+			}
+			if got := server.lastCommand(t); got != "DELETE BLOCK 0 0 FROM "+testCase.want {
+				t.Fatalf("got %q", got)
+			}
+			// HELLO does not name the table.
+			if got := server.commands()[0]; got != "HELLO 3 AUTH tok" {
+				t.Fatalf("got %q", got)
 			}
 		})
 	}
-
-	// The requests stayed framed: the connection still works.
-	if err := client.Ping(ctx); err != nil {
-		t.Fatalf("Ping: %v", err)
-	}
 }
 
-func TestClientPutChunkValidatesSizes(t *testing.T) {
+func TestClientValidatesBeforeSending(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
 	client := newTestClient(t, server, nil)
 	ctx := t.Context()
+	// Fetch the schema first, so every case below sends nothing.
+	if _, err := client.Schema(ctx, "world"); err != nil {
+		t.Fatalf("Schema: %v", err)
+	}
+	sent := len(server.commands())
 
 	cases := map[string]func() error{
-		"short payload": func() error {
-			_, err := client.PutChunk(ctx, 0, 0, []byte{1}, PutOptions{})
+		"multi-line statement": func() error { _, err := client.Do(ctx, "PING\r\nPING"); return err },
+		"bare LF":              func() error { _, err := client.Do(ctx, "PING\n"); return err },
+		"long statement":       func() error { _, err := client.Do(ctx, "PING "+strings.Repeat("x", 65536)); return err },
+		"bad table name":       func() error { _, err := client.DeleteBlock(ctx, "World", 0, 0); return err },
+		"injected table name":  func() error { _, err := client.GetBlock(ctx, "world COLUMNS id", 0, 0); return err },
+		"bad column name":      func() error { _, err := client.GetBlock(ctx, "world", 0, 0, "id, temp"); return err },
+		"empty set":            func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{}); return err },
+		"u10 too large":        func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"id": 1024}); return err },
+		"u10 negative":         func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"id": -1}); return err },
+		"i8 too small":         func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"temp": -129}); return err },
+		"bool as int":          func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"solid": 1}); return err },
+		"f32 out of range":     func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"h": 1e39}); return err },
+		"bits wrong width":     func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"mask": NewBits(4)}); return err },
+		"text too long": func() error {
+			_, err := client.SetBlock(ctx, "world", 0, 0, Record{"name": strings.Repeat("x", 17)})
 			return err
 		},
-		"long payload": func() error {
-			_, err := client.PutChunk(ctx, 0, 0, []byte{1, 2, 3}, PutOptions{ZRLE: true})
+		"text not UTF-8":  func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"name": "\xff"}); return err },
+		"bytes as string": func() error { _, err := client.SetBlock(ctx, "world", 0, 0, Record{"blob": "ab"}); return err },
+		"NULL in a non-NULL column": func() error {
+			_, err := client.SetBlock(ctx, "world", 0, 0, Record{"id": nil})
 			return err
 		},
-		"state payload": func() error {
-			_, err := client.PutChunkState(ctx, 0, 0, ChunkStateInput{Payload: []byte{1}, Presence: []byte{1}}, PutOptions{})
-			return err
+		"nil raw chunk":   func() error { _, err := client.SetChunkRaw(ctx, "world", 0, 0, nil); return err },
+		"negative radius": func() error { _, err := client.GetAreaAround(ctx, "world", 0, 0, -1); return err },
+		"negative limit":  func() error { _, err := client.ScanChunks(ctx, "world", nil, -1); return err },
+		"no columns":      func() error { return client.CreateTable(ctx, "t", TableSpec{ChunkWidth: 1, ChunkHeight: 1}) },
+		"bad default": func() error {
+			return client.AddColumn(ctx, "world", ColumnDef{Name: "c", Type: TypeUint(4), Default: 16})
 		},
-		"state presence": func() error {
-			_, err := client.PutChunkState(ctx, 0, 0, ChunkStateInput{Payload: []byte{1, 2}, Presence: []byte{}}, PutOptions{})
-			return err
-		},
+		"bad type":         func() error { return client.AddColumn(ctx, "world", ColumnDef{Name: "c", Type: TypeUint(65)}) },
+		"bad option value": func() error { return client.SetTableOption(ctx, "world", "checkpoint_updates", -1) },
 	}
-
 	for name, call := range cases {
 		t.Run(name, func(t *testing.T) {
-			before := len(server.commands())
 			err := call()
 			if !errors.Is(err, ErrProtocol) {
 				t.Fatalf("got %v, want ErrProtocol", err)
 			}
 			var typed *Error
-			if errors.As(err, &typed) && typed.Phase != PhaseRequest {
-				t.Fatalf("got phase %q, want %q", typed.Phase, PhaseRequest)
-			}
-			if len(server.commands()) != before {
-				t.Fatalf("client sent %q, want nothing", server.commands()[before:])
+			if !errors.As(err, &typed) || typed.Phase != PhaseRequest || typed.Command == "" {
+				t.Fatalf("got %#v, want a request error naming its command", err)
 			}
 		})
 	}
-
-	if err := client.Ping(ctx); err != nil {
-		t.Fatalf("Ping: %v", err)
-	}
-	if got := server.acceptedConns(); got != 1 {
-		t.Fatalf("got %d connections, want the first one to stay usable", got)
+	if got := server.commands(); len(got) != sent {
+		t.Fatalf("the client sent %q", got[sent:])
 	}
 }
 
-// bulkWire frames payload as a bulk response.
-func bulkWire(payload []byte) string {
-	return fmt.Sprintf("$%d\r\n%s\r\n", len(payload), payload)
-}
-
-func TestClientRejectsMalformedResponses(t *testing.T) {
-	cases := []struct {
-		name     string
-		response string
-		call     func(*Client) error
-	}{
-		{
-			name:     "chunk payload of the wrong size",
-			response: "$3\r\nabc\r\n",
-			call:     func(c *Client) error { _, err := c.GetChunk(t.Context(), 0, 0, GetOptions{}); return err },
-		},
-		{
-			name:     "chunk state of the wrong size",
-			response: "$2\r\nab\r\n",
-			call:     func(c *Client) error { _, err := c.GetChunkState(t.Context(), 0, 0, GetOptions{}); return err },
-		},
-		{
-			name:     "zrle chunk of the wrong size",
-			response: bulkWire(ZRLECompress([]byte{1})),
-			call:     func(c *Client) error { _, err := c.GetChunk(t.Context(), 0, 0, GetOptions{ZRLE: true}); return err },
-		},
-		{
-			name:     "zrle chunk that is not zrle",
-			response: "$2\r\nab\r\n",
-			call:     func(c *Client) error { _, err := c.GetChunk(t.Context(), 0, 0, GetOptions{ZRLE: true}); return err },
-		},
-		{
-			name:     "null chunk",
-			response: "$-1\r\n",
-			call:     func(c *Client) error { _, err := c.GetChunk(t.Context(), 0, 0, GetOptions{}); return err },
-		},
-		{
-			name:     "chunk exists out of range",
-			response: "+2\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkExists(t.Context(), 0, 0); return err },
-		},
-		{
-			name:     "ping with wrong text",
-			response: "+PANG\r\n",
-			call:     func(c *Client) error { return c.Ping(t.Context()) },
-		},
-		{
-			name:     "set without OK",
-			response: "+NOPE\r\n",
-			call:     func(c *Client) error { return c.Set(t.Context(), 0, 0, "1010") },
-		},
-		{
-			name:     "bulk where simple is expected",
-			response: "$2\r\nOK\r\n",
-			call:     func(c *Client) error { return c.Set(t.Context(), 0, 0, "1010") },
-		},
-		{
-			name:     "simple where bulk is expected",
-			response: "+1010\r\n",
-			call:     func(c *Client) error { _, err := c.Get(t.Context(), 0, 0); return err },
-		},
-		{
-			name:     "simple where array is expected",
-			response: "+1010\r\n",
-			call:     func(c *Client) error { _, err := c.MGet(t.Context(), []BlockRef{{}}); return err },
-		},
-		{
-			name:     "empty scan response",
-			response: "*0\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkScan(t.Context(), 1, nil); return err },
-		},
-		{
-			name:     "scan header is not END or CURSOR",
-			response: "*1\r\n$4\r\nNOPE\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkScan(t.Context(), 1, nil); return err },
-		},
-		{
-			name:     "scan entry is not a coordinate pair",
-			response: "*2\r\n$3\r\nEND\r\n$3\r\n0 x\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkScan(t.Context(), 1, nil); return err },
-		},
-		{
-			name:     "scan entry is null",
-			response: "*2\r\n$3\r\nEND\r\n$-1\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkScan(t.Context(), 1, nil); return err },
-		},
-		{
-			name:     "range with an odd item count",
-			response: "*1\r\n$3\r\n0 0\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkRange(t.Context(), 0, 0, 0, 0, GetOptions{}); return err },
-		},
-		{
-			name:     "range with a null chunk",
-			response: "*2\r\n$3\r\n0 0\r\n$-1\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkRange(t.Context(), 0, 0, 0, 0, GetOptions{}); return err },
-		},
-		{
-			name:     "range chunk of the wrong size",
-			response: "*2\r\n$3\r\n0 0\r\n$2\r\nab\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkRange(t.Context(), 0, 0, 0, 0, GetOptions{}); return err },
-		},
-		{
-			name:     "range coordinates are not a pair",
-			response: "*2\r\n$5\r\n0 0 0\r\n$3\r\nabc\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkRadius(t.Context(), 0, 0, 1, GetOptions{}); return err },
-		},
-		{
-			name:     "version is not a number",
-			response: "$3\r\nabc\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkVersion(t.Context(), 0, 0); return err },
-		},
-		{
-			name:     "put version is not a number",
-			response: "$3\r\nabc\r\n",
-			call: func(c *Client) error {
-				_, err := c.PutChunk(t.Context(), 0, 0, []byte{0, 0}, PutOptions{})
-				return err
-			},
-		},
-		{
-			name:     "coordinate is not canonical",
-			response: "*2\r\n$3\r\nEND\r\n$4\r\n01 2\r\n",
-			call:     func(c *Client) error { _, err := c.ChunkScan(t.Context(), 1, nil); return err },
-		},
-	}
-
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			server := newFakeServer(t, respondWith(testCase.response))
-			client := newTestClient(t, server, nil)
-
-			if err := testCase.call(client); !errors.Is(err, ErrProtocol) {
-				t.Fatalf("got %v, want ErrProtocol", err)
-			}
-		})
-	}
-}
-
-func TestClientValidatesArgumentsBeforeSending(t *testing.T) {
+func TestClientRefreshesTheSchemaForAnUnknownColumn(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
 	client := newTestClient(t, server, nil)
 	ctx := t.Context()
-
-	cases := []struct {
-		name string
-		call func() error
-	}{
-		{"set with non-bit payload", func() error { return client.Set(ctx, 0, 0, "10x0") }},
-		{"set with empty payload", func() error { return client.Set(ctx, 0, 0, "") }},
-		{"mset with non-bit payload", func() error { return client.MSet(ctx, []Block{{Bits: "2"}}) }},
-		{"batch with no operations", func() error {
-			_, err := client.ChunkBatch(ctx, 0, 0, nil)
-			return err
-		}},
-		{"batch with non-bit payload", func() error {
-			_, err := client.ChunkBatch(ctx, 0, 0, []BatchOperation{SetOp(0, 0, "z")})
-			return err
-		}},
-		{"batch with unknown operation", func() error {
-			_, err := client.ChunkBatch(ctx, 0, 0, []BatchOperation{{}})
-			return err
-		}},
+	if _, err := client.Schema(ctx, "world"); err != nil {
+		t.Fatalf("Schema: %v", err)
 	}
 
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			before := len(server.commands())
-			err := testCase.call()
-			if !errors.Is(err, ErrProtocol) {
-				t.Fatalf("got %v, want ErrProtocol", err)
-			}
-			var typed *Error
-			if errors.As(err, &typed) && typed.Phase != PhaseRequest {
-				t.Fatalf("got phase %q, want %q", typed.Phase, PhaseRequest)
-			}
-			if after := len(server.commands()); after != before {
-				t.Fatalf("client sent %q, want nothing", server.commands()[before:])
-			}
-		})
+	// The column may have been added since the schema was cached: the client
+	// asks once more before it gives up.
+	_, err := client.SetBlock(ctx, "world", 0, 0, Record{"nope": 1})
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Phase != PhaseRequest || !strings.Contains(typed.Message, "no column nope") {
+		t.Fatalf("got %v, want a request error", err)
+	}
+	if got := server.commands(); len(got) != 3 || got[2] != "DESCRIBE world" {
+		t.Fatalf("got %q, want HELLO and two DESCRIBE", got)
 	}
 }
 
-func TestClientEmptyBatchesSkipTheServer(t *testing.T) {
-	server := newFakeServer(t, withHello(genericHandler))
-	client := newTestClient(t, server, nil)
-
-	if err := client.MSet(t.Context(), nil); err != nil {
-		t.Fatalf("MSet: %v", err)
-	}
-	values, err := client.MGet(t.Context(), nil)
-	if err != nil {
-		t.Fatalf("MGet: %v", err)
-	}
-	if len(values) != 0 {
-		t.Fatalf("got %+v, want no values", values)
-	}
-	if commands := server.commands(); len(commands) != 1 {
-		t.Fatalf("got %q, want only HELLO", commands)
-	}
-}
-
-func TestClientChunkScan(t *testing.T) {
-	var page int
-	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, _ string) {
-		page++
-		if page == 1 {
-			writeArray(conn, "CURSOR 2 -3", "0 0", "1 -1")
-			return
+func TestClientRejectsBadTokenAndTable(t *testing.T) {
+	for _, opts := range []Options{
+		{Token: "two words"},
+		{Token: "line\r\nbreak"},
+		{URI: "chunk://h:1/Upper"},
+		{Table: "a b"},
+	} {
+		if _, err := NewClient(opts); !errors.Is(err, ErrConnection) {
+			t.Fatalf("NewClient(%+v): got %v, want ErrConnection", opts, err)
 		}
-		writeArray(conn, "END", "2 -3")
-	}))
-	client := newTestClient(t, server, nil)
-
-	first, err := client.ChunkScan(t.Context(), 2, nil)
-	if err != nil {
-		t.Fatalf("ChunkScan: %v", err)
-	}
-	if first.NextCursor == nil || *first.NextCursor != (CoordPair{CX: 2, CY: -3}) {
-		t.Fatalf("got cursor %+v, want {2 -3}", first.NextCursor)
-	}
-	want := []CoordPair{{CX: 0, CY: 0}, {CX: 1, CY: -1}}
-	if len(first.Coords) != 2 || first.Coords[0] != want[0] || first.Coords[1] != want[1] {
-		t.Fatalf("got %+v, want %+v", first.Coords, want)
-	}
-
-	second, err := client.ChunkScan(t.Context(), 2, first.NextCursor)
-	if err != nil {
-		t.Fatalf("ChunkScan: %v", err)
-	}
-	if second.NextCursor != nil {
-		t.Fatalf("got cursor %+v, want nil at the end of the scan", second.NextCursor)
-	}
-	if len(second.Coords) != 1 || second.Coords[0] != (CoordPair{CX: 2, CY: -3}) {
-		t.Fatalf("got %+v", second.Coords)
 	}
 }
 
-func TestClientVersionMismatchIsNotAnError(t *testing.T) {
-	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, _ string) {
-		writeServerError(conn, "ERR VERSION_MISMATCH current=42")
+func TestClientDo(t *testing.T) {
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, command string) {
+		switch command {
+		case "SET BLOCK 1 1 IN world name = $1, blob = $2":
+			writeRaw(conn, respInt(41))
+		case "SET BLOCK 1 1 IN world id = 1":
+			writeServerError(conn, "ERR VERSION_MISMATCH current=18446744073709551615")
+		default:
+			genericHandler(s, conn, command)
+		}
 	}))
 	client := newTestClient(t, server, nil)
-	stale := uint64(41)
 
-	result, err := client.PutChunk(t.Context(), 0, 0, []byte{1, 2}, PutOptions{IfVersion: &stale})
+	reply, err := client.Do(t.Context(), "SET BLOCK 1 1 IN world name = $1, blob = $2", []byte("x"), nil)
 	if err != nil {
-		t.Fatalf("PutChunk: %v", err)
+		t.Fatalf("Do: %v", err)
 	}
-	if result.OK || result.Version != 42 {
-		t.Fatalf("got %+v, want {OK:false Version:42}", result)
+	if version, ok := reply.Uint64(); !ok || version != 41 {
+		t.Fatalf("got %+v", reply)
 	}
-
-	result, err = client.PutChunkState(t.Context(), 0, 0, ChunkStateInput{Payload: []byte{1, 2}, Presence: []byte{1}},
-		PutOptions{IfVersion: &stale})
-	if err != nil {
-		t.Fatalf("PutChunkState: %v", err)
-	}
-	if result.OK || result.Version != 42 {
-		t.Fatalf("got %+v, want {OK:false Version:42}", result)
+	if params := server.lastParams(t); len(params) != 2 || string(params[0]) != "x" || params[1] != nil {
+		t.Fatalf("got parameters %q", params)
 	}
 
-	result, err = client.ChunkBatchIfVersion(t.Context(), 0, 0, stale, []BatchOperation{UnsetOp(0, 0)})
-	if err != nil {
-		t.Fatalf("ChunkBatchIfVersion: %v", err)
+	_, err = client.Do(t.Context(), "SET BLOCK 1 1 IN world id = 1")
+	var mismatch *VersionMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Current != math.MaxUint64 {
+		t.Fatalf("got %v, want a VersionMismatchError", err)
 	}
-	if result.OK || result.Version != 42 {
-		t.Fatalf("got %+v, want {OK:false Version:42}", result)
+}
+
+func TestClientVersionMismatchIsTyped(t *testing.T) {
+	server := newFakeServer(t, respondWithSchema("-ERR VERSION_MISMATCH current=1043\r\n"))
+	client := newTestClient(t, server, nil)
+
+	_, err := client.SetBlock(t.Context(), "world", 10, 4, Record{"id": 8}, IfVersion(1042))
+	if !errors.Is(err, ErrVersionMismatch) || !errors.Is(err, ErrServer) {
+		t.Fatalf("got %v, want ErrVersionMismatch and ErrServer", err)
+	}
+	var mismatch *VersionMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Current != 1043 {
+		t.Fatalf("got %v, want the current version 1043", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.ServerCode != CodeVersionMismatch || typed.Command != "SET BLOCK" {
+		t.Fatalf("got %#v, want the server error underneath", typed)
+	}
+	if got := server.lastCommand(t); got != "SET BLOCK 10 4 IN world id = $1 IF VERSION 1042" {
+		t.Fatalf("got %q", got)
 	}
 }
 
 func TestClientMalformedVersionMismatchIsProtocolError(t *testing.T) {
-	for _, reply := range []string{
-		"ERR VERSION_MISMATCH",
-		"ERR VERSION_MISMATCH stale",
-		"ERR VERSION_MISMATCH current=",
-		"ERR VERSION_MISMATCH current=x",
-		"ERR VERSION_MISMATCH current=42 extra",
-		"ERR VERSION_MISMATCH current=-1",
-		"ERR VERSION_MISMATCH current=18446744073709551616",
-		"ERR VERSION_MISMATCH version current=42",
-	} {
-		t.Run(reply, func(t *testing.T) {
-			server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, _ string) {
-				writeServerError(conn, reply)
+	server := newFakeServer(t, respondWith("-ERR VERSION_MISMATCH current=soon\r\n"))
+	client := newTestClient(t, server, nil)
+
+	_, err := client.DeleteBlock(t.Context(), "world", 0, 0, IfVersion(1))
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want ErrProtocol", err)
+	}
+}
+
+func TestClientGetBlockDecodesEveryType(t *testing.T) {
+	values := respArray(
+		respInt(1023), respInt(-128), respBool(true), ",1.5\r\n", ",-inf\r\n",
+		respBulk("\x05"), respBulk("it's"), respBulk("\x00\r\n"),
+	)
+	server := newFakeServer(t, respondWithSchema(values))
+	client := newTestClient(t, server, nil)
+
+	record, err := client.GetBlock(t.Context(), "world", 0, 0)
+	if err != nil {
+		t.Fatalf("GetBlock: %v", err)
+	}
+	mask, _ := ParseBits("101")
+	want := Record{
+		"id": uint64(1023), "temp": int64(-128), "solid": true, "h": float32(1.5), "d": math.Inf(-1),
+		"mask": mask, "name": "it's", "blob": []byte{0, '\r', '\n'},
+	}
+	if fmt.Sprint(record) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", record, want)
+	}
+	if record["mask"].(Bits).String() != "101" {
+		t.Fatalf("got mask %v", record["mask"])
+	}
+}
+
+func TestClientGetBlockAbsentAndNull(t *testing.T) {
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, command string) {
+		if strings.Contains(command, "BLOCK 1 1") {
+			writeRaw(conn, respArray(respNull, respNull))
+			return
+		}
+		genericHandler(s, conn, command)
+	}))
+	client := newTestClient(t, server, nil)
+
+	record, err := client.GetBlock(t.Context(), "world", 0, 0)
+	if err != nil || record != nil {
+		t.Fatalf("got %v, %v; want an absent block", record, err)
+	}
+	record, err = client.GetBlock(t.Context(), "world", 1, 1, "temp", "name")
+	if err != nil || len(record) != 2 || record["temp"] != nil || record["name"] != nil {
+		t.Fatalf("got %v, %v; want two NULL values", record, err)
+	}
+}
+
+func TestClientRejectsRepliesThatDoNotFitTheSchema(t *testing.T) {
+	cases := map[string]string{
+		"u10 out of range": respArray(respInt(1024)),
+		"text as integer":  respArray(respInt(1)),
+		"too few values":   respArray(),
+		"not an array":     respInt(1),
+	}
+	for name, reply := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, command string) {
+				if commandOf(command) == "GET BLOCK" {
+					writeRaw(conn, reply)
+					return
+				}
+				genericHandler(s, conn, command)
 			}))
 			client := newTestClient(t, server, nil)
-
-			if _, err := client.PutChunk(t.Context(), 0, 0, []byte{1, 2}, PutOptions{}); !errors.Is(err, ErrProtocol) {
-				t.Fatalf("PutChunk: got %v, want ErrProtocol", err)
+			column := "id"
+			if name == "text as integer" {
+				column = "name"
 			}
-			if _, err := client.ChunkBatchIfVersion(t.Context(), 0, 0, 1, []BatchOperation{UnsetOp(0, 0)}); !errors.Is(err, ErrProtocol) {
-				t.Fatalf("ChunkBatchIfVersion: got %v, want ErrProtocol", err)
+			if _, err := client.GetBlock(t.Context(), "world", 0, 0, column); !errors.Is(err, ErrProtocol) {
+				t.Fatalf("got %v, want ErrProtocol", err)
+			}
+			// One retry with a fresh schema, then the error.
+			describes := 0
+			for _, command := range server.commands() {
+				if commandOf(command) == "DESCRIBE" {
+					describes++
+				}
+			}
+			if describes != 2 {
+				t.Fatalf("got %d DESCRIBE, want 2", describes)
 			}
 		})
 	}
 }
 
-func TestClientMutationSuccessReturnsVersion(t *testing.T) {
-	server := newFakeServer(t, withHello(genericHandler))
-	client := newTestClient(t, server, nil)
+// schemaServer answers DESCRIBE with the current columns of a table whose
+// column h a test can change.
+type schemaServer struct {
+	mu       sync.Mutex
+	hType    string
+	version  int64
+	describe int
+	sets     int
+}
 
-	result, err := client.ChunkBatch(t.Context(), 0, 0, []BatchOperation{UnsetOp(0, 0)})
-	if err != nil {
-		t.Fatalf("ChunkBatch: %v", err)
-	}
-	if !result.OK || result.Version != 8 {
-		t.Fatalf("got %+v, want {OK:true Version:8}", result)
+func (s *schemaServer) handle(_ *fakeServer, conn net.Conn, command string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch commandOf(command) {
+	case "HELLO":
+		answerHello(conn, command)
+	case "DESCRIBE":
+		s.describe++
+		writeRaw(conn, describeReply("world", s.version, []string{
+			fakeColumn(1, "id", "u10", false, false, respNull),
+			fakeColumn(2, "h", s.hType, false, false, respNull),
+		}))
+	case "SET BLOCK":
+		s.sets++
+		if s.hType == "f64" && strings.Contains(command, "h = $") && s.describe == 1 {
+			writeServerError(conn, "ERR INVALID_ARGUMENT $1 for column h (f64) must be 8 bytes, got 4")
+			return
+		}
+		writeRaw(conn, respInt(9))
+	case "ALTER TABLE":
+		writeSimple(conn, "OK")
+	default:
+		writeServerError(conn, "ERR SYNTAX unexpected")
 	}
 }
 
-func TestClientInfo(t *testing.T) {
+func TestClientSetBlockRetriesOnceAfterAWrongSize(t *testing.T) {
+	fake := &schemaServer{hType: "f32", version: 1}
+	server := newFakeServer(t, fake.handle)
+	client := newTestClient(t, server, nil)
+	ctx := t.Context()
+
+	if _, err := client.SetBlock(ctx, "world", 0, 0, Record{"h": 1.5}); err != nil {
+		t.Fatalf("SetBlock: %v", err)
+	}
+	// Another client widens h to f64; this client's schema is now stale.
+	fake.mu.Lock()
+	fake.hType, fake.version = "f64", 2
+	fake.mu.Unlock()
+
+	version, err := client.SetBlock(ctx, "world", 0, 0, Record{"h": 2.5})
+	if err != nil || version != 9 {
+		t.Fatalf("got %d, %v; want the retried write's version", version, err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if fake.describe != 2 || fake.sets != 3 {
+		t.Fatalf("got %d DESCRIBE and %d SET BLOCK, want 2 and 3", fake.describe, fake.sets)
+	}
+	if params := server.lastParams(t); len(params) != 1 || len(params[0]) != 8 {
+		t.Fatalf("got parameters %v, want one f64", params)
+	}
+}
+
+func TestClientSetChunkReencodesAfterASchemaMismatch(t *testing.T) {
+	var mu sync.Mutex
+	schemaVersion := int64(1)
+	describes, sets := 0, 0
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, command string) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch commandOf(command) {
+		case "DESCRIBE":
+			describes++
+			writeRaw(conn, describeReply("world", schemaVersion, worldColumns))
+		case "SET CHUNK":
+			sets++
+			params := s.params[len(s.params)-1]
+			if got := int64(binary.LittleEndian.Uint64(params[0][8:])); got != schemaVersion {
+				writeServerError(conn, fmt.Sprintf("ERR SCHEMA_MISMATCH current=%d the chunk was encoded for schema version %d", schemaVersion, got))
+				return
+			}
+			writeRaw(conn, respInt(5))
+		}
+	}))
+	client := newTestClient(t, server, nil)
+	ctx := t.Context()
+
+	schema, err := client.Schema(ctx, "world")
+	if err != nil {
+		t.Fatalf("Schema: %v", err)
+	}
+	chunk := NewChunk(schema)
+	chunk.SetBlock(0, 0, Record{"id": 1, "name": "n"})
+	form, _ := EncodeChunk(schema, chunk)
+
+	// Another client changes the table: the cached schema is version 1, the
+	// table's version 2.
+	mu.Lock()
+	schemaVersion = 2
+	mu.Unlock()
+	version, err := client.SetChunk(ctx, "world", 0, 0, chunk)
+	if err != nil || version != 5 {
+		t.Fatalf("got %d, %v; want the re-encoded write's version", version, err)
+	}
+	mu.Lock()
+	if describes != 2 || sets != 2 {
+		t.Fatalf("got %d DESCRIBE and %d SET CHUNK, want 2 and 2", describes, sets)
+	}
+	mu.Unlock()
+
+	// A raw form is sent as it is.
+	_, err = client.SetChunkRaw(ctx, "world", 0, 0, form)
+	var mismatch *SchemaMismatchError
+	if !errors.As(err, &mismatch) || mismatch.Current != 2 || !errors.Is(err, ErrSchemaMismatch) || !errors.Is(err, ErrServer) {
+		t.Fatalf("got %v, want a SchemaMismatchError at version 2", err)
+	}
+	if errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("got %v, want it not to match ErrVersionMismatch", err)
+	}
+}
+
+func TestClientDropsTheConnectionWhenTheServerCloses(t *testing.T) {
+	cases := []struct {
+		name   string
+		reply  string
+		params bool
+		closes bool
+	}{
+		{"bad request", "ERR BAD_REQUEST line too long", false, true},
+		{"no table with parameters", "ERR NO_TABLE table 'x' does not exist", true, true},
+		{"syntax with parameters", "ERR SYNTAX column 5: a parameter is $ followed by its number", true, true},
+		{"unknown column with parameters", "ERR INVALID_ARGUMENT the table has no column x", true, true},
+		{"no table without parameters", "ERR NO_TABLE table 'x' does not exist", false, false},
+		{"wrong size", "ERR INVALID_ARGUMENT $1 for column a (u8) must be 8 bytes, got 1", true, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
+				if command == "PING" {
+					writeSimple(conn, "PONG")
+					return
+				}
+				// The server answers without closing; the client must not
+				// rely on it.
+				writeServerError(conn, testCase.reply)
+			}))
+			client := newTestClient(t, server, nil)
+			var params [][]byte
+			statement := "DELETE BLOCK 0 0 FROM x"
+			if testCase.params {
+				statement, params = "SET BLOCK 0 0 IN x a = $1", [][]byte{{1}}
+			}
+			if _, err := client.Do(t.Context(), statement, params...); !errors.Is(err, ErrServer) {
+				t.Fatalf("got %v, want the server error", err)
+			}
+			if err := client.Ping(t.Context()); err != nil {
+				t.Fatalf("Ping: %v", err)
+			}
+			want := 1
+			if testCase.closes {
+				want = 2
+			}
+			if got := server.acceptedConns(); got != want {
+				t.Fatalf("got %d connections, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestClientForgetsSchemaAfterTableStatements(t *testing.T) {
+	fake := &schemaServer{hType: "f32", version: 1}
+	server := newFakeServer(t, fake.handle)
+	client := newTestClient(t, server, nil)
+	ctx := t.Context()
+
+	describes := func() int {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return fake.describe
+	}
+	if _, err := client.Schema(ctx, "world"); err != nil {
+		t.Fatalf("Schema: %v", err)
+	}
+	if _, err := client.Schema(ctx, "world"); err != nil || describes() != 1 {
+		t.Fatalf("got %v and %d DESCRIBE, want the cached schema", err, describes())
+	}
+	if err := client.AlterColumnType(ctx, "world", "h", TypeF64(), ConvertNone); err != nil {
+		t.Fatalf("AlterColumnType: %v", err)
+	}
+	if _, err := client.Schema(ctx, "world"); err != nil || describes() != 2 {
+		t.Fatalf("got %v and %d DESCRIBE, want a fresh schema after ALTER", err, describes())
+	}
+	if _, err := client.Do(ctx, "alter table world set checkpoint_updates = 1"); err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if _, err := client.Schema(ctx, "world"); err != nil || describes() != 3 {
+		t.Fatalf("got %v and %d DESCRIBE, want a fresh schema after ALTER through Do", err, describes())
+	}
+	if _, err := client.Describe(ctx, "world"); err != nil || describes() != 4 {
+		t.Fatalf("got %v and %d DESCRIBE, want Describe to ask the server", err, describes())
+	}
+}
+
+func TestClientSchemaIsParsedAndCopied(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
 	client := newTestClient(t, server, nil)
 
-	info, err := client.Info(t.Context())
+	schema, err := client.Schema(t.Context(), "land")
 	if err != nil {
-		t.Fatalf("Info: %v", err)
+		t.Fatalf("Schema: %v", err)
 	}
-	if info.Raw != genericInfo {
-		t.Fatalf("got raw %q", info.Raw)
+	if schema.Table != "land" || schema.Version != 1 || len(schema.Columns) != 8 || schema.ChunkWidth != 2 ||
+		schema.ChunkHeight != 2 || schema.LargeWidth != 8 || schema.LargeHeight != 8 {
+		t.Fatalf("got %+v", schema)
 	}
-	if info.Values["table"] != "default" {
-		t.Fatalf("got table %q, want default", info.Values["table"])
+	want := TableOptions{
+		DurabilityMode: "relaxed", CheckpointUpdates: 256, CheckpointWalBytes: 1 << 20,
+		WalGroupCommitUpdates: 8, CheckpointCompression: "none", VarMaxChunkBytes: 1 << 20,
+	}
+	if schema.Options != want {
+		t.Fatalf("got options %+v", schema.Options)
+	}
+	id, _ := schema.Column("id")
+	h, _ := schema.Column("h")
+	mask, _ := schema.Column("mask")
+	if id.ID != 1 || mask.ID != 6 || id.Type != TypeUint(10) || !id.Required || id.Null || id.Default != nil ||
+		h.Default != float32(1.5) || mask.Type != TypeBits(3) || !mask.Null {
+		t.Fatalf("got columns %+v", schema.Columns)
+	}
+	schema.Columns[0].Name = "changed"
+	again, _ := client.Schema(t.Context(), "land")
+	if again.Columns[0].Name != "id" {
+		t.Fatal("changing a returned schema changed the cache")
+	}
+}
+
+func TestClientPipelinedRepliesKeepOrder(t *testing.T) {
+	// Each GET BLOCK x is answered with x, in arrival order, while up to 8
+	// requests are in flight.
+	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
+		if commandOf(command) == "DESCRIBE" {
+			writeRaw(conn, describeReply("world", 1, []string{fakeColumn(1, "v", "i64", false, false, respNull)}))
+			return
+		}
+		writeRaw(conn, respArray(":"+strings.Fields(command)[2]+"\r\n"))
+	}))
+	client := newTestClient(t, server, func(o *Options) { o.PipelineDepth = 8 })
+
+	var group sync.WaitGroup
+	for i := range 64 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			record, err := client.GetBlock(t.Context(), "world", int64(i), 0)
+			if err != nil || record["v"] != int64(i) {
+				t.Errorf("block %d: got %v, %v", i, record, err)
+			}
+		}()
+	}
+	group.Wait()
+	if got := server.acceptedConns(); got != 1 {
+		t.Fatalf("got %d connections, want 1", got)
 	}
 }
 
@@ -1391,11 +1180,11 @@ func TestClientConcurrentUseIsSerialized(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			if err := client.Set(t.Context(), int64(i), 0, "1010"); err != nil {
-				t.Errorf("Set: %v", err)
+			if _, err := client.SetBlock(t.Context(), "world", int64(i), 0, Record{"id": i}); err != nil {
+				t.Errorf("SetBlock: %v", err)
 			}
-			if _, err := client.Get(t.Context(), int64(i), 0); err != nil {
-				t.Errorf("Get: %v", err)
+			if _, err := client.GetBlock(t.Context(), "world", int64(i), 0); err != nil {
+				t.Errorf("GetBlock: %v", err)
 			}
 		}()
 	}
@@ -1443,13 +1232,13 @@ func TestClientOptionResolution(t *testing.T) {
 		},
 		{
 			name: "uri",
-			opts: Options{URI: "chunks://tok@example.test:9000/"},
-			want: URI{Scheme: "chunks", Secure: true, Host: "example.test", Port: 9000, Token: "tok", Path: "/"},
+			opts: Options{URI: "chunks://tok@example.test:9000/terrain"},
+			want: URI{Scheme: "chunks", Secure: true, Host: "example.test", Port: 9000, Token: "tok", Path: "/terrain"},
 		},
 		{
 			name: "explicit fields win over uri",
-			opts: Options{URI: "chunk://tok@example.test:9000/", Host: "other.test", Port: 1, Token: "override"},
-			want: URI{Scheme: "chunk", Host: "other.test", Port: 1, Token: "override", Path: "/"},
+			opts: Options{URI: "chunk://tok@example.test:9000/", Host: "other.test", Port: 1, Token: "override", Table: "world"},
+			want: URI{Scheme: "chunk", Host: "other.test", Port: 1, Token: "override", Path: "/world"},
 		},
 		{
 			name: "tls option upgrades a chunk uri",

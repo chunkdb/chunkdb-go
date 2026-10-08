@@ -27,8 +27,8 @@ type PoolOptions struct {
 // Pool is a fixed-size set of [Client] connections leased per operation.
 //
 // It is the recommended way to run concurrent workloads: the protocol has no
-// request multiplexing, so parallelism comes from multiple sockets. A Pool is
-// safe for concurrent use.
+// request multiplexing, so parallelism comes from multiple sockets. Each
+// client keeps its own schema cache. A Pool is safe for concurrent use.
 type Pool struct {
 	clientOpts     Options
 	maxConnections int
@@ -272,117 +272,101 @@ func isTransportFailure(err error) bool {
 	return errors.Is(err, ErrConnection) || errors.Is(err, ErrTimeout) || errors.Is(err, ErrTLS)
 }
 
+// Do runs [Client.Do] on a leased client.
+func (p *Pool) Do(ctx context.Context, statement string, params ...[]byte) (Reply, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (Reply, error) {
+		return c.Do(ctx, statement, params...)
+	})
+}
+
 // Ping runs [Client.Ping] on a leased client.
 func (p *Pool) Ping(ctx context.Context) error {
 	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Ping(ctx) })
 }
 
-// Info runs [Client.Info] on a leased client.
-func (p *Pool) Info(ctx context.Context) (Info, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (Info, error) { return c.Info(ctx) })
+// GetBlock runs [Client.GetBlock] on a leased client.
+func (p *Pool) GetBlock(ctx context.Context, table string, x, y int64, columns ...string) (Record, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (Record, error) {
+		return c.GetBlock(ctx, table, x, y, columns...)
+	})
 }
 
-// Get runs [Client.Get] on a leased client.
-func (p *Pool) Get(ctx context.Context, x, y int64) (BlockState, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (BlockState, error) { return c.Get(ctx, x, y) })
+// SetBlock runs [Client.SetBlock] on a leased client.
+func (p *Pool) SetBlock(ctx context.Context, table string, x, y int64, values Record, opts ...WriteOption) (uint64, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+		return c.SetBlock(ctx, table, x, y, values, opts...)
+	})
 }
 
-// Set runs [Client.Set] on a leased client.
-func (p *Pool) Set(ctx context.Context, x, y int64, bits string) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Set(ctx, x, y, bits) })
-}
-
-// Unset runs [Client.Unset] on a leased client.
-func (p *Pool) Unset(ctx context.Context, x, y int64) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.Unset(ctx, x, y) })
-}
-
-// MSet runs [Client.MSet] on a leased client.
-func (p *Pool) MSet(ctx context.Context, blocks []Block) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.MSet(ctx, blocks) })
-}
-
-// MGet runs [Client.MGet] on a leased client.
-func (p *Pool) MGet(ctx context.Context, blocks []BlockRef) ([]BlockState, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]BlockState, error) { return c.MGet(ctx, blocks) })
-}
-
-// ChunkExists runs [Client.ChunkExists] on a leased client.
-func (p *Pool) ChunkExists(ctx context.Context, cx, cy int64) (bool, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (bool, error) { return c.ChunkExists(ctx, cx, cy) })
+// DeleteBlock runs [Client.DeleteBlock] on a leased client.
+func (p *Pool) DeleteBlock(ctx context.Context, table string, x, y int64, opts ...WriteOption) (uint64, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+		return c.DeleteBlock(ctx, table, x, y, opts...)
+	})
 }
 
 // GetChunk runs [Client.GetChunk] on a leased client.
-func (p *Pool) GetChunk(ctx context.Context, cx, cy int64, opts GetOptions) ([]byte, error) {
+func (p *Pool) GetChunk(ctx context.Context, table string, cx, cy int64, columns ...string) (*Chunk, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (*Chunk, error) {
+		return c.GetChunk(ctx, table, cx, cy, columns...)
+	})
+}
+
+// GetChunkRaw runs [Client.GetChunkRaw] on a leased client.
+func (p *Pool) GetChunkRaw(ctx context.Context, table string, cx, cy int64, columns ...string) ([]byte, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) {
-		return c.GetChunk(ctx, cx, cy, opts)
+		return c.GetChunkRaw(ctx, table, cx, cy, columns...)
 	})
 }
 
-// GetChunkState runs [Client.GetChunkState] on a leased client.
-func (p *Pool) GetChunkState(ctx context.Context, cx, cy int64, opts GetOptions) (ChunkState, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ChunkState, error) {
-		return c.GetChunkState(ctx, cx, cy, opts)
+// SetChunk runs [Client.SetChunk] on a leased client.
+func (p *Pool) SetChunk(ctx context.Context, table string, cx, cy int64, chunk *Chunk, opts ...WriteOption) (uint64, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+		return c.SetChunk(ctx, table, cx, cy, chunk, opts...)
 	})
 }
 
-// PutChunk runs [Client.PutChunk] on a leased client.
-func (p *Pool) PutChunk(ctx context.Context, cx, cy int64, payload []byte, opts PutOptions) (MutationResult, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.PutChunk(ctx, cx, cy, payload, opts)
+// SetChunkRaw runs [Client.SetChunkRaw] on a leased client.
+func (p *Pool) SetChunkRaw(ctx context.Context, table string, cx, cy int64, form []byte, opts ...WriteOption) (uint64, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+		return c.SetChunkRaw(ctx, table, cx, cy, form, opts...)
 	})
 }
 
-// PutChunkState runs [Client.PutChunkState] on a leased client.
-func (p *Pool) PutChunkState(ctx context.Context, cx, cy int64, state ChunkStateInput, opts PutOptions) (MutationResult, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.PutChunkState(ctx, cx, cy, state, opts)
+// GetArea runs [Client.GetArea] on a leased client.
+func (p *Pool) GetArea(ctx context.Context, table string, cx0, cy0, cx1, cy1 int64, columns ...string) ([]AreaChunk, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]AreaChunk, error) {
+		return c.GetArea(ctx, table, cx0, cy0, cx1, cy1, columns...)
 	})
 }
 
-// ChunkScan runs [Client.ChunkScan] on a leased client.
-func (p *Pool) ChunkScan(ctx context.Context, limit int, cursor *CoordPair) (ScanResult, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ScanResult, error) {
-		return c.ChunkScan(ctx, limit, cursor)
+// GetAreaAround runs [Client.GetAreaAround] on a leased client.
+func (p *Pool) GetAreaAround(ctx context.Context, table string, cx, cy, radius int64, columns ...string) ([]AreaChunk, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]AreaChunk, error) {
+		return c.GetAreaAround(ctx, table, cx, cy, radius, columns...)
 	})
 }
 
-// ChunkRange runs [Client.ChunkRange] on a leased client.
-func (p *Pool) ChunkRange(ctx context.Context, cx0, cy0, cx1, cy1 int64, opts GetOptions) ([]RangeEntry, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]RangeEntry, error) {
-		return c.ChunkRange(ctx, cx0, cy0, cx1, cy1, opts)
+// ScanChunks runs [Client.ScanChunks] on a leased client.
+func (p *Pool) ScanChunks(ctx context.Context, table string, after *ChunkCoord, limit int) (ScanPage, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ScanPage, error) {
+		return c.ScanChunks(ctx, table, after, limit)
 	})
 }
 
-// ChunkRadius runs [Client.ChunkRadius] on a leased client.
-func (p *Pool) ChunkRadius(ctx context.Context, cx, cy int64, radiusChunks int, opts GetOptions) ([]RangeEntry, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]RangeEntry, error) {
-		return c.ChunkRadius(ctx, cx, cy, radiusChunks, opts)
-	})
+// Describe runs [Client.Describe] on a leased client.
+func (p *Pool) Describe(ctx context.Context, table string) (*Schema, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (*Schema, error) { return c.Describe(ctx, table) })
 }
 
-// ChunkVersion runs [Client.ChunkVersion] on a leased client.
-func (p *Pool) ChunkVersion(ctx context.Context, cx, cy int64) (uint64, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) { return c.ChunkVersion(ctx, cx, cy) })
+// Tables runs [Client.Tables] on a leased client.
+func (p *Pool) Tables(ctx context.Context) ([]string, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]string, error) { return c.Tables(ctx) })
 }
 
-// ChunkBatch runs [Client.ChunkBatch] on a leased client.
-func (p *Pool) ChunkBatch(ctx context.Context, cx, cy int64, operations []BatchOperation) (MutationResult, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.ChunkBatch(ctx, cx, cy, operations)
-	})
-}
-
-// ChunkBatchIfVersion runs [Client.ChunkBatchIfVersion] on a leased client.
-func (p *Pool) ChunkBatchIfVersion(ctx context.Context, cx, cy int64, expectedVersion uint64, operations []BatchOperation) (MutationResult, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (MutationResult, error) {
-		return c.ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations)
-	})
-}
-
-// WALFlush runs [Client.WALFlush] on a leased client.
-func (p *Pool) WALFlush(ctx context.Context) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.WALFlush(ctx) })
+// FlushWAL runs [Client.FlushWAL] on a leased client.
+func (p *Pool) FlushWAL(ctx context.Context) error {
+	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.FlushWAL(ctx) })
 }
 
 // Metrics runs [Client.Metrics] on a leased client.

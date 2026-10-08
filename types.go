@@ -10,6 +10,9 @@ const (
 	defaultHost = "127.0.0.1"
 	// DefaultPort is the chunkdb server port used when a URI omits one.
 	DefaultPort = 4242
+	// DefaultTableName is the table a client works on when neither
+	// [Options.Table] nor the URI path names one.
+	DefaultTableName = "default"
 )
 
 // Options configure a [Client].
@@ -18,19 +21,20 @@ const (
 // falls back to URI and then to the package default.
 type Options struct {
 	// URI is a chunk:// or chunks:// endpoint, optionally carrying the token
-	// as its userinfo component.
+	// as its userinfo component and the default table as its path.
 	URI string
 
 	Host string
 	Port int
-	// Token is sent as HELLO 2 AUTH <token> when a connection opens.
+	// Token is sent as HELLO 3 AUTH <token> when a connection opens. It must
+	// not contain spaces or control characters.
 	Token string
 
-	// ConnectTimeout bounds establishing the socket and completing the TLS
-	// handshake. Zero means [DefaultTimeout]; a negative value disables the
+	// ConnectTimeout bounds establishing the socket, the TLS handshake and
+	// HELLO. Zero means [DefaultTimeout]; a negative value disables the
 	// client-side deadline and leaves cancellation to the caller's context.
 	ConnectTimeout time.Duration
-	// CommandTimeout bounds waiting for one command response. Zero means
+	// CommandTimeout bounds waiting for one reply. Zero means
 	// [DefaultTimeout]; a negative value disables the client-side deadline.
 	CommandTimeout time.Duration
 
@@ -47,213 +51,141 @@ type Options struct {
 	Key  []byte
 
 	// PipelineDepth caps concurrent in-flight requests on one connection.
-	// Zero and one both mean sequential request/response.
+	// Zero and one both mean sequential request/reply.
 	PipelineDepth int
 
-	// Table is the table the connection works on, named in HELLO when
-	// connecting and reconnecting. Empty means the URI path
-	// (chunk://host:4242/terrain), then the server's default table.
+	// Table is the client's default table: the one a method uses when its
+	// table argument is "". Empty means the URI path
+	// (chunk://host:4242/terrain), then [DefaultTableName]. Every statement
+	// names its table on the wire.
 	Table string
 }
 
-// TableOptions are the options of a table. In [Client.SetTableOptions] and
-// [TableSpec], a zero field leaves the option unchanged (or at the server's
-// default for a new table).
-type TableOptions struct {
-	// DurabilityMode is "relaxed", "fsync-wal" or "fsync-checkpoint".
-	DurabilityMode        string
-	CheckpointUpdates     int
-	CheckpointWalBytes    int
-	WalGroupCommitUpdates int
-	// CheckpointCompression is "none" or "zrle".
-	CheckpointCompression string
-}
-
-// TableSpec describes a new table for [Client.CreateTable]. Its geometry is
-// fixed once the table exists. Zero chunk and large-chunk sizes take the
-// server defaults (16x16 blocks, 8x8 chunks).
-type TableSpec struct {
-	BlockBits              int
-	ChunkWidthBlocks       int
-	ChunkHeightBlocks      int
-	LargeChunkWidthChunks  int
-	LargeChunkHeightChunks int
-	Options                TableOptions
-}
-
-// TableInfo is the geometry, options and identity of a table, as HELLO,
-// TABLEINFO and USE report them.
-type TableInfo struct {
-	Name string
-	// StoreID changes when a table is dropped and created again under the
-	// same name.
-	StoreID                string
-	BlockBits              int
-	ChunkWidthBlocks       int
-	ChunkHeightBlocks      int
-	LargeChunkWidthChunks  int
-	LargeChunkHeightChunks int
-	Options                TableOptions
-	// Values holds every key/value line of the reply.
-	Values map[string]string
-}
-
-// HelloInfo is the server's reply to the HELLO handshake that opens every
+// ServerInfo is the server's reply to the HELLO 3 handshake that opens every
 // connection.
-type HelloInfo struct {
-	// Protocol is the protocol version, always 2.
+type ServerInfo struct {
+	// Protocol is the protocol version, always 3.
 	Protocol      int
 	ServerVersion string
-	// Capabilities lists optional features, for example "zrle".
-	Capabilities []string
-	// MaxLineBytes bounds one request line.
+	// MaxLineBytes bounds one statement line, CRLF included.
 	MaxLineBytes int
-	// MaxAreaChunks is the most chunks one [Client.ChunkRange] or
-	// [Client.ChunkRadius] call may cover.
+	// MaxParameters is the most parameters one statement takes.
+	MaxParameters int
+	// MaxAreaChunks is the most chunks one [Client.GetArea] or
+	// [Client.GetAreaAround] covers.
 	MaxAreaChunks int
-	// MaxResponseBytes caps a [Client.ChunkRange] or [Client.ChunkRadius]
-	// response.
+	// MaxResponseBytes caps the reply of one area read.
 	MaxResponseBytes int
-	// MaxScanLimit is the largest [Client.ChunkScan] limit.
+	// MaxScanLimit is the largest [Client.ScanChunks] limit.
 	MaxScanLimit int
-	// MaxBatchOps is the most operations one [Client.ChunkBatch] may carry.
-	MaxBatchOps int
-	// Table is the connection's table at HELLO time, or nil when the
-	// connection has none (the server has no default table and none was
-	// named). [Client.Use] reports later selections.
-	Table *TableInfo
-	// Values holds every key/value line of the reply.
-	Values map[string]string
 }
 
-// Info is the parsed result of the INFO command: runtime statistics of the
-// selected table.
-type Info struct {
-	// Raw is the server payload exactly as received.
-	Raw string
-	// Values holds the parsed key/value pairs.
-	Values map[string]string
-}
+// Record is one block: column name to value. See [EncodeValue] for the Go
+// types each column type takes and returns.
+type Record map[string]any
 
-// BlockState is one block as read by [Client.Get] and [Client.MGet].
-//
-// An unset block reports Exists false and an empty Bits; an explicitly stored
-// all-zero block reports Exists true with an all-zero Bits string.
-type BlockState struct {
-	Exists bool
-	Bits   string
-}
-
-// ChunkState is a chunk's binary state, as read by [Client.GetChunkState].
-//
-// Payload holds the packed block bits: bit i of the chunk is
-// payload[i/8] >> (i%8) & 1. Presence holds one bit per block, laid out the
-// same way, set when the block is explicitly present. Exists reports whether
-// any presence bit is set.
-type ChunkState struct {
-	Exists   bool
-	Payload  []byte
-	Presence []byte
-}
-
-// ChunkStateInput is the chunk state written by [Client.PutChunkState], in
-// the layout of [ChunkState].
-type ChunkStateInput struct {
-	Payload  []byte
-	Presence []byte
-}
-
-// GetOptions configure a chunk read.
-type GetOptions struct {
-	// ZRLE transfers the chunk zrle-compressed. The client decompresses it
-	// and checks its size.
-	ZRLE bool
-}
-
-// PutOptions configure a chunk write.
-type PutOptions struct {
-	// IfVersion, when set, applies the write only if the chunk's current
-	// version equals it.
-	IfVersion *uint64
-	// ZRLE sends the chunk zrle-compressed when that is smaller than the raw
-	// bytes, and raw otherwise.
-	ZRLE bool
-}
-
-// Block is one item of a batch write.
-type Block struct {
-	X    int64
-	Y    int64
-	Bits string
-}
-
-// BlockRef is one item of a batch read.
-type BlockRef struct {
-	X int64
-	Y int64
-}
-
-// CoordPair is a chunk coordinate.
-type CoordPair struct {
+// ChunkCoord is a chunk coordinate; chunk coordinates count chunks, not
+// blocks.
+type ChunkCoord struct {
 	CX int64
 	CY int64
 }
 
-// ScanResult is the result of [Client.ChunkScan].
-type ScanResult struct {
-	Coords []CoordPair
-	// NextCursor is nil once the scan is exhausted; otherwise pass it back to
-	// [Client.ChunkScan] to continue.
-	NextCursor *CoordPair
+// AreaChunk is one chunk of an area read.
+type AreaChunk struct {
+	CX    int64
+	CY    int64
+	Chunk *Chunk
 }
 
-// RangeEntry is one populated chunk returned by [Client.ChunkRange] or
-// [Client.ChunkRadius], with its state in the layout of [ChunkState].
-type RangeEntry struct {
-	CX       int64
-	CY       int64
-	Payload  []byte
-	Presence []byte
+// ScanPage is one page of [Client.ScanChunks].
+type ScanPage struct {
+	// Chunks are the chunks with a present block, in ascending CX then CY.
+	Chunks []ChunkCoord
+	// More reports whether chunks follow the last one; pass the last one as
+	// the next call's after.
+	More bool
 }
 
-// BatchOpType selects the operation performed by a [BatchOperation].
-type BatchOpType int
+// WriteOption configures a write.
+type WriteOption func(*writeOptions)
+
+type writeOptions struct {
+	ifVersion *uint64
+}
+
+// IfVersion makes a write conditional: it applies only while the chunk is
+// still at version, and fails with a [*VersionMismatchError] otherwise. The
+// version belongs to the whole chunk, so a block write also fails when
+// another block of the chunk changed.
+func IfVersion(version uint64) WriteOption {
+	return func(o *writeOptions) { o.ifVersion = &version }
+}
+
+func resolveWriteOptions(opts []WriteOption) writeOptions {
+	var resolved writeOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&resolved)
+		}
+	}
+	return resolved
+}
+
+// TableOptions are the options of a table. In a [TableSpec], a zero field
+// takes the server's default.
+type TableOptions struct {
+	// DurabilityMode is "relaxed", "fsync-wal" or "fsync-checkpoint".
+	DurabilityMode        string
+	CheckpointUpdates     uint64
+	CheckpointWalBytes    uint64
+	WalGroupCommitUpdates uint64
+	// CheckpointCompression is "none" or "zrle".
+	CheckpointCompression string
+	// VarMaxChunkBytes is the most bytes of text and bytes values one chunk
+	// holds, counting 12 bytes per value.
+	VarMaxChunkBytes uint64
+}
+
+// ColumnDef is a column of [TableSpec] or [Client.AddColumn].
+type ColumnDef struct {
+	Name string
+	Type ColumnType
+	// Null lets the column hold NULL.
+	Null bool
+	// Required makes a new block give the column a value.
+	Required bool
+	// Default is the value a new block takes when it does not give one; nil
+	// means none. It takes the Go types [EncodeValue] lists.
+	Default any
+}
+
+// TableSpec describes a new table for [Client.CreateTable].
+type TableSpec struct {
+	Columns []ColumnDef
+	// ChunkWidth and ChunkHeight are the blocks of a chunk; both are
+	// required.
+	ChunkWidth  int
+	ChunkHeight int
+	// LargeWidth and LargeHeight are the chunks of a large chunk (one file
+	// group on disk); zero takes the server's default.
+	LargeWidth  int
+	LargeHeight int
+	Options     TableOptions
+}
+
+// Conversion is how [Client.AlterColumnType] converts stored values that the
+// new type cannot hold.
+type Conversion int
 
 const (
-	// BatchSet writes one block.
-	BatchSet BatchOpType = iota + 1
-	// BatchUnset clears explicit presence for one block.
-	BatchUnset
+	// ConvertNone widens, or narrows after the server checked every stored
+	// value; the first value that does not fit fails the statement.
+	ConvertNone Conversion = iota
+	// ConvertClamp converts numbers to the nearest value.
+	ConvertClamp
+	// ConvertDefault converts to the column's default.
+	ConvertDefault
+	// ConvertTruncate cuts text, bytes and bits.
+	ConvertTruncate
 )
-
-// BatchOperation is one block operation inside a [Client.ChunkBatch] call.
-type BatchOperation struct {
-	Type BatchOpType
-	X    int64
-	Y    int64
-	// Bits is used by [BatchSet] only.
-	Bits string
-}
-
-// SetOp returns a [BatchSet] operation.
-func SetOp(x, y int64, bits string) BatchOperation {
-	return BatchOperation{Type: BatchSet, X: x, Y: y, Bits: bits}
-}
-
-// UnsetOp returns a [BatchUnset] operation.
-func UnsetOp(x, y int64) BatchOperation {
-	return BatchOperation{Type: BatchUnset, X: x, Y: y}
-}
-
-// MutationResult is the result of a chunk write ([Client.PutChunk],
-// [Client.PutChunkState], [Client.ChunkBatch]).
-//
-// Version is the chunk's version after the write. Versions are opaque tokens:
-// they change on every content mutation and survive eviction and restart; a
-// write that does not change the chunk keeps its version. When a conditional
-// write's version does not match, OK is false and Version is the chunk's
-// current version; the chunk is unchanged.
-type MutationResult struct {
-	OK      bool
-	Version uint64
-}

@@ -7,17 +7,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"maps"
 	"net"
-	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // protocolVersion is the chunkdb protocol this client speaks.
-const protocolVersion = 2
+const protocolVersion = 3
 
 type resolvedOptions struct {
 	uri            URI
@@ -68,12 +66,19 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		scheme = "chunks"
 	}
 
+	if strings.ContainsFunc(token, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) {
+		return resolvedOptions{}, connectionErrorf("", nil, "the token must not contain spaces or control characters")
+	}
+
 	table := opts.Table
 	if table == "" {
 		var err error
 		if table, err = TableFromPath(parsed.Path); err != nil {
 			return resolvedOptions{}, err
 		}
+	}
+	if table != "" && !isName(table) {
+		return resolvedOptions{}, connectionErrorf("", nil, "invalid table name %q: names are [a-z_][a-z0-9_]*", table)
 	}
 
 	return resolvedOptions{
@@ -102,17 +107,16 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 //
 // A Client is safe for concurrent use. By default it sends one request at a
 // time; raise [Options.PipelineDepth] to keep several requests in flight on the
-// same socket. The connection is established lazily and re-established on the
-// next request after a transport failure, but no request is ever retried
-// automatically.
+// same socket, whose replies come back in request order. The connection is
+// established lazily and re-established on the next request after a transport
+// failure. A request is never resent after a transport failure; the one retry
+// a client makes is described at [Client.SetBlock].
+//
+// A client keeps the schemas of the tables it uses, to encode and decode
+// values; see [Client.Schema].
 type Client struct {
-	// options is what the client was built with; [Client.Table] reuses it.
-	options Options
-	opts    resolvedOptions
-	slots   chan struct{}
-	// exclusiveMu lets one caller at a time collect every slot, so two
-	// exclusive callers cannot each hold part of them.
-	exclusiveMu sync.Mutex
+	opts  resolvedOptions
+	slots chan struct{}
 	// dialGate serializes connection attempts so concurrent callers share one
 	// dial instead of opening redundant sockets.
 	dialGate chan struct{}
@@ -123,12 +127,11 @@ type Client struct {
 
 	// hello is the reply to the most recent successful handshake.
 	helloMu sync.Mutex
-	hello   *HelloInfo
+	hello   *ServerInfo
 
-	// table is the selected table, empty for the server's default. Every
-	// new connection names it in HELLO.
-	tableMu sync.Mutex
-	table   string
+	// schemas caches DESCRIBE replies by table name.
+	schemaMu sync.Mutex
+	schemas  map[string]*Schema
 }
 
 // NewClient builds a client without connecting. The connection is opened on
@@ -139,18 +142,17 @@ func NewClient(opts Options) (*Client, error) {
 		return nil, err
 	}
 	return &Client{
-		options:  opts,
 		opts:     resolved,
 		slots:    make(chan struct{}, resolved.pipelineDepth),
 		dialGate: make(chan struct{}, 1),
-		table:    resolved.table,
+		schemas:  make(map[string]*Schema),
 	}, nil
 }
 
 // Connect builds a client and opens its connection. Every connection starts
-// with the HELLO 2 handshake, which carries the token and the table; a wrong
-// or missing token fails with [ErrAuth], an unknown table with [CodeNoTable],
-// and a server that does not speak protocol 2 with [ErrProtocol].
+// with the HELLO 3 handshake, which carries the token; a wrong or missing
+// token fails with [ErrAuth], and a server of an older chunkdb protocol with
+// [ErrProtocol].
 func Connect(ctx context.Context, opts Options) (*Client, error) {
 	client, err := NewClient(opts)
 	if err != nil {
@@ -168,26 +170,29 @@ func ConnectURI(ctx context.Context, uri string) (*Client, error) {
 	return Connect(ctx, Options{URI: uri})
 }
 
-// URI reports the resolved endpoint, with the selected table as its path. Note
-// that [URI.String] renders the token into the userinfo component.
+// URI reports the resolved endpoint, with the default table as its path when
+// one was configured. Note that [URI.String] renders the token into the
+// userinfo component.
 func (c *Client) URI() URI {
-	uri := c.opts.uri
-	uri.Path = "/" + c.selectedTable()
-	return uri
+	return c.opts.uri
 }
 
-func (c *Client) selectedTable() string {
-	c.tableMu.Lock()
-	defer c.tableMu.Unlock()
-	return c.table
+// DefaultTable reports the table a method uses when its table argument is "":
+// [Options.Table], else the URI path, else [DefaultTableName].
+func (c *Client) DefaultTable() string {
+	return cmp.Or(c.opts.table, DefaultTableName)
 }
 
 // ServerInfo returns the server's HELLO reply for the most recent connection,
 // or nil before the first successful connection. The result is a copy.
-func (c *Client) ServerInfo() *HelloInfo {
+func (c *Client) ServerInfo() *ServerInfo {
 	c.helloMu.Lock()
 	defer c.helloMu.Unlock()
-	return c.hello.clone()
+	if c.hello == nil {
+		return nil
+	}
+	info := *c.hello
+	return &info
 }
 
 // Connect opens the connection if it is not already established.
@@ -223,31 +228,6 @@ func (c *Client) acquireSlot(ctx context.Context, command string) (func(), error
 	case <-ctx.Done():
 		return nil, timeoutErrorf(command, ctx.Err(), "%s", ctx.Err())
 	}
-}
-
-// acquireAllSlots reserves every pipeline slot, so no other request is in
-// flight while the caller runs. USE needs it: it changes the table, and with
-// it the sizes that chunk requests are checked and framed with, so a chunk
-// request must not be sent between USE and its reply.
-func (c *Client) acquireAllSlots(ctx context.Context, command string) (func(), error) {
-	c.exclusiveMu.Lock()
-	held := 0
-	release := func() {
-		for ; held > 0; held-- {
-			<-c.slots
-		}
-		c.exclusiveMu.Unlock()
-	}
-	for held < cap(c.slots) {
-		select {
-		case c.slots <- struct{}{}:
-			held++
-		case <-ctx.Done():
-			release()
-			return nil, timeoutErrorf(command, ctx.Err(), "%s", ctx.Err())
-		}
-	}
-	return release, nil
 }
 
 // connection returns the live connection, dialing when necessary.
@@ -351,46 +331,36 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 	return established, nil
 }
 
-// helloOn performs the HELLO 2 handshake on a connection that has not been
+// helloOn performs the HELLO 3 handshake on a connection that has not been
 // published yet, so it bypasses the pipeline slots held by the request that
 // triggered the dial.
 func (c *Client) helloOn(ctx context.Context, established *conn) error {
-	args := []string{strconv.Itoa(protocolVersion)}
-	token := c.opts.uri.Token
-	if token != "" {
-		args = append(args, "AUTH", token)
-	}
-	if table := c.selectedTable(); table != "" {
-		args = append(args, "TABLE", table)
+	statement := "HELLO 3"
+	if token := c.opts.uri.Token; token != "" {
+		statement += " AUTH " + token
 	}
 
-	frame, err := c.execOn(ctx, established, "HELLO", args...)
+	reply, err := c.execOn(ctx, established, "HELLO", statement, nil)
 	if err != nil {
-		// A 1.x server does not know HELLO; one that requires a token
-		// answers AUTH_REQUIRED although HELLO carried it, which a protocol 2
-		// server never does. The server error is not wrapped, so the result
+		// A server of protocol 2 answers "-ERR PROTOCOL expected HELLO 2"; a
+		// 1.x server does not know HELLO, or, when it requires a token,
+		// answers AUTH_REQUIRED although HELLO carried one, which a protocol
+		// 3 server never does. The server error is not wrapped, so the result
 		// matches ErrProtocol and not ErrServer.
 		var typed *Error
-		if errors.As(err, &typed) && (typed.ServerCode == codeUnknownCommand ||
-			(typed.ServerCode == codeAuthRequired && token != "")) {
+		if errors.As(err, &typed) && ((typed.ServerCode == CodeProtocol && strings.Contains(typed.ServerMessage, "HELLO 2")) ||
+			typed.ServerCode == "UNKNOWN_COMMAND" || (typed.ServerCode == CodeAuthRequired && c.opts.uri.Token != "")) {
 			return protocolErrorf("HELLO",
-				"server does not speak protocol 2 (chunkdb 1.x; it replied %s); this client needs chunkdb 2.0 or later",
-				typed.Message)
+				"the server speaks an older chunkdb protocol (it replied %q); this client needs a server of protocol 3",
+				typed.ServerCode+" "+typed.ServerMessage)
 		}
 		return err
 	}
-	payload, err := expectBulk(frame, "HELLO")
+	info, err := parseServerInfo(reply)
 	if err != nil {
 		return err
 	}
-	info, err := parseHelloInfo(payload)
-	if err != nil {
-		return err
-	}
-
-	if info.Table != nil {
-		established.setGeometry(geometryOf(*info.Table))
-	}
+	established.info = info
 	c.helloMu.Lock()
 	c.hello = info
 	c.helloMu.Unlock()
@@ -492,62 +462,63 @@ func (d callDeadline) err() *Error {
 	return timeoutErrorf(d.command, d.ctx.Err(), "command timeout after %s", d.timeout)
 }
 
-// exec runs one command on the live connection. The caller must already hold a
-// pipeline slot.
-func (c *Client) exec(ctx context.Context, command string, args ...string) (Frame, error) {
+// exec runs one statement on the live connection. The caller must already
+// hold a pipeline slot.
+func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte) (Reply, error) {
 	established, err := c.connection(ctx)
 	if err != nil {
-		return Frame{}, err
+		return Reply{}, err
 	}
-	return c.execOn(ctx, established, command, args...)
+	if info := established.info; info != nil {
+		if len(statement)+2 > info.MaxLineBytes {
+			return Reply{}, requestErrorf(command, "the statement takes %d bytes; the server takes lines of at most %d",
+				len(statement)+2, info.MaxLineBytes)
+		}
+		if len(params) > info.MaxParameters {
+			return Reply{}, requestErrorf(command, "%d parameters; the server takes at most %d", len(params), info.MaxParameters)
+		}
+	}
+	return c.execOn(ctx, established, command, statement, params)
 }
 
-func (c *Client) execOn(ctx context.Context, established *conn, command string, args ...string) (Frame, error) {
-	return c.execPayloadOn(ctx, established, nil, command, args...)
-}
-
-// execPayloadOn is execOn for commands that carry raw bytes after the request
-// line (CHUNKPUT): the payload is written right after the line, followed by an
-// empty line, as one write so pipelined peers never see a partial request.
-func (c *Client) execPayloadOn(ctx context.Context, established *conn, payload []byte, command string, args ...string) (Frame, error) {
-	line, err := SerializeCommand(append([]string{command}, args...)...)
+func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte) (Reply, error) {
+	wire, err := encodeRequest(command, statement, params)
 	if err != nil {
-		return Frame{}, err
-	}
-	if payload != nil {
-		wire := make([]byte, 0, len(line)+len(payload)+2)
-		wire = append(wire, line...)
-		wire = append(wire, payload...)
-		wire = append(wire, '\r', '\n')
-		line = wire
+		return Reply{}, err
 	}
 
 	deadline := c.commandDeadline(ctx, command)
 	defer deadline.cancel()
 
-	frame, err := established.roundTrip(deadline, line)
+	reply, err := established.roundTrip(deadline, wire)
 	if err != nil {
-		return Frame{}, err
+		return Reply{}, err
 	}
 
-	if frame.Kind == FrameError {
+	if reply.Kind == ReplyError {
 		phase := PhaseResponse
-		if command == "HELLO" && (frame.Code == codeAuthFailed || frame.Code == codeAuthRequired) {
+		if command == "HELLO" && (reply.Code == CodeAuthFailed || reply.Code == CodeAuthRequired) {
 			phase = PhaseAuth
 		}
-		return Frame{}, serverError(phase, command, frame.Code, frame.Message)
+		if closesConnection(reply, len(params) > 0) {
+			// The server closes the connection after this reply; requests
+			// pipelined behind it were not executed.
+			_ = established.shutdown(connectionErrorf(command, nil,
+				"the server closed the connection after %s to an earlier request", reply.Code))
+		}
+		return Reply{}, replyError(phase, command, reply)
 	}
-	return frame, nil
+	return reply, nil
 }
 
-// pending is one request waiting for its response frame.
+// pending is one request waiting for its reply.
 type pending struct {
 	command string
 	ch      chan result
 }
 
 type result struct {
-	frame Frame
+	reply Reply
 	err   error
 }
 
@@ -569,28 +540,11 @@ type conn struct {
 	failed  bool
 	termErr error
 
-	// geo is the chunk geometry of the connection's table, nil while it has
-	// none. HELLO sets it and USE replaces it.
-	geoMu sync.Mutex
-	geo   *geometry
+	// info is the HELLO reply; set before the connection is published.
+	info *ServerInfo
 }
 
-func (cn *conn) setGeometry(geo geometry) {
-	cn.geoMu.Lock()
-	cn.geo = &geo
-	cn.geoMu.Unlock()
-}
-
-func (cn *conn) geometry() (geometry, bool) {
-	cn.geoMu.Lock()
-	defer cn.geoMu.Unlock()
-	if cn.geo == nil {
-		return geometry{}, false
-	}
-	return *cn.geo, true
-}
-
-func (cn *conn) roundTrip(deadline callDeadline, line []byte) (Frame, error) {
+func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
 	waiter := &pending{command: deadline.command, ch: make(chan result, 1)}
 
 	cn.writeMu.Lock()
@@ -602,42 +556,42 @@ func (cn *conn) roundTrip(deadline callDeadline, line []byte) (Frame, error) {
 		// Detach defensively: a caller holding a reference to a connection that
 		// died must not keep the client pinned to it.
 		cn.client.detach(cn)
-		return Frame{}, err
+		return Reply{}, err
 	}
 	cn.queue = append(cn.queue, waiter)
 	cn.mu.Unlock()
 
-	_, err := cn.writer.Write(line)
+	_, err := cn.writer.Write(wire)
 	if err == nil {
 		err = cn.writer.Flush()
 	}
 	cn.writeMu.Unlock()
 
 	if err != nil {
-		wrapped := newError(KindConnection, PhaseRequest, deadline.command, "write command: "+err.Error(), err)
+		wrapped := newError(KindConnection, PhaseRequest, deadline.command, "write request: "+err.Error(), err)
 		_ = cn.shutdown(wrapped)
-		return Frame{}, wrapped
+		return Reply{}, wrapped
 	}
 
 	select {
 	case res := <-waiter.ch:
 		if res.err != nil {
-			return Frame{}, res.err
+			return Reply{}, res.err
 		}
-		return res.frame, nil
+		return res.reply, nil
 	case <-deadline.ctx.Done():
 		// The response for this request may still arrive, and without request
 		// identifiers it cannot be skipped without desynchronizing every later
 		// response. Dropping the connection is the only safe recovery.
 		err := deadline.err()
 		_ = cn.shutdown(err)
-		return Frame{}, err
+		return Reply{}, err
 	}
 }
 
 func (cn *conn) readLoop() {
 	for {
-		frame, err := ReadFrame(cn.reader)
+		reply, err := readReply(cn.reader)
 		if err != nil {
 			_ = cn.shutdown(cn.readError(err))
 			return
@@ -648,7 +602,7 @@ func (cn *conn) readLoop() {
 			_ = cn.shutdown(protocolErrorf("", "unsolicited response from server"))
 			return
 		}
-		waiter.ch <- result{frame: frame}
+		waiter.ch <- result{reply: reply}
 	}
 }
 
@@ -717,99 +671,36 @@ func (cn *conn) shutdown(cause error) error {
 	return closeErr
 }
 
-// geometry holds the chunk sizes of a table.
-type geometry struct {
-	payloadBytes  int
-	presenceBytes int
-}
-
-func geometryOf(info TableInfo) geometry {
-	blockCount := info.ChunkWidthBlocks * info.ChunkHeightBlocks
-	return geometry{
-		payloadBytes:  (blockCount*info.BlockBits + 7) / 8,
-		presenceBytes: (blockCount + 7) / 8,
+// parseServerInfo parses and checks a HELLO reply.
+func parseServerInfo(reply Reply) (*ServerInfo, error) {
+	if reply.Kind != ReplyMap {
+		return nil, protocolErrorf("HELLO", "HELLO reply is not a map")
 	}
-}
-
-func (g geometry) stateBytes() int { return g.payloadBytes + g.presenceBytes }
-
-// chunkConnection returns the live connection and its table's geometry. The
-// caller must already hold a pipeline slot.
-func (c *Client) chunkConnection(ctx context.Context, command string) (*conn, geometry, error) {
-	established, err := c.connection(ctx)
-	if err != nil {
-		return nil, geometry{}, err
+	protocol, _ := reply.Lookup("protocol")
+	if value, ok := protocol.Int64(); !ok || value != protocolVersion {
+		return nil, protocolErrorf("HELLO", "the server replied with another protocol, expected %d", protocolVersion)
 	}
-	geo, ok := established.geometry()
-	if !ok {
-		return nil, geometry{}, requestErrorf(command,
-			"%s needs a table: the connection has none (the server has no default table); select one with Use", command)
+	version, ok := reply.Lookup("server_version")
+	if !ok || version.Kind != ReplyBulk {
+		return nil, protocolErrorf("HELLO", "HELLO reply has no server_version")
 	}
-	return established, geo, nil
-}
-
-// parseHelloInfo parses and checks a HELLO reply.
-func parseHelloInfo(payload []byte) (*HelloInfo, error) {
-	values := ParseInfo(payload)
-	if values["protocol"] != strconv.Itoa(protocolVersion) {
-		protocol := values["protocol"]
-		if protocol == "" {
-			protocol = "(none)"
-		}
-		return nil, protocolErrorf("HELLO", "server replied with protocol %s, expected %d", protocol, protocolVersion)
-	}
-
-	info := &HelloInfo{
-		Protocol:      protocolVersion,
-		ServerVersion: values["server_version"],
-		Capabilities:  []string{},
-		Values:        values,
-	}
-	for _, capability := range strings.Split(values["capabilities"], ",") {
-		if capability != "" {
-			info.Capabilities = append(info.Capabilities, capability)
-		}
-	}
+	info := &ServerInfo{Protocol: protocolVersion, ServerVersion: string(version.Bulk)}
 	for _, field := range []struct {
 		key    string
 		target *int
 	}{
 		{"max_line_bytes", &info.MaxLineBytes},
+		{"max_parameters", &info.MaxParameters},
 		{"max_area_chunks", &info.MaxAreaChunks},
 		{"max_response_bytes", &info.MaxResponseBytes},
 		{"max_scan_limit", &info.MaxScanLimit},
-		{"max_batch_ops", &info.MaxBatchOps},
 	} {
-		value, err := strconv.Atoi(values[field.key])
-		if err != nil || value <= 0 {
-			return nil, protocolErrorf("HELLO", "HELLO missing valid %s", field.key)
+		value, _ := reply.Lookup(field.key)
+		number, ok := value.Int64()
+		if !ok || number <= 0 || number > 1<<40 {
+			return nil, protocolErrorf("HELLO", "HELLO reply has no valid %s", field.key)
 		}
-		*field.target = value
-	}
-
-	// Without a default table and without TABLE, the connection has none.
-	if _, ok := values["table"]; ok {
-		table, err := parseTableValues(ParseInfo(payload), "HELLO")
-		if err != nil {
-			return nil, err
-		}
-		info.Table = &table
+		*field.target = int(number)
 	}
 	return info, nil
-}
-
-// clone returns a deep copy, so callers cannot change the client's state.
-func (h *HelloInfo) clone() *HelloInfo {
-	if h == nil {
-		return nil
-	}
-	out := *h
-	out.Capabilities = slices.Clone(h.Capabilities)
-	out.Values = maps.Clone(h.Values)
-	if h.Table != nil {
-		table := *h.Table
-		table.Values = maps.Clone(h.Table.Values)
-		out.Table = &table
-	}
-	return &out
 }

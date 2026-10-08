@@ -281,12 +281,12 @@ func TestPoolConcurrentMixedOperations(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			if err := pool.Set(t.Context(), int64(i), 0, "1010"); err != nil {
-				t.Errorf("Set: %v", err)
+			if _, err := pool.SetBlock(t.Context(), "world", int64(i), 0, Record{"id": i}); err != nil {
+				t.Errorf("SetBlock: %v", err)
 				return
 			}
-			if _, err := pool.Get(t.Context(), int64(i), 0); err != nil {
-				t.Errorf("Get: %v", err)
+			if _, err := pool.GetBlock(t.Context(), "world", int64(i), 0); err != nil {
+				t.Errorf("GetBlock: %v", err)
 			}
 		}()
 	}
@@ -317,73 +317,33 @@ func TestNewPoolRejectsBadOptions(t *testing.T) {
 
 func TestPoolMirrorsClientCommands(t *testing.T) {
 	server := newFakeServer(t, withHello(genericHandler))
-	pool := newTestPool(t, server, nil)
+	pool := newTestPool(t, server, func(o *PoolOptions) { o.Table = "world" })
 	ctx := t.Context()
+	chunk := NewChunk(&Schema{Table: "world", ChunkWidth: 1, ChunkHeight: 1, Columns: []Column{{Name: "id", Type: TypeUint(8)}}})
 
 	cases := []struct {
 		name string
 		call func() error
 		want string
 	}{
+		{"do", func() error { _, err := pool.Do(ctx, "PING"); return err }, "PING"},
 		{"ping", func() error { return pool.Ping(ctx) }, "PING"},
-		{"info", func() error { _, err := pool.Info(ctx); return err }, "INFO"},
-		{"get", func() error { _, err := pool.Get(ctx, 1, 2); return err }, "GET 1 2"},
-		{"set", func() error { return pool.Set(ctx, 1, 2, "1010") }, "SET 1 2 1010"},
-		{"unset", func() error { return pool.Unset(ctx, 1, 2) }, "UNSET 1 2"},
-		{"mset", func() error { return pool.MSet(ctx, []Block{{X: 1, Y: 2, Bits: "1010"}}) }, "MSET 1 2 1010"},
-		{"mget", func() error { _, err := pool.MGet(ctx, []BlockRef{{X: 1, Y: 2}}); return err }, "MGET 1 2"},
-		{"chunk exists", func() error { _, err := pool.ChunkExists(ctx, 1, 2); return err }, "CHUNKEXISTS 1 2"},
-		{"get chunk", func() error { _, err := pool.GetChunk(ctx, 1, 2, GetOptions{}); return err }, "CHUNKGET 1 2"},
-		{
-			"get chunk state",
-			func() error { _, err := pool.GetChunkState(ctx, 1, 2, GetOptions{ZRLE: true}); return err },
-			"CHUNKGET 1 2 STATE ZRLE",
-		},
-		{
-			"put chunk",
-			func() error { _, err := pool.PutChunk(ctx, 1, 2, []byte{1, 2}, PutOptions{}); return err },
-			"CHUNKPUT 1 2 2",
-		},
-		{
-			"put chunk state",
-			func() error {
-				version := uint64(5)
-				_, err := pool.PutChunkState(ctx, 1, 2, ChunkStateInput{Payload: []byte{1, 2}, Presence: []byte{3}},
-					PutOptions{IfVersion: &version})
-				return err
-			},
-			"CHUNKPUT 1 2 STATE IF 5 3",
-		},
-		{"scan", func() error { _, err := pool.ChunkScan(ctx, 10, nil); return err }, "CHUNKSCAN 10"},
-		{
-			"range",
-			func() error { _, err := pool.ChunkRange(ctx, 1, 2, 3, 4, GetOptions{}); return err },
-			"CHUNKRANGE 1 2 3 4 STATE",
-		},
-		{
-			"radius",
-			func() error { _, err := pool.ChunkRadius(ctx, 1, 2, 3, GetOptions{ZRLE: true}); return err },
-			"CHUNKRADIUS 1 2 3 STATE ZRLE",
-		},
-		{"version", func() error { _, err := pool.ChunkVersion(ctx, 1, 2); return err }, "CHUNKVER 1 2"},
-		{
-			"batch",
-			func() error {
-				_, err := pool.ChunkBatch(ctx, 1, 2, []BatchOperation{UnsetOp(3, 4)})
-				return err
-			},
-			"CHUNKBATCH 1 2 UNSET 3 4",
-		},
-		{
-			"batch with version",
-			func() error {
-				_, err := pool.ChunkBatchIfVersion(ctx, 1, 2, 9, []BatchOperation{UnsetOp(3, 4)})
-				return err
-			},
-			"CHUNKBATCH 1 2 IF 9 UNSET 3 4",
-		},
-		{"wal flush", func() error { return pool.WALFlush(ctx) }, "WALFLUSH"},
-		{"metrics", func() error { _, err := pool.Metrics(ctx); return err }, "METRICS"},
+		{"get block", func() error { _, err := pool.GetBlock(ctx, "", 1, 2, "id"); return err }, "GET BLOCK 1 2 FROM world COLUMNS id"},
+		{"set block", func() error { _, err := pool.SetBlock(ctx, "", 1, 2, Record{"id": 3}); return err }, "SET BLOCK 1 2 IN world id = $1"},
+		{"delete block", func() error { _, err := pool.DeleteBlock(ctx, "", 1, 2, IfVersion(4)); return err },
+			"DELETE BLOCK 1 2 FROM world IF VERSION 4"},
+		{"get chunk", func() error { _, err := pool.GetChunk(ctx, "", 1, 2); return err },
+			"GET CHUNK 1 2 FROM world COLUMNS id, temp, solid, h, d, mask, name, blob"},
+		{"get chunk raw", func() error { _, err := pool.GetChunkRaw(ctx, "", 1, 2, "id"); return err }, "GET CHUNK 1 2 FROM world COLUMNS id"},
+		{"set chunk raw", func() error { _, err := pool.SetChunkRaw(ctx, "", 1, 2, []byte{0}); return err }, "SET CHUNK 1 2 IN world $1"},
+		{"get area", func() error { _, err := pool.GetArea(ctx, "", 1, 2, 3, 4, "id"); return err }, "GET AREA 1 2 TO 3 4 FROM world COLUMNS id"},
+		{"get area around", func() error { _, err := pool.GetAreaAround(ctx, "", 1, 2, 3, "id"); return err },
+			"GET AREA AROUND 1 2 RADIUS 3 FROM world COLUMNS id"},
+		{"scan", func() error { _, err := pool.ScanChunks(ctx, "", nil, 10); return err }, "SCAN CHUNKS FROM world LIMIT 10"},
+		{"describe", func() error { _, err := pool.Describe(ctx, ""); return err }, "DESCRIBE world"},
+		{"tables", func() error { _, err := pool.Tables(ctx); return err }, "SHOW TABLES"},
+		{"flush", func() error { return pool.FlushWAL(ctx) }, "FLUSH WAL"},
+		{"metrics", func() error { _, err := pool.Metrics(ctx); return err }, "SHOW METRICS"},
 	}
 
 	for _, testCase := range cases {
@@ -395,5 +355,11 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, testCase.want)
 			}
 		})
+	}
+
+	// SetChunk encodes with the pool client's schema of the table, which has
+	// other columns than the chunk.
+	if _, err := pool.SetChunk(ctx, "", 1, 2, chunk); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want a request error", err)
 	}
 }

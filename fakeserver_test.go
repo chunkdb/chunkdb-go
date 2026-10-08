@@ -15,21 +15,22 @@ import (
 // lets the client tests drive framing, error, and connection-lifecycle paths
 // that a real server cannot be asked for on demand.
 //
-// Commands are dispatched to handle one at a time per connection, in arrival
-// order. A handler that wants to keep a request in flight records the
-// connection and writes its response later.
+// Statements are dispatched to handle one at a time per connection, in
+// arrival order, after their parameter frames were read. A handler that wants
+// to keep a request in flight records the connection and writes its reply
+// later.
 type fakeServer struct {
 	listener net.Listener
 	handle   func(*fakeServer, net.Conn, string)
 	// closeOnAccept makes the server hang up immediately, without reading a
-	// single command.
+	// single statement.
 	closeOnAccept bool
 
 	mu       sync.Mutex
 	received []string
-	// puts holds every CHUNKPUT request exactly as it arrived: the request
-	// line, the payload, and the empty line after it.
-	puts     [][]byte
+	// params holds the parameter frames of each received statement; nil is
+	// NULL.
+	params   [][][]byte
 	conns    []net.Conn
 	accepted int
 	// finished counts connections the client closed or the server dropped.
@@ -88,6 +89,27 @@ func (s *fakeServer) acceptLoop() {
 	}
 }
 
+// parameterCount is the highest $n of a statement, outside quotes.
+func parameterCount(statement string) int {
+	count := 0
+	quoted := false
+	for i := 0; i < len(statement); i++ {
+		switch {
+		case statement[i] == '\'':
+			quoted = !quoted
+		case statement[i] == '$' && !quoted:
+			end := i + 1
+			for end < len(statement) && statement[end] >= '0' && statement[end] <= '9' {
+				end++
+			}
+			if n, err := strconv.Atoi(statement[i+1 : end]); err == nil && n > count {
+				count = n
+			}
+		}
+	}
+	return count
+}
+
 func (s *fakeServer) serve(conn net.Conn) {
 	defer func() {
 		s.mu.Lock()
@@ -101,29 +123,35 @@ func (s *fakeServer) serve(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		if strings.HasPrefix(strings.ToUpper(line), "CHUNKPUT ") {
-			// The payload and its empty-line terminator follow the header;
-			// read them so the next iteration sees the next request line.
-			fields := strings.Fields(line)
-			n, convErr := strconv.Atoi(fields[len(fields)-1])
-			if convErr != nil || n < 0 {
+		statement := strings.TrimRight(line, "\r\n")
+		params := make([][]byte, 0)
+		for range parameterCount(statement) {
+			header, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			header = strings.TrimRight(header, "\r\n")
+			if header == "$-1" {
+				params = append(params, nil)
+				continue
+			}
+			n, err := strconv.Atoi(strings.TrimPrefix(header, "$"))
+			if err != nil || n < 0 {
 				return
 			}
 			body := make([]byte, n+2)
-			if _, readErr := io.ReadFull(reader, body); readErr != nil {
+			if _, err := io.ReadFull(reader, body); err != nil {
 				return
 			}
-			s.mu.Lock()
-			s.puts = append(s.puts, append([]byte(line), body...))
-			s.mu.Unlock()
+			params = append(params, body[:n:n])
 		}
-		command := strings.TrimRight(line, "\r\n")
 
 		s.mu.Lock()
-		s.received = append(s.received, command)
+		s.received = append(s.received, statement)
+		s.params = append(s.params, params)
 		s.mu.Unlock()
 
-		s.handle(s, conn, command)
+		s.handle(s, conn, statement)
 	}
 }
 
@@ -172,14 +200,25 @@ func (s *fakeServer) commands() []string {
 	return append([]string(nil), s.received...)
 }
 
-// lastCommand returns the most recently received command line.
+// lastCommand returns the most recently received statement.
 func (s *fakeServer) lastCommand(t *testing.T) string {
 	t.Helper()
 	commands := s.commands()
 	if len(commands) == 0 {
-		t.Fatal("server received no commands")
+		t.Fatal("server received no statements")
 	}
 	return commands[len(commands)-1]
+}
+
+// lastParams returns the parameter frames of the most recent statement.
+func (s *fakeServer) lastParams(t *testing.T) [][]byte {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.params) == 0 {
+		t.Fatal("server received no statements")
+	}
+	return s.params[len(s.params)-1]
 }
 
 func (s *fakeServer) acceptedConns() int {
@@ -194,52 +233,103 @@ func (s *fakeServer) finishedConns() int {
 	return s.finished
 }
 
-// lastPut returns the most recent CHUNKPUT request as it arrived on the wire.
-func (s *fakeServer) lastPut(t *testing.T) []byte {
-	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.puts) == 0 {
-		t.Fatal("server received no CHUNKPUT")
-	}
-	return s.puts[len(s.puts)-1]
+// RESP3 reply builders.
+
+func respBulk(payload string) string {
+	return "$" + strconv.Itoa(len(payload)) + "\r\n" + payload + "\r\n"
+}
+func respInt(n int64) string { return ":" + strconv.FormatInt(n, 10) + "\r\n" }
+func respArray(items ...string) string {
+	return "*" + strconv.Itoa(len(items)) + "\r\n" + strings.Join(items, "")
 }
 
-// helloLimits is the part of every fake HELLO reply before the table lines.
-const helloLimits = "protocol=2\nserver_version=test\ncapabilities=zrle\nmax_line_bytes=65536\n" +
-	"max_area_chunks=256\nmax_response_bytes=67108864\nmax_scan_limit=1024\nmax_batch_ops=1024\n"
+// respMap takes alternating keys (written as bulk strings) and values.
+func respMap(pairs ...string) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "%%%d\r\n", len(pairs)/2)
+	for i := 0; i < len(pairs); i += 2 {
+		out.WriteString(respBulk(pairs[i]) + pairs[i+1])
+	}
+	return out.String()
+}
 
-// defaultInfo is the fake server's default table. Chunks of 2x2 blocks of 4
-// bits keep the derived sizes small: 2 payload bytes and 1 presence byte.
-const defaultInfo = "table=default\nstore_id=ffeeddccbbaa99887766554433221100\nblock_bits=4\n" +
-	"chunk_width_blocks=2\nchunk_height_blocks=2\nlarge_chunk_width_chunks=8\n" +
-	"large_chunk_height_chunks=8\ndurability_mode=relaxed\ncheckpoint_updates=256\n" +
-	"checkpoint_wal_bytes=1048576\nwal_group_commit_updates=8\ncheckpoint_compression=none\n"
+func respBool(v bool) string {
+	if v {
+		return "#t\r\n"
+	}
+	return "#f\r\n"
+}
 
-const (
-	testChunkPayloadBytes = 2
-	testPresenceBytes     = 1
+const respNull = "_\r\n"
+
+// helloReply is the fake server's HELLO 3 reply.
+var helloReply = respMap(
+	"protocol", respInt(3),
+	"server_version", respBulk("test"),
+	"max_line_bytes", respInt(65536),
+	"max_parameters", respInt(65535),
+	"max_area_chunks", respInt(256),
+	"max_response_bytes", respInt(64<<20),
+	"max_scan_limit", respInt(1024),
 )
 
-// fakeTables are the tables the fake HELLO and USE know.
-var fakeTables = map[string]string{"default": defaultInfo, "terrain": terrainInfo}
+func fakeColumn(id int64, name, typ string, null, required bool, def string) string {
+	return respMap("id", respInt(id), "name", respBulk(name), "type", respBulk(typ), "null", respBool(null),
+		"required", respBool(required), "default", def)
+}
 
-// answerHello answers a HELLO line like a protocol 2 server holding
-// fakeTables, ignoring the token.
-func answerHello(conn net.Conn, command string) {
-	args := strings.Fields(command)
-	table := "default"
-	for i := 2; i+1 < len(args); i += 2 {
-		if args[i] == "TABLE" {
-			table = args[i+1]
-		}
-	}
-	info, ok := fakeTables[table]
-	if !ok {
-		writeServerError(conn, "ERR NO_TABLE table '"+table+"' does not exist")
-		return
-	}
-	writeBulkString(conn, helloLimits+info)
+// worldColumns are the columns of the fake server's tables: a row of every
+// type. Chunks are 2x2 blocks.
+var worldColumns = []string{
+	fakeColumn(1, "id", "u10", false, true, respNull),
+	fakeColumn(2, "temp", "i8", true, false, respNull),
+	fakeColumn(3, "solid", "bool", false, false, respNull),
+	fakeColumn(4, "h", "f32", false, false, ",1.5\r\n"),
+	fakeColumn(5, "d", "f64", false, false, respNull),
+	fakeColumn(6, "mask", "bits(3)", true, false, respNull),
+	fakeColumn(7, "name", "text(16)", true, false, respNull),
+	fakeColumn(8, "blob", "bytes(4)", false, false, respNull),
+}
+
+// describeReply answers DESCRIBE of a table with columns.
+func describeReply(table string, version int64, columns []string) string {
+	return respMap(
+		"table", respBulk(table),
+		"version", respInt(version),
+		"columns", respArray(columns...),
+		"chunk", respArray(respInt(2), respInt(2)),
+		"large", respArray(respInt(8), respInt(8)),
+		"options", respMap(
+			"durability_mode", respBulk("relaxed"),
+			"checkpoint_updates", respInt(256),
+			"checkpoint_wal_bytes", respInt(1<<20),
+			"wal_group_commit_updates", respInt(8),
+			"checkpoint_compression", respBulk("none"),
+			"var_max_chunk_bytes", respInt(1<<20),
+		),
+	)
+}
+
+// worldFormBytes is the size of an empty chunk form of the fake tables:
+// chunk and schema version, presence, then the values (and validity bits) of
+// id, temp, solid, h, d and mask.
+const worldFormBytes = 16 + 1 + 5 + (4 + 1) + 1 + 16 + 32 + (2 + 1)
+
+// emptyWorldForm is an empty chunk form of size bytes at chunk version 7 and
+// schema version 1.
+func emptyWorldForm(size int) string {
+	form := make([]byte, size)
+	form[0], form[8] = 7, 1
+	return string(form)
+}
+
+// worldSectionBytes is the part of an empty chunk form each column takes.
+var worldSectionBytes = map[string]int{"id": 5, "temp": 4 + 1, "solid": 1, "h": 16, "d": 32, "mask": 2 + 1}
+
+// answerHello answers a HELLO line like a protocol 3 server, ignoring the
+// token.
+func answerHello(conn net.Conn, _ string) {
+	writeRaw(conn, helloReply)
 }
 
 // withHello answers HELLO and forwards everything else to handle.
@@ -253,44 +343,39 @@ func withHello(handle func(*fakeServer, net.Conn, string)) func(*fakeServer, net
 	}
 }
 
-// respondWith answers HELLO and every other command with the same canned
-// response bytes.
+// respondWith answers HELLO and every other statement with the same canned
+// reply bytes.
 func respondWith(response string) func(*fakeServer, net.Conn, string) {
 	return withHello(func(_ *fakeServer, conn net.Conn, _ string) {
-		_, _ = conn.Write([]byte(response))
+		writeRaw(conn, response)
+	})
+}
+
+// respondWithSchema answers DESCRIBE with the fake world table and every
+// other statement with the same canned reply bytes.
+func respondWithSchema(response string) func(*fakeServer, net.Conn, string) {
+	return withHello(func(_ *fakeServer, conn net.Conn, command string) {
+		if verbOf(command) == "DESCRIBE" {
+			writeRaw(conn, describeReply(strings.Fields(command)[1], 1, worldColumns))
+			return
+		}
+		writeRaw(conn, response)
 	})
 }
 
 func verbOf(command string) string {
 	verb, _, _ := strings.Cut(command, " ")
-	return verb
+	return strings.ToUpper(verb)
+}
+
+func writeRaw(conn net.Conn, text string) {
+	_, _ = conn.Write([]byte(text))
 }
 
 func writeSimple(conn net.Conn, text string) {
-	_, _ = conn.Write([]byte("+" + text + "\r\n"))
+	writeRaw(conn, "+"+text+"\r\n")
 }
 
 func writeServerError(conn net.Conn, text string) {
-	_, _ = conn.Write([]byte("-" + text + "\r\n"))
-}
-
-func writeBulk(conn net.Conn, payload []byte) {
-	_, _ = fmt.Fprintf(conn, "$%d\r\n", len(payload))
-	_, _ = conn.Write(payload)
-	_, _ = conn.Write([]byte("\r\n"))
-}
-
-func writeNull(conn net.Conn) {
-	_, _ = conn.Write([]byte("$-1\r\n"))
-}
-
-func writeBulkString(conn net.Conn, payload string) {
-	writeBulk(conn, []byte(payload))
-}
-
-func writeArray(conn net.Conn, items ...string) {
-	_, _ = fmt.Fprintf(conn, "*%d\r\n", len(items))
-	for _, item := range items {
-		writeBulkString(conn, item)
-	}
+	writeRaw(conn, "-"+text+"\r\n")
 }
