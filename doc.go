@@ -1,7 +1,8 @@
 // Package chunkdb is the official Go client for chunkdb.
 //
-// It speaks chunkdb protocol 2, which chunkdb 2.0 servers serve; it does not
-// connect to chunkdb 1.x servers.
+// It speaks chunkdb protocol 3: one CQL statement per request, values sent as
+// binary parameters, typed RESP3 replies. It does not connect to servers of an
+// earlier protocol.
 //
 // The package is intentionally small:
 //
@@ -9,33 +10,35 @@
 //   - requests are sequential per client by default, with opt-in pipelining
 //     ([Options.PipelineDepth])
 //   - opt-in pooling via [Pool]
-//   - no automatic retries or background reconnect loops
+//   - no background reconnect loops
 //
-// Every connection starts with the HELLO 2 handshake, which carries the token
-// and the table; [Client.ServerInfo] returns the reply. A chunkdb server holds
-// named tables; a client works on one of them, chosen by [Options.Table], the
-// URI path, or [Client.Use], and the server's default table otherwise.
+// Every connection starts with the HELLO 3 handshake, which carries the token;
+// [Client.ServerInfo] returns the server's limits. Every statement names its
+// table; the methods take the table as their first argument after the
+// context, and "" means the client's default table ([Options.Table], the URI
+// path, else "default").
 //
-// Chunk data is binary: [Client.GetChunk], [Client.GetChunkState],
-// [Client.PutChunk] and [Client.PutChunkState] transfer the packed block
-// payload (bit i of the chunk is payload[i/8] >> (i%8) & 1) and the presence
-// bitmap, sized by the table's geometry.
+// Values are typed by the table's columns. A client caches each table's
+// schema ([Client.Schema]) to encode parameters and decode chunks;
+// [EncodeValue] lists the Go types of each column type. [Client.Do] sends any
+// statement with raw parameters.
 //
 // Every request method takes a [context.Context]. Cancelling it aborts the
 // call; because the protocol has no request identifiers, an aborted in-flight
 // request also drops the connection, since the client cannot resynchronize
-// with the response stream. The next request transparently reconnects.
+// with the reply stream. The next request transparently reconnects.
 //
 // Basic use:
 //
-//	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
+//	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
 //	if err != nil {
 //		return err
 //	}
 //	defer client.Close()
 //
-//	if err := client.Set(ctx, 0, 0, "1011001110110011"); err != nil {
+//	version, err := client.SetBlock(ctx, "", 10, 4, chunkdb.Record{"id": 23, "light": 7})
+//	if err != nil {
 //		return err
 //	}
-//	block, err := client.Get(ctx, 0, 0)
+//	block, err := client.GetBlock(ctx, "", 10, 4)
 package chunkdb

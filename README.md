@@ -1,442 +1,128 @@
 # chunkdb-go
 
-Official Go client for [`chunkdb`](https://github.com/chunkdb/chunkdb).
+Official Go client for [`chunkdb`](https://github.com/chunkdb/chunkdb). It speaks protocol 3: one CQL statement per request, values sent as binary parameters, typed replies. It does not connect to servers of an earlier protocol; see the engine's [compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
 
-Speaks `chunkdb` protocol 2, which chunkdb 2.0 servers serve; see the engine's
-[compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
-It does not connect to 1.x servers: use `github.com/chunkdb/chunkdb-go` 1.x
-with those.
-
-This package is intentionally small:
-
-- `Client` = one long-lived socket
-- sequential request/response per client by default, with opt-in pipelining (`PipelineDepth`)
-- opt-in pooling via `Pool`
-- no automatic retries or background reconnect loops
-- standard library only, no third-party dependencies
-
-## Features
-
-- `chunk://` and `chunks://` URI support
-- `net` / `crypto/tls` transport
-- `Connect`, `ConnectURI`, `ConnectPool`, `NewClient`, `NewPool`
-- `ServerInfo`: the server version, capabilities, limits, and the table's
-  geometry and options, from the `HELLO` handshake
-- blocks: `Get` (reports unset blocks), `Set`, `Unset`, batch `MSet` / `MGet`
-  (single round-trip for many blocks)
-- binary chunks: `GetChunk`, `GetChunkState`, `PutChunk`, `PutChunkState`,
-  optionally zrle-compressed on the wire
-- world reads: `ChunkScan`, `ChunkRange`, `ChunkRadius`
-- optimistic concurrency: `ChunkVersion`, conditional `PutChunk` /
-  `PutChunkState` (`IfVersion`), and atomic single-chunk `ChunkBatch` /
-  `ChunkBatchIfVersion`
-- `WALFlush` durability barrier and `Metrics` (Prometheus text format)
-- tables: `CreateTable`, `DropTable`, `Tables`, `TableInfo`,
-  `SetTableOptions`, `Use`, per-table clients (`client.Table(ctx, name)`), and
-  the table named in the URI path (`chunk://host:4242/terrain`)
-- configurable request pipelining for high-latency links
-- `context.Context` on every request, for per-call deadlines and cancellation
-- typed errors with `errors.Is` sentinels and protocol error codes
-- `int64` block and chunk coordinates across the full signed 64-bit domain
-- configurable connect and command timeouts
-
-## Requirements
-
-- Go 1.25 or newer
-- a reachable `chunkdb` 2.0 server
-
-## Install
+Requirements: Go 1.25 or newer and a reachable chunkdb server of protocol 3. Standard library only.
 
 ```bash
 go get github.com/chunkdb/chunkdb-go/v2
 ```
 
-## Quick Start
+## Quick start
 
 ```go
-package main
+ctx := context.Background()
 
-import (
-	"context"
-	"fmt"
-	"log"
-
-	"github.com/chunkdb/chunkdb-go/v2"
-)
-
-func main() {
-	ctx := context.Background()
-
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
-
-	if err := client.Set(ctx, 0, 0, "1011001110110011"); err != nil {
-		log.Fatal(err)
-	}
-
-	block, err := client.Get(ctx, 0, 0)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(block.Exists, block.Bits) // true 1011001110110011
-
-	unset, err := client.Get(ctx, 1, 0)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(unset.Exists) // false
-
-	chunk, err := client.GetChunkState(ctx, 0, 0, chunkdb.GetOptions{})
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(chunk.Exists, len(chunk.Payload), len(chunk.Presence))
-}
-```
-
-Connecting sends `HELLO 2` with the token and table from the URI. The reply is
-available as `client.ServerInfo()`: the server version, capabilities, limits,
-and the table's geometry and options.
-
-## Options
-
-`Connect` takes `Options` when a URI alone is not enough:
-
-```go
-client, err := chunkdb.Connect(ctx, chunkdb.Options{
-	URI:            "chunk://chunk-token@127.0.0.1:4242/",
-	ConnectTimeout: 2 * time.Second,
-	CommandTimeout: 3 * time.Second,
-})
-```
-
-Explicit `Host`, `Port`, and `Token` win over the values parsed from `URI`.
-
-- `ConnectTimeout`: maximum time to establish the socket and complete TLS setup
-- `CommandTimeout`: maximum time to wait for one command response, including
-  `HELLO`
-- both default to 5 seconds; a negative value disables the client-side deadline
-  and leaves cancellation to the context
-- `PipelineDepth`: maximum concurrent in-flight requests per connection (default 1)
-
-## Context And Cancellation
-
-Every request takes a `context.Context`. Cancelling it aborts the call and
-returns an error that matches both `chunkdb.ErrTimeout` and the underlying
-`context.Canceled` or `context.DeadlineExceeded`.
-
-The protocol has no request identifiers, so a response cannot be skipped without
-desynchronizing every later response. Aborting an in-flight request therefore
-drops the connection; the next request opens a fresh one. Requests are never
-retried automatically.
-
-## TLS
-
-```go
-client, err := chunkdb.Connect(ctx, chunkdb.Options{
-	URI: "chunks://chunk-token@127.0.0.1:4242/",
-	CA:  caPEM,
-})
-```
-
-- `chunks://` or `TLS: true` enables TLS
-- `TLSInsecure: true` skips certificate verification, for local testing only
-- `TLSServerName` overrides the SNI and hostname-verification target
-- `CA`, `Cert`, and `Key` take PEM bytes for custom trust roots and client certificates
-- the minimum negotiated version is TLS 1.2
-
-## Connection Model
-
-- Reuse one `Client` for low-concurrency code paths. It keeps one socket open
-  and sends one request at a time. It is safe for concurrent use; calls are
-  serialized.
-- Use one shared `Pool` for concurrent workloads. It keeps several warm clients
-  and leases them per operation.
-- Single-socket multiplexing is out of scope. Parallelism comes from multiple
-  sockets, not request IDs on one socket.
-- The connection is opened lazily and re-established on the next request after a
-  transport failure. The request that hit the failure still returns an error.
-
-## Pooling
-
-```go
-pool, err := chunkdb.ConnectPool(ctx, chunkdb.PoolOptions{
-	Options:        chunkdb.Options{URI: "chunk://chunk-token@127.0.0.1:4242/"},
-	MaxConnections: 4,
-	MinConnections: 1,
-	AcquireTimeout: 2 * time.Second,
-})
+// The URI path is the client's default table; "" in a method means that table.
+client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
 if err != nil {
 	log.Fatal(err)
 }
-defer pool.Close()
+defer client.Close()
 
-if err := pool.Set(ctx, 0, 0, "1011001110110011"); err != nil {
-	log.Fatal(err)
-}
-
-err = pool.WithClient(ctx, func(ctx context.Context, client *chunkdb.Client) error {
-	if err := client.Set(ctx, 1, 0, "0000111100001111"); err != nil {
-		return err
-	}
-	return client.WALFlush(ctx)
-})
-```
-
-`PoolOptions` embeds `Options` and adds:
-
-- `MaxConnections`: maximum number of clients the pool opens
-- `MinConnections`: warm connections opened by `ConnectPool`
-- `AcquireTimeout`: maximum time to wait for a free pooled client
-
-A leased client is returned to the pool when the operation finishes, or
-discarded when it fails with a transport error. `Close` waits for outstanding
-leases before closing the connections.
-
-The server occupies one worker for as long as a client connection is open, so
-keep `MaxConnections` at or below the server's `--workers` setting. Extra
-connections wait in the server's pending queue instead of being served.
-
-## Chunks
-
-A chunk's data is binary:
-
-- `Payload`: the packed block bits,
-  `ceil(ChunkWidthBlocks * ChunkHeightBlocks * BlockBits / 8)` bytes; bit `i`
-  of the chunk is `payload[i/8] >> (i%8) & 1`. Block `b` (row-major inside the
-  chunk) holds bits `b*BlockBits` to `(b+1)*BlockBits - 1`, and character `j`
-  of its `Get` bit text is bit `b*BlockBits + j`
-- `Presence`: one bit per block, laid out the same way, set when the block is
-  explicitly present; `ceil(ChunkWidthBlocks * ChunkHeightBlocks / 8)` bytes
-
-The sizes come from the connection's table (`client.ServerInfo().Table`, or the
-`TableInfo` that `Use` returns). The client checks every chunk it sends or
-receives against them; a write of the wrong size fails before anything is
-sent.
-
-```go
-version, err := client.ChunkVersion(ctx, 0, 0)
-if err != nil {
-	return err
-}
-state, err := client.GetChunkState(ctx, 0, 0, chunkdb.GetOptions{})
-if err != nil {
-	return err
-}
-state.Payload[0] ^= 0xff
-state.Presence[0] |= 0x01
-
-result, err := client.PutChunkState(ctx, 0, 0,
-	chunkdb.ChunkStateInput{Payload: state.Payload, Presence: state.Presence},
-	chunkdb.PutOptions{IfVersion: &version})
-if err != nil {
-	return err
-}
-if !result.OK {
-	// Someone else wrote the chunk; result.Version is its current version.
-}
-```
-
-- `GetChunk` returns the payload only; an absent chunk reads as zeros, so use
-  `GetChunkState(...).Exists` or `ChunkExists` to tell it from an all-zero
-  chunk.
-- `PutChunk` makes every block present; `PutChunkState` writes the presence
-  bitmap too, and payload bits of absent blocks are stored as zero. An
-  all-zero presence bitmap leaves the chunk absent.
-- `GetOptions{ZRLE: true}` and `PutOptions{ZRLE: true}` compress the transfer.
-  Reads are decompressed and size-checked; writes are compressed only when
-  that makes them smaller. Sparse chunks shrink a lot, dense ones not at all.
-- `PutOptions{IfVersion: &v}` applies the write only if the chunk's version is
-  still `v`.
-- Writes return a `MutationResult`: the chunk's version after the write, or
-  with `OK` false the current version when `IfVersion` did not match.
-
-## Tables
-
-A chunkdb server holds named tables, each with its own geometry and options.
-A client works on one table: `Options.Table`, else the URI path, else the
-server's `default` table. The client names it again in `HELLO` on every
-reconnect.
-
-```go
-admin, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
-if err != nil {
-	log.Fatal(err)
-}
-defer admin.Close()
-
-err = admin.CreateTable(ctx, "terrain", chunkdb.TableSpec{
-	BlockBits:         4,
-	ChunkWidthBlocks:  32,
-	ChunkHeightBlocks: 32,
-	Options:           chunkdb.TableOptions{DurabilityMode: "fsync-wal"},
+err = client.CreateTable(ctx, "world", chunkdb.TableSpec{
+	Columns: []chunkdb.ColumnDef{
+		{Name: "id", Type: chunkdb.TypeUint(10), Required: true},
+		{Name: "light", Type: chunkdb.TypeUint(4), Default: 15},
+		{Name: "sign", Type: chunkdb.TypeText(256), Null: true},
+	},
+	ChunkWidth: 16, ChunkHeight: 16,
 })
 if err != nil {
 	log.Fatal(err)
 }
 
-// A per-table client has its own connection.
-terrain, err := admin.Table(ctx, "terrain")
+version, err := client.SetBlock(ctx, "", 10, 4, chunkdb.Record{"id": 23, "sign": "hello"})
 if err != nil {
 	log.Fatal(err)
 }
-defer terrain.Close()
-if err := terrain.Set(ctx, 0, 0, "1011"); err != nil {
-	log.Fatal(err)
-}
-
-// Or name the table in the URI.
-same, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/terrain")
-if err != nil {
-	log.Fatal(err)
-}
-defer same.Close()
+block, err := client.GetBlock(ctx, "", 10, 4) // nil when the block is absent
+fmt.Println(version, block["id"], block["light"], block["sign"]) // <chunk version> 23 15 hello
 ```
 
-- Geometry is fixed when a table is created; `SetTableOptions` changes its
-  options (zero fields stay unchanged).
-- A pool works on one table: set `Options.Table` or the URI path in
-  `PoolOptions`. Use one pool per table, and do not call `Use` on a client
-  from `WithClient`: the pooled connection would keep that table.
-- After `DropTable`, commands from clients on that table fail with an `*Error`
-  whose `ServerCode` is `CodeNoTable`, even if a table of the same name is
-  created again; `Use` selects a table again.
-- `Use` changes the table for every later command on the client. It waits
-  for the requests in flight and holds back new ones until it completes, so
-  each request runs entirely on the old or the new table.
-- If the server has no `default` table and none is named, the connection has
-  no table: `ServerInfo().Table` is nil and the chunk methods fail until `Use`
-  selects one.
-- An unknown table in `Options.Table` or the URI path fails `Connect` with
-  `CodeNoTable`.
+## Values
+
+Every method names its table; `""` is the default table: `Options.Table`, else the URI path, else `default`. Values are typed by the table's columns, and the client caches each table's schema (`Schema`, `Describe`) to encode and decode them.
+
+| Column type | Go value written | Go value read |
+|---|---|---|
+| `uN` | any integer type | `uint64` (the full range, above `math.MaxInt64` too) |
+| `iN` | any integer type | `int64` |
+| `bool` | `bool` | `bool` |
+| `f32`, `f64` | `float32` or `float64` | `float32`, `float64` (inf and NaN included) |
+| `bits(N)` | `chunkdb.Bits` (`ParseBits("1010")`, lowest bit first) | `chunkdb.Bits` |
+| `text(max)` | `string`, valid UTF-8 | `string` |
+| `bytes(max)` | `[]byte` | `[]byte` |
+| `NULL` | `nil` | `nil` |
+
+A value that does not fit its column (out of range, too long, wrong type) fails with `ErrProtocol` before anything is sent. Values always travel as parameters, so text and bytes may hold any byte, CR and LF included.
 
 ## API
 
-Package functions:
+- blocks: `GetBlock(ctx, table, x, y, columns...)`, `SetBlock(ctx, table, x, y, Record, opts...)`, `DeleteBlock(ctx, table, x, y, opts...)`; writes return the chunk's new version
+- chunks: `GetChunk(ctx, table, cx, cy, columns...)` returns a `*Chunk` (`Version`, `SchemaVersion`, `Present` per block, `Columns` of values per block); `SetChunk(ctx, table, cx, cy, *Chunk, opts...)` replaces every column; `NewChunk(schema)`, `Chunk.Block` / `SetBlock` / `DeleteBlock` and `Schema.Locate(x, y)` build one
+- raw chunk forms: `GetChunkRaw` and `SetChunkRaw` copy chunks as bytes; `DecodeChunk` and `EncodeChunk` convert them
+- areas: `GetArea(ctx, table, cx0, cy0, cx1, cy1, columns...)` and `GetAreaAround(ctx, table, cx, cy, radius, columns...)` return the chunks with a present block (at most `ServerInfo().MaxAreaChunks` per read)
+- scans: `ScanChunks(ctx, table, after, limit)` returns one page (`Chunks`, `More`); `AllChunks(ctx, table, limit)` iterates every page
+- tables: `CreateTable`, `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` (`ConvertNone`, `ConvertClamp`, `ConvertDefault`, `ConvertTruncate`), `SetTableOption`, `DropTable`, `Tables`, `Describe`, `Schema`
+- server: `Ping`, `FlushWAL` (returns once every acknowledged write is durable), `Metrics` (Prometheus text), `ServerInfo()` (version and limits from `HELLO 3`)
+- any statement: `Do(ctx, statement, params...)` sends raw parameter frames (`EncodeValue` builds them; `nil` is NULL) and returns the decoded `Reply`
 
-- `Connect(ctx, Options) (*Client, error)`
-- `ConnectURI(ctx, uri) (*Client, error)`
-- `NewClient(Options) (*Client, error)` — build without connecting
-- `ConnectPool(ctx, PoolOptions) (*Pool, error)`
-- `NewPool(PoolOptions) (*Pool, error)`
-- `ParseURI(string) (URI, error)`; `URI.Table()` and `TableFromPath(path)`
-  report the table a path names (empty for `/`)
-- `SerializeCommand(parts ...string) ([]byte, error)`, `ReadFrame(*bufio.Reader) (Frame, error)`,
-  `ParseInfo([]byte) map[string]string`; `$-1` reads as a `FrameNull` frame,
-  and array items are `FrameBulk` or `FrameNull` frames
-- `ZRLECompress([]byte) []byte`, `ZRLEDecompress([]byte, int) ([]byte, error)`
+`Pool` mirrors the statement methods and adds `WithClient(ctx, fn)`.
 
-`Client` methods:
+## Conditional writes
 
-- `Connect(ctx)` / `Close()` / `URI()` — the URI path is the selected table
-- `ServerInfo() *HelloInfo` — the `HELLO` reply of the most recent
-  connection, nil before the first: `ServerVersion`, `Capabilities`,
-  `MaxLineBytes`, `MaxAreaChunks`, `MaxResponseBytes`, `MaxScanLimit`,
-  `MaxBatchOps`, and `Table` (geometry and options, or nil)
-- `CurrentTable()` — the table this client works on
-- `Tables(ctx) ([]string, error)`
-- `TableInfo(ctx, name) (TableInfo, error)` — geometry, options and store id
-- `Use(ctx, name) (TableInfo, error)` — selects a table for this client; an
-  unknown name fails with `CodeNoTable` and keeps the current one
-- `Table(ctx, name) (*Client, error)` — a new connected client on `name`
-- `CreateTable(ctx, name, TableSpec)`, `SetTableOptions(ctx, name, TableOptions)`,
-  `DropTable(ctx, name)`
-- `Ping(ctx)`
-- `Info(ctx)` — runtime statistics of the selected table
-- `Get(ctx, x, y) (BlockState, error)` — `{Exists: false}` for an unset block
-- `Set(ctx, x, y, bits)`
-- `Unset(ctx, x, y)`
-- `MSet(ctx, blocks []Block)` — batch write, one round-trip; items apply in order
-  and are not atomic as a group (on error, earlier items may already be
-  applied) — use `ChunkBatch` for an atomic single-chunk update
-- `MGet(ctx, blocks []BlockRef) ([]BlockState, error)` — batch read, one round-trip
-- `ChunkExists(ctx, cx, cy)`
-- `GetChunk(ctx, cx, cy, GetOptions) ([]byte, error)` — the payload
-- `GetChunkState(ctx, cx, cy, GetOptions) (ChunkState, error)` — `Exists`,
-  `Payload`, `Presence`
-- `PutChunk(ctx, cx, cy, payload, PutOptions) (MutationResult, error)`
-- `PutChunkState(ctx, cx, cy, ChunkStateInput, PutOptions) (MutationResult, error)`
-- `ChunkScan(ctx, limit, cursor)` — enumerate populated chunks in deterministic
-  `(cx, cy)` order; returns `Coords` and `NextCursor`, pass `NextCursor` back to
-  continue (limit 1..1024 per page)
-- `ChunkRange(ctx, cx0, cy0, cx1, cy1, GetOptions)` — bounded rectangular
-  multi-chunk read (max 256 chunks, 64 MiB response cap); returns a
-  `RangeEntry{CX, CY, Payload, Presence}` per populated chunk
-- `ChunkRadius(ctx, cx, cy, radiusChunks, GetOptions)` — bounded radius/disc
-  multi-chunk read with the same limits and result shape as `ChunkRange`
-- `ChunkVersion(ctx, cx, cy) (uint64, error)` — opaque chunk version token
-- `ChunkBatch(ctx, cx, cy, operations)` / `ChunkBatchIfVersion(ctx, cx, cy, expectedVersion, operations)` —
-  atomic single-chunk batch of `SetOp` / `UnsetOp` operations; returns a
-  `MutationResult`
-- `WALFlush(ctx)` — explicit durability barrier: returns once every previously
-  acknowledged write is durable, even when the server runs in `relaxed` mode
-- `Metrics(ctx)` — Prometheus text-format runtime metrics
-
-`Pool` mirrors the same data methods and adds `Close()` and
-`WithClient(ctx, fn)`.
-
-## Versions
-
-Chunk versions are opaque tokens: they change on every content mutation and
-survive eviction and restart. A write that does not change the chunk keeps its
-version.
-
-Conditional writes (`PutOptions.IfVersion`, `ChunkBatchIfVersion`) report a
-version mismatch as a normal result rather than an error:
+`IfVersion(v)` writes only while the chunk is still at version `v`; the version belongs to the whole chunk. A mismatch changes nothing and returns a `*VersionMismatchError` with the current version:
 
 ```go
-result, err := client.ChunkBatchIfVersion(ctx, 0, 0, version, operations)
+chunk, err := client.GetChunk(ctx, "", 0, 0, "light")
 if err != nil {
 	return err
 }
-if !result.OK {
-	// result.Version is the chunk's current version; re-read, reconcile, retry.
+_, err = client.SetBlock(ctx, "", 0, 0, chunkdb.Record{"light": 9}, chunkdb.IfVersion(chunk.Version))
+var mismatch *chunkdb.VersionMismatchError
+if errors.As(err, &mismatch) {
+	// mismatch.Current is the chunk's version now: read again and retry.
 }
 ```
+
+## Schema changes
+
+The client refreshes a table's cached schema after its own `CREATE`, `ALTER` or `DROP TABLE` (also through `Do`), on `Describe`, and when the server shows the cache is out of date:
+
+- a `SetBlock` parameter whose size no longer fits its column (another client changed the type): the client fetches the schema and sends the write once more
+- a chunk form carries the schema version it was encoded for; `SetChunk` refused with `SCHEMA_MISMATCH` fetches the schema, encodes the chunk again and sends it once more, and fails to encode a chunk whose columns no longer match the table's. `SetChunkRaw` returns the `*SchemaMismatchError`
+- a parameter longer than the column now holds makes the server close the connection; that write fails and the next statement uses a fresh schema
+
+## Options
+
+```go
+client, err := chunkdb.Connect(ctx, chunkdb.Options{
+	URI:            "chunks://chunk-token@127.0.0.1:4242/world",
+	CA:             caPEM,
+	ConnectTimeout: 2 * time.Second,
+	CommandTimeout: 3 * time.Second,
+	PipelineDepth:  8,
+})
+```
+
+- explicit `Host`, `Port`, `Token` and `Table` win over the URI
+- `ConnectTimeout` bounds dialing, TLS and `HELLO`; `CommandTimeout` bounds one reply; both default to 5 seconds, and a negative value leaves deadlines to the context
+- `PipelineDepth` keeps that many requests in flight on one connection (default 1); replies come back in request order
+- TLS: `chunks://` or `TLS: true`; `CA`, `Cert`, `Key` take PEM bytes; `TLSServerName` overrides SNI; `TLSInsecure` skips verification (local testing only); TLS 1.2 or newer
+
+## Connections and pooling
+
+A `Client` is one socket, safe for concurrent use. It connects lazily and reconnects on the next request after a transport failure; the request that hit the failure returns an error. Cancelling a context aborts the call and drops the connection, since replies cannot be skipped. After an error the server closes the connection on (`BAD_REQUEST`, or `SYNTAX`, `NO_TABLE` or an unknown column in a statement with parameters), the client drops it too; requests pipelined behind it fail with `ErrConnection` and were not executed.
+
+`ConnectPool(ctx, PoolOptions{Options, MaxConnections, MinConnections, AcquireTimeout})` leases clients per operation and discards one after a transport failure. The server occupies a worker per open connection, so keep `MaxConnections` at or below its `--workers`.
 
 ## Errors
 
-Every failure is an `*Error` carrying the phase, command, and — for `-ERR ...`
-responses — the server's code and message. Classify with `errors.Is` against:
-
-- `ErrConnection`
-- `ErrTimeout`
-- `ErrProtocol` — also when the server does not speak protocol 2
-- `ErrServer`
-- `ErrAuth` (also matches `ErrServer`) — a wrong (`AUTH_FAILED`) or missing
-  (`AUTH_REQUIRED`) token
-- `ErrTLS`
-- `ErrClosed`
-
-A wrong token, a missing token, or an unknown table fails `Connect`.
-
-```go
-client, err := chunkdb.ConnectURI(ctx, "chunk://wrong-token@127.0.0.1:4242/")
-if err != nil {
-	var chunkErr *chunkdb.Error
-	switch {
-	case errors.Is(err, chunkdb.ErrAuth):
-		errors.As(err, &chunkErr)
-		log.Println("auth failed:", chunkErr.ServerCode, chunkErr.ServerMessage)
-	case errors.Is(err, chunkdb.ErrTimeout):
-		log.Println("timed out:", err)
-	default:
-		return err
-	}
-}
-```
-
-Client-side argument validation (a bit string containing anything but `0` and
-`1`, a chunk of the wrong size, an empty batch, a chunk method without a table)
-fails with `ErrProtocol` before anything is written to the socket.
+Every failure is an `*Error` with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` or `AUTH_REQUIRED`, also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrTLS`, `ErrClosed`.
 
 ## Limits
 
-- a single bulk payload is capped at `MaxBulkBytes` (64 MiB), matching the
-  server's response-size limit; a larger declared length is rejected as a
-  protocol error instead of being allocated
-- ZRLE reads bound decompression by the size the table's geometry gives and
-  reject any payload that declares or produces a different size
+- a statement is one line of at most `ServerInfo().MaxLineBytes`, CRLF included; a statement with CR or LF is refused before sending
+- a bulk reply is capped at `MaxBulkBytes` (160 MiB); a larger declared length is a protocol error
+- a chunk's text and bytes values take at most the table's `var_max_chunk_bytes`, counting 12 bytes per value

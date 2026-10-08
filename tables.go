@@ -2,234 +2,228 @@ package chunkdb
 
 import (
 	"context"
+	"reflect"
 	"strconv"
+	"strings"
 )
 
-// CurrentTable reports the table this client works on ("default" unless one
-// was selected).
-func (c *Client) CurrentTable() string {
-	if table := c.selectedTable(); table != "" {
-		return table
-	}
-	return "default"
-}
-
-// Tables lists the table names in ascending order.
+// Tables lists the table names (SHOW TABLES).
 func (c *Client) Tables(ctx context.Context) ([]string, error) {
-	release, err := c.acquireSlot(ctx, "TABLES")
+	const command = "SHOW TABLES"
+	reply, err := c.call(ctx, command, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-
-	frame, err := c.exec(ctx, "TABLES")
-	if err != nil {
-		return nil, err
+	if reply.Kind != ReplyArray {
+		return nil, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
 	}
-	items, err := expectArray(frame, "TABLES")
-	if err != nil {
-		return nil, err
-	}
-	names := make([]string, 0, len(items))
-	for _, item := range items {
-		name, err := bulkText(item, "TABLES")
+	names := make([]string, 0, len(reply.Array))
+	for _, item := range reply.Array {
+		name, err := expectBulk(item, command)
 		if err != nil {
 			return nil, err
 		}
-		names = append(names, name)
+		names = append(names, string(name))
 	}
 	return names, nil
 }
 
-// TableInfo reports a table's geometry, options and store id.
-func (c *Client) TableInfo(ctx context.Context, name string) (TableInfo, error) {
-	release, err := c.acquireSlot(ctx, "TABLEINFO")
-	if err != nil {
-		return TableInfo{}, err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "TABLEINFO", name)
-	if err != nil {
-		return TableInfo{}, err
-	}
-	return parseTableInfo(frame, "TABLEINFO")
-}
-
-// Use selects the table for this client's connection, and for every
-// reconnect. An unknown name fails with [CodeNoTable] and keeps the current
-// table. Use waits for the requests in flight on this client and holds back
-// new ones until it completes, so each runs entirely on one table.
-func (c *Client) Use(ctx context.Context, name string) (TableInfo, error) {
-	release, err := c.acquireAllSlots(ctx, "USE")
-	if err != nil {
-		return TableInfo{}, err
-	}
-	defer release()
-
-	established, err := c.connection(ctx)
-	if err != nil {
-		return TableInfo{}, err
-	}
-	return c.useOn(ctx, established, name)
-}
-
-// useOn selects a table on a connection and records it as the client's
-// selection, with its geometry.
-func (c *Client) useOn(ctx context.Context, established *conn, name string) (TableInfo, error) {
-	frame, err := c.execOn(ctx, established, "USE", name)
-	if err != nil {
-		return TableInfo{}, err
-	}
-	info, err := parseTableInfo(frame, "USE")
-	if err != nil {
-		return TableInfo{}, err
-	}
-	c.tableMu.Lock()
-	c.table = info.Name
-	c.tableMu.Unlock()
-	established.setGeometry(geometryOf(info))
-	return info, nil
-}
-
-// Table returns a new connected client on table name, with this client's
-// options; its handshake names the table. It has its own connection; close it
-// when done.
-func (c *Client) Table(ctx context.Context, name string) (*Client, error) {
-	options := c.options
-	options.Table = name
-	return Connect(ctx, options)
-}
-
-// CreateTable creates a table. Its geometry is fixed once created; its
-// options can change with [Client.SetTableOptions].
-func (c *Client) CreateTable(ctx context.Context, name string, spec TableSpec) error {
-	release, err := c.acquireSlot(ctx, "TABLECREATE")
+// CreateTable creates table ("" is the default table). Its chunk and
+// large-chunk sizes are fixed once it exists; its columns and options change
+// with the ALTER methods.
+func (c *Client) CreateTable(ctx context.Context, table string, spec TableSpec) error {
+	const command = "CREATE TABLE"
+	name, err := c.tableName(command, table)
 	if err != nil {
 		return err
 	}
-	defer release()
+	if len(spec.Columns) == 0 {
+		return requestErrorf(command, "a table needs at least one column")
+	}
+	if spec.ChunkWidth <= 0 || spec.ChunkHeight <= 0 {
+		return requestErrorf(command, "the chunk size must be positive, got %dx%d", spec.ChunkWidth, spec.ChunkHeight)
+	}
+	if spec.LargeWidth < 0 || spec.LargeHeight < 0 || (spec.LargeWidth == 0) != (spec.LargeHeight == 0) {
+		return requestErrorf(command, "the large-chunk size must be both zero or both positive, got %dx%d",
+			spec.LargeWidth, spec.LargeHeight)
+	}
+	definitions := make([]string, 0, len(spec.Columns))
+	for _, column := range spec.Columns {
+		definition, err := columnDefinition(column)
+		if err != nil {
+			return annotate(command, err)
+		}
+		definitions = append(definitions, definition)
+	}
+	statement := "CREATE TABLE " + name + " (" + strings.Join(definitions, ", ") + ") CHUNK " +
+		strconv.Itoa(spec.ChunkWidth) + " x " + strconv.Itoa(spec.ChunkHeight)
+	if spec.LargeWidth > 0 {
+		statement += " LARGE " + strconv.Itoa(spec.LargeWidth) + " x " + strconv.Itoa(spec.LargeHeight)
+	}
+	if options := optionAssignments(spec.Options); len(options) > 0 {
+		statement += " WITH " + strings.Join(options, ", ")
+	}
+	return c.tableStatement(ctx, name, statement)
+}
 
-	args := []string{name, "block_bits", strconv.Itoa(spec.BlockBits)}
-	for _, field := range []struct {
-		key   string
-		value int
-	}{
-		{"chunk_width_blocks", spec.ChunkWidthBlocks},
-		{"chunk_height_blocks", spec.ChunkHeightBlocks},
-		{"large_chunk_width_chunks", spec.LargeChunkWidthChunks},
-		{"large_chunk_height_chunks", spec.LargeChunkHeightChunks},
-	} {
-		if field.value != 0 {
-			args = append(args, field.key, strconv.Itoa(field.value))
+// columnDefinition formats a column of CREATE TABLE or ADD COLUMN.
+func columnDefinition(column ColumnDef) (string, error) {
+	if err := checkNames("", "column", column.Name); err != nil {
+		return "", err
+	}
+	if err := column.Type.validate(); err != nil {
+		return "", err
+	}
+	definition := column.Name + " " + column.Type.String()
+	if column.Null {
+		definition += " NULL"
+	}
+	if column.Required {
+		definition += " REQUIRED"
+	}
+	if column.Default != nil {
+		value, err := normalize(column.Name, column.Type, column.Default)
+		if err != nil {
+			return "", err
+		}
+		definition += " DEFAULT " + literal(value)
+	}
+	return definition, nil
+}
+
+func optionAssignments(options TableOptions) []string {
+	var out []string
+	text := func(name, value string) {
+		if value != "" {
+			out = append(out, name+" = "+literal(value))
 		}
 	}
-	args = append(args, tableOptionArgs(spec.Options)...)
-
-	frame, err := c.exec(ctx, "TABLECREATE", args...)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "TABLECREATE")
-}
-
-// SetTableOptions changes the non-zero options of a table; the server
-// reopens the table.
-func (c *Client) SetTableOptions(ctx context.Context, name string, options TableOptions) error {
-	args := tableOptionArgs(options)
-	if len(args) == 0 {
-		return requestErrorf("TABLESET", "SetTableOptions needs at least one option")
-	}
-	release, err := c.acquireSlot(ctx, "TABLESET")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "TABLESET", append([]string{name}, args...)...)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "TABLESET")
-}
-
-// DropTable deletes a table and its data. Irreversible. Connections working on
-// it get [CodeNoTable] from then on.
-func (c *Client) DropTable(ctx context.Context, name string) error {
-	release, err := c.acquireSlot(ctx, "TABLEDROP")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	frame, err := c.exec(ctx, "TABLEDROP", name)
-	if err != nil {
-		return err
-	}
-	return expectOK(frame, "TABLEDROP")
-}
-
-func tableOptionArgs(options TableOptions) []string {
-	var args []string
-	if options.DurabilityMode != "" {
-		args = append(args, "durability_mode", options.DurabilityMode)
-	}
-	if options.CheckpointUpdates != 0 {
-		args = append(args, "checkpoint_updates", strconv.Itoa(options.CheckpointUpdates))
-	}
-	if options.CheckpointWalBytes != 0 {
-		args = append(args, "checkpoint_wal_bytes", strconv.Itoa(options.CheckpointWalBytes))
-	}
-	if options.WalGroupCommitUpdates != 0 {
-		args = append(args, "wal_group_commit_updates", strconv.Itoa(options.WalGroupCommitUpdates))
-	}
-	if options.CheckpointCompression != "" {
-		args = append(args, "checkpoint_compression", options.CheckpointCompression)
-	}
-	return args
-}
-
-func parseTableInfo(frame Frame, command string) (TableInfo, error) {
-	payload, err := expectBulk(frame, command)
-	if err != nil {
-		return TableInfo{}, err
-	}
-	return parseTableValues(ParseInfo(payload), command)
-}
-
-// parseTableValues reads the TABLEINFO lines, which USE and HELLO carry too.
-func parseTableValues(values map[string]string, command string) (TableInfo, error) {
-	info := TableInfo{
-		Name:    values["table"],
-		StoreID: values["store_id"],
-		Options: TableOptions{
-			DurabilityMode:        values["durability_mode"],
-			CheckpointCompression: values["checkpoint_compression"],
-		},
-		Values: values,
-	}
-	if info.Name == "" || info.StoreID == "" || info.Options.DurabilityMode == "" ||
-		info.Options.CheckpointCompression == "" {
-		return TableInfo{}, protocolErrorf(command, "%s reply is missing table fields", command)
-	}
-	for _, field := range []struct {
-		key    string
-		target *int
-	}{
-		{"block_bits", &info.BlockBits},
-		{"chunk_width_blocks", &info.ChunkWidthBlocks},
-		{"chunk_height_blocks", &info.ChunkHeightBlocks},
-		{"large_chunk_width_chunks", &info.LargeChunkWidthChunks},
-		{"large_chunk_height_chunks", &info.LargeChunkHeightChunks},
-		{"checkpoint_updates", &info.Options.CheckpointUpdates},
-		{"checkpoint_wal_bytes", &info.Options.CheckpointWalBytes},
-		{"wal_group_commit_updates", &info.Options.WalGroupCommitUpdates},
-	} {
-		value, err := strconv.Atoi(values[field.key])
-		if err != nil || value <= 0 {
-			return TableInfo{}, protocolErrorf(command, "%s missing valid %s", command, field.key)
+	number := func(name string, value uint64) {
+		if value != 0 {
+			out = append(out, name+" = "+strconv.FormatUint(value, 10))
 		}
-		*field.target = value
 	}
-	return info, nil
+	text("durability_mode", options.DurabilityMode)
+	number("checkpoint_updates", options.CheckpointUpdates)
+	number("checkpoint_wal_bytes", options.CheckpointWalBytes)
+	number("wal_group_commit_updates", options.WalGroupCommitUpdates)
+	text("checkpoint_compression", options.CheckpointCompression)
+	number("var_max_chunk_bytes", options.VarMaxChunkBytes)
+	return out
+}
+
+// AddColumn adds a column to table ("" is the default table). A REQUIRED
+// column needs a default. Chunks written before take its default, or NULL.
+func (c *Client) AddColumn(ctx context.Context, table string, column ColumnDef) error {
+	const command = "ALTER TABLE"
+	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	definition, err := columnDefinition(column)
+	if err != nil {
+		return annotate(command, err)
+	}
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" ADD COLUMN "+definition)
+}
+
+// DropColumn drops a column of table ("" is the default table). The last
+// fixed-width column cannot be dropped.
+func (c *Client) DropColumn(ctx context.Context, table, column string) error {
+	const command = "ALTER TABLE"
+	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	if err := checkNames(command, "column", column); err != nil {
+		return err
+	}
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" DROP COLUMN "+column)
+}
+
+// RenameColumn renames a column of table ("" is the default table).
+func (c *Client) RenameColumn(ctx context.Context, table, column, newName string) error {
+	const command = "ALTER TABLE"
+	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	if err := checkNames(command, "column", column, newName); err != nil {
+		return err
+	}
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" RENAME COLUMN "+column+" TO "+newName)
+}
+
+// AlterColumnType changes the type of a column of table ("" is the default
+// table) within its family (integers, floats, text, bytes, bits). A type that
+// holds every value changes at once; for a narrower one, conversion says what
+// happens to stored values that do not fit ([ConvertNone] fails on the first).
+func (c *Client) AlterColumnType(ctx context.Context, table, column string, t ColumnType, conversion Conversion) error {
+	const command = "ALTER TABLE"
+	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	if err := checkNames(command, "column", column); err != nil {
+		return err
+	}
+	if err := t.validate(); err != nil {
+		return annotate(command, err)
+	}
+	statement := "ALTER TABLE " + name + " ALTER COLUMN " + column + " TYPE " + t.String()
+	switch conversion {
+	case ConvertNone:
+	case ConvertClamp:
+		statement += " USING CLAMP"
+	case ConvertDefault:
+		statement += " USING DEFAULT"
+	case ConvertTruncate:
+		statement += " USING TRUNCATE"
+	default:
+		return requestErrorf(command, "unknown conversion %d", conversion)
+	}
+	return c.tableStatement(ctx, name, statement)
+}
+
+// SetTableOption sets one option of table ("" is the default table), by its
+// name as [TableOptions] documents it (for example "durability_mode" or
+// "var_max_chunk_bytes"). value is a string or a non-negative integer.
+func (c *Client) SetTableOption(ctx context.Context, table, option string, value any) error {
+	const command = "ALTER TABLE"
+	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	if err := checkNames(command, "option", option); err != nil {
+		return err
+	}
+	var text string
+	if reflect.ValueOf(value).Kind() == reflect.String {
+		text = literal(reflect.ValueOf(value).String())
+	} else if negative, magnitude, ok := integerOf(value); ok && !negative {
+		text = strconv.FormatUint(magnitude, 10)
+	} else {
+		return requestErrorf(command, "option %s takes a string or a non-negative integer, got %T", option, value)
+	}
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" SET "+option+" = "+text)
+}
+
+// DropTable drops table ("" is the default table) and its data.
+func (c *Client) DropTable(ctx context.Context, table string) error {
+	name, err := c.tableName("DROP TABLE", table)
+	if err != nil {
+		return err
+	}
+	return c.tableStatement(ctx, name, "DROP TABLE "+name)
+}
+
+// tableStatement sends a statement that changes table and drops the cached
+// schema of it, whatever the outcome.
+func (c *Client) tableStatement(ctx context.Context, table, statement string) error {
+	defer c.forgetSchema(table)
+	reply, err := c.call(ctx, statement, nil)
+	if err != nil {
+		return err
+	}
+	return expectSimple(reply, commandOf(statement), "OK")
 }

@@ -93,8 +93,8 @@ func (u URI) String() string {
 }
 
 // Table reports the table the path names: "terrain" for /terrain, empty for
-// / (the server's default table). A path with more than one segment is an
-// error.
+// / (the client then uses [DefaultTableName]). A path with more than one
+// segment is an error.
 func (u URI) Table() (string, error) {
 	return TableFromPath(u.Path)
 }

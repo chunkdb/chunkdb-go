@@ -14,21 +14,22 @@ import (
 func Example() {
 	ctx := context.Background()
 
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
+	// The path names the default table: "" in a method means "world".
+	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set(ctx, 0, 0, "1011001110110011"); err != nil {
-		log.Fatal(err)
-	}
-
-	block, err := client.Get(ctx, 0, 0)
+	version, err := client.SetBlock(ctx, "", 10, 4, chunkdb.Record{"id": 23, "light": 7})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(block.Exists, block.Bits)
+	block, err := client.GetBlock(ctx, "", 10, 4, "id", "light")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(version, block["id"], block["light"])
 }
 
 func ExampleConnect() {
@@ -75,7 +76,7 @@ func ExampleConnectPool() {
 	ctx := context.Background()
 
 	pool, err := chunkdb.ConnectPool(ctx, chunkdb.PoolOptions{
-		Options:        chunkdb.Options{URI: "chunk://chunk-token@127.0.0.1:4242/"},
+		Options:        chunkdb.Options{URI: "chunk://chunk-token@127.0.0.1:4242/world"},
 		MaxConnections: 4,
 		MinConnections: 1,
 		AcquireTimeout: 2 * time.Second,
@@ -85,24 +86,23 @@ func ExampleConnectPool() {
 	}
 	defer pool.Close()
 
-	if err := pool.Set(ctx, 0, 0, "1011001110110011"); err != nil {
+	if _, err := pool.SetBlock(ctx, "", 0, 0, chunkdb.Record{"id": 1}); err != nil {
 		log.Fatal(err)
 	}
 
-	// Several commands on one leased connection.
+	// Several statements on one leased connection.
 	err = pool.WithClient(ctx, func(ctx context.Context, client *chunkdb.Client) error {
-		if err := client.Set(ctx, 1, 0, "0000111100001111"); err != nil {
+		if _, err := client.SetBlock(ctx, "", 1, 0, chunkdb.Record{"id": 2}); err != nil {
 			return err
 		}
-		return client.WALFlush(ctx)
+		return client.FlushWAL(ctx)
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-// Paging through every populated chunk.
-func ExampleClient_ChunkScan() {
+func ExampleClient_CreateTable() {
 	ctx := context.Background()
 
 	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
@@ -111,85 +111,73 @@ func ExampleClient_ChunkScan() {
 	}
 	defer client.Close()
 
-	var cursor *chunkdb.CoordPair
-	for {
-		page, err := client.ChunkScan(ctx, 256, cursor)
-		if err != nil {
-			log.Fatal(err)
-		}
-		for _, coordinate := range page.Coords {
-			fmt.Println(coordinate.CX, coordinate.CY)
-		}
-		if page.NextCursor == nil {
-			break
-		}
-		cursor = page.NextCursor
-	}
-}
-
-// Read-modify-write against an opaque chunk version. On a mismatch, re-read the
-// chunk, reconcile, and retry with the fresh version.
-func ExampleClient_PutChunkState() {
-	ctx := context.Background()
-
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
-
-	for attempt := range 5 {
-		version, err := client.ChunkVersion(ctx, 0, 0)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		state, err := client.GetChunkState(ctx, 0, 0, chunkdb.GetOptions{})
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Mark block 0 present and set its lowest payload bit.
-		state.Presence[0] |= 0x01
-		state.Payload[0] |= 0x01
-
-		result, err := client.PutChunkState(ctx, 0, 0,
-			chunkdb.ChunkStateInput{Payload: state.Payload, Presence: state.Presence},
-			chunkdb.PutOptions{IfVersion: &version, ZRLE: true})
-		if err != nil {
-			log.Fatal(err)
-		}
-		if result.OK {
-			fmt.Println("applied at version", result.Version)
-			return
-		}
-		fmt.Println("retrying after mismatch on attempt", attempt)
-	}
-}
-
-// An atomic multi-block update inside one chunk.
-func ExampleClient_ChunkBatch() {
-	ctx := context.Background()
-
-	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
-
-	result, err := client.ChunkBatch(ctx, 0, 0, []chunkdb.BatchOperation{
-		chunkdb.SetOp(0, 0, "1011001110110011"),
-		chunkdb.SetOp(1, 0, "0000111100001111"),
-		chunkdb.UnsetOp(2, 0),
+	err = client.CreateTable(ctx, "world", chunkdb.TableSpec{
+		Columns: []chunkdb.ColumnDef{
+			{Name: "id", Type: chunkdb.TypeUint(10), Required: true},
+			{Name: "light", Type: chunkdb.TypeUint(4), Default: 15},
+			{Name: "sign", Type: chunkdb.TypeText(256), Null: true},
+		},
+		ChunkWidth:  16,
+		ChunkHeight: 16,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(result.OK, result.Version)
 }
 
-// Server errors carry their protocol code, and the sentinels classify failures
-// without unwrapping.
+// Paging through every chunk with a present block.
+func ExampleClient_AllChunks() {
+	ctx := context.Background()
+
+	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	for coord, err := range client.AllChunks(ctx, "", 0) {
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(coord.CX, coord.CY)
+	}
+}
+
+// Read, compute, write IF VERSION, and retry on a mismatch.
+func ExampleIfVersion() {
+	ctx := context.Background()
+
+	client, err := chunkdb.ConnectURI(ctx, "chunk://chunk-token@127.0.0.1:4242/world")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	for range 5 {
+		chunk, err := client.GetChunk(ctx, "", 0, 0, "light")
+		if err != nil {
+			log.Fatal(err)
+		}
+		light := uint64(0)
+		if value, ok := chunk.Columns["light"][0].(uint64); ok {
+			light = value
+		}
+
+		_, err = client.SetBlock(ctx, "", 0, 0, chunkdb.Record{"light": min(light+1, 15)},
+			chunkdb.IfVersion(chunk.Version))
+		var mismatch *chunkdb.VersionMismatchError
+		if errors.As(err, &mismatch) {
+			continue
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+}
+
+// Server errors carry their code, and the sentinels classify failures without
+// unwrapping.
 func ExampleError() {
 	ctx := context.Background()
 
@@ -206,7 +194,7 @@ func ExampleError() {
 		errors.As(err, &typed)
 		fmt.Println("auth failed:", typed.ServerCode, typed.ServerMessage)
 	case errors.Is(err, chunkdb.ErrServer):
-		fmt.Println("server rejected the command:", err)
+		fmt.Println("server rejected the statement:", err)
 	case errors.Is(err, chunkdb.ErrTimeout):
 		fmt.Println("timed out:", err)
 	case errors.Is(err, chunkdb.ErrConnection):
