@@ -315,3 +315,54 @@ func TestWatchRejectsNestedPush(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWatchCloseCancelsSchemaHandshake(t *testing.T) {
+	var mu sync.Mutex
+	described := false
+	stalled := make(chan struct{}, 1)
+	server := newFakeServer(t, func(_ *fakeServer, cn net.Conn, command string) {
+		switch verbOf(command) {
+		case "HELLO":
+			mu.Lock()
+			stop := described
+			mu.Unlock()
+			if stop {
+				stalled <- struct{}{}
+			} else {
+				answerHello(cn, command)
+			}
+		case "DESCRIBE":
+			writeRaw(cn, describeReply("world", 1, worldColumns))
+		case "WATCH":
+			mu.Lock()
+			described = true
+			mu.Unlock()
+			writeRaw(cn, "+OK "+watchEpoch+" 10\r\n"+changePush(2, respNull, respArray(respInt(1))))
+		case "UNWATCH":
+			writeSimple(cn, "OK")
+		}
+	})
+	c := newTestClient(t, server, func(o *Options) { o.ConnectTimeout = -1; o.CommandTimeout = -1 })
+	w, err := c.Watch(t.Context(), "world", WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := make(chan error, 1)
+	go func() { _, err := w.Next(t.Context()); pending <- err }()
+	select {
+	case <-stalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("schema handshake did not start")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-pending:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close left Next blocked in HELLO")
+	}
+}

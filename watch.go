@@ -72,18 +72,19 @@ func (e *ResyncEvent) GetPosition() Position { return e.Position }
 // Close can interrupt a pending Next. Closing the originating Client or Pool
 // does not close a Watch: callers must close each watch themselves.
 type Watch struct {
-	client        *Client
-	metadataMu    sync.Mutex
-	metadata      *Client
-	conn          *conn
-	table         string
-	start         Position
-	schemas       map[uint64][]Column
-	pushes        chan Reply
-	closing, done chan struct{}
-	nextGate      chan struct{}
-	closeOnce     sync.Once
-	closeErr      error
+	client         *Client
+	metadataMu     sync.Mutex
+	metadataCancel context.CancelFunc
+	metadata       *Client
+	conn           *conn
+	table          string
+	start          Position
+	schemas        map[uint64][]Column
+	pushes         chan Reply
+	closing, done  chan struct{}
+	nextGate       chan struct{}
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 // Watch opens a stream with the client's endpoint, TLS options and login.
@@ -197,6 +198,11 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 	select {
 	case reply := <-w.pushes:
 		event, err := w.decode(ctx, reply)
+		select {
+		case <-w.closing:
+			return nil, closedError("WATCH")
+		default:
+		}
 		if err != nil {
 			_ = w.conn.shutdown(err)
 		}
@@ -216,6 +222,12 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 func (w *Watch) Close() error {
 	w.closeOnce.Do(func() {
 		close(w.closing)
+		w.metadataMu.Lock()
+		lookupCancel := w.metadataCancel
+		w.metadataMu.Unlock()
+		if lookupCancel != nil {
+			lookupCancel()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 		if w.client.opts.commandTimeout > 0 {
 			cancel()
@@ -402,24 +414,29 @@ func decodeWatchRow(columns []Column, r Reply) (Record, error) {
 // Describe connections are short-lived: idle ordinary connections occupy
 // statement workers, so holding one would starve WATCH setup on small servers.
 func (w *Watch) describe(ctx context.Context) (*Schema, error) {
+	lookupCtx, cancel := context.WithCancel(ctx)
 	metadata := w.client.copyOptions()
 	w.metadataMu.Lock()
 	select {
 	case <-w.closing:
 		w.metadataMu.Unlock()
+		cancel()
 		_ = metadata.Close()
 		return nil, closedError("WATCH")
 	default:
 	}
 	w.metadata = metadata
+	w.metadataCancel = cancel
 	w.metadataMu.Unlock()
 	defer func() {
+		cancel()
 		_ = metadata.Close()
 		w.metadataMu.Lock()
 		if w.metadata == metadata {
 			w.metadata = nil
+			w.metadataCancel = nil
 		}
 		w.metadataMu.Unlock()
 	}()
-	return metadata.Describe(ctx, w.table)
+	return metadata.Describe(lookupCtx, w.table)
 }
