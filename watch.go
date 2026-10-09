@@ -72,16 +72,18 @@ func (e *ResyncEvent) GetPosition() Position { return e.Position }
 // Close can interrupt a pending Next. Closing the originating Client or Pool
 // does not close a Watch: callers must close each watch themselves.
 type Watch struct {
-	client, metadata *Client
-	conn             *conn
-	table            string
-	start            Position
-	schemas          map[uint64][]Column
-	pushes           chan Reply
-	closing, done    chan struct{}
-	nextGate         chan struct{}
-	closeOnce        sync.Once
-	closeErr         error
+	client        *Client
+	metadataMu    sync.Mutex
+	metadata      *Client
+	conn          *conn
+	table         string
+	start         Position
+	schemas       map[uint64][]Column
+	pushes        chan Reply
+	closing, done chan struct{}
+	nextGate      chan struct{}
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 // Watch opens a stream with the client's endpoint, TLS options and login.
@@ -111,19 +113,16 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		statement += " AFTER " + p.Epoch + " " + strconv.FormatUint(p.Revision, 10)
 	}
 	dedicated := c.copyOptions()
-	metadata := c.copyOptions()
-	w := &Watch{client: dedicated, metadata: metadata, table: name, schemas: make(map[uint64][]Column), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
+	w := &Watch{client: dedicated, table: name, schemas: make(map[uint64][]Column), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
 	// Seed before WATCH, so schema changes racing with setup are retained in
 	// the stream rather than decoded with a later DESCRIBE's columns.
-	schema, err := metadata.Describe(ctx, name)
+	schema, err := w.describe(ctx)
 	if err != nil {
-		_ = metadata.Close()
 		return nil, err
 	}
 	w.schemas[schema.Version] = schema.Columns
 	cn, err := dedicated.connection(ctx)
 	if err != nil {
-		_ = metadata.Close()
 		_ = dedicated.Close()
 		return nil, err
 	}
@@ -137,7 +136,6 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 	cn.mu.Unlock()
 	if err != nil {
 		_ = dedicated.Close()
-		_ = metadata.Close()
 		return nil, err
 	}
 	if err = checkLimits(cn.info, "WATCH", statement, nil); err == nil {
@@ -149,7 +147,6 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 	}
 	if err != nil {
 		_ = dedicated.Close()
-		_ = metadata.Close()
 		return nil, err
 	}
 	return w, nil
@@ -235,7 +232,12 @@ func (w *Watch) Close() error {
 			w.closeErr = err
 		}
 		_ = w.client.Close()
-		_ = w.metadata.Close()
+		w.metadataMu.Lock()
+		metadata := w.metadata
+		w.metadataMu.Unlock()
+		if metadata != nil {
+			_ = metadata.Close()
+		}
 	})
 	return w.closeErr
 }
@@ -280,7 +282,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		}
 		return &ResyncEvent{Position: pos}, nil
 	case "schema":
-		if len(a) != 5 || a[4].Kind != ReplyArray {
+		if len(a) != 5 || a[4].Kind != ReplyArray || len(a[4].Array) == 0 {
 			return bad()
 		}
 		version, ok := a[3].Uint64()
@@ -288,11 +290,18 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 			return bad()
 		}
 		columns := make([]Column, 0, len(a[4].Array))
+		names := make(map[string]bool)
+		ids := make(map[uint32]bool)
 		for _, item := range a[4].Array {
 			col, err := parseColumn(item)
 			if err != nil {
 				return nil, annotate("WATCH", err)
 			}
+			if names[col.Name] || ids[col.ID] {
+				return nil, protocolErrorf("WATCH", "duplicate schema column name or ID")
+			}
+			names[col.Name] = true
+			ids[col.ID] = true
 			columns = append(columns, col)
 		}
 		w.schemas[version] = columns
@@ -320,7 +329,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		}
 		columns, ok := w.schemas[version]
 		if !ok {
-			schema, err := w.metadata.Describe(ctx, w.table)
+			schema, err := w.describe(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -388,4 +397,29 @@ func decodeWatchRow(columns []Column, r Reply) (Record, error) {
 		out[col.Name] = v
 	}
 	return out, nil
+}
+
+// Describe connections are short-lived: idle ordinary connections occupy
+// statement workers, so holding one would starve WATCH setup on small servers.
+func (w *Watch) describe(ctx context.Context) (*Schema, error) {
+	metadata := w.client.copyOptions()
+	w.metadataMu.Lock()
+	select {
+	case <-w.closing:
+		w.metadataMu.Unlock()
+		_ = metadata.Close()
+		return nil, closedError("WATCH")
+	default:
+	}
+	w.metadata = metadata
+	w.metadataMu.Unlock()
+	defer func() {
+		_ = metadata.Close()
+		w.metadataMu.Lock()
+		if w.metadata == metadata {
+			w.metadata = nil
+		}
+		w.metadataMu.Unlock()
+	}()
+	return metadata.Describe(ctx, w.table)
 }

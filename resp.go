@@ -223,6 +223,9 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 		return Reply{Kind: ReplyBulk, Bulk: payload[:length:length]}, nil
 
 	case '*', '>':
+		if prefix == '>' && depth != 0 {
+			return Reply{}, protocolErrorf("", "push must be a top-level reply")
+		}
 		count, err := parseCount(line, "array")
 		if err != nil {
 			return Reply{}, err

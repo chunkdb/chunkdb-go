@@ -294,3 +294,24 @@ func TestPushOutsideWatchRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWatchInvalidSchemaColumns(t *testing.T) {
+	for name, columns := range map[string][]string{
+		"empty":          {},
+		"duplicate_name": {fakeColumn(1, "v", "u8", false, false, respNull), fakeColumn(2, "v", "u8", false, false, respNull)},
+		"duplicate_id":   {fakeColumn(1, "a", "u8", false, false, respNull), fakeColumn(1, "b", "u8", false, false, respNull)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, w := fakeWatch(t, push(respBulk("schema"), respBulk(watchEpoch), respInt(11), respInt(2), respArray(columns...)), worldColumns)
+			if _, err := w.Next(t.Context()); !errors.Is(err, ErrProtocol) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+func TestWatchRejectsNestedPush(t *testing.T) {
+	_, w := fakeWatch(t, push(respBulk("resync"), respBulk(watchEpoch), push(respInt(11))), worldColumns)
+	if _, err := w.Next(t.Context()); !errors.Is(err, ErrProtocol) {
+		t.Fatal(err)
+	}
+}

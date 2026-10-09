@@ -13,7 +13,7 @@ func TestIntegrationWatch(t *testing.T) {
 			name = "tls"
 		}
 		t.Run(name, func(t *testing.T) {
-			s := startServer(t, serverConfig{tls: secure, workers: 4})
+			s := startServer(t, serverConfig{tls: secure, workers: 2})
 			c := connectIntegration(t, s, func(o *Options) {
 				if secure {
 					o.CA = s.caPEM
@@ -97,7 +97,7 @@ func TestIntegrationWatch(t *testing.T) {
 	}
 }
 func TestIntegrationPoolWatch(t *testing.T) {
-	s := startServer(t, serverConfig{workers: 3})
+	s := startServer(t, serverConfig{workers: 2})
 	c := connectIntegration(t, s, nil)
 	createTable(t, c, "watched", TableSpec{Columns: []ColumnDef{{Name: "v", Type: TypeInt(8)}}, ChunkWidth: 2, ChunkHeight: 2})
 	pool, err := NewPool(PoolOptions{Options: Options{URI: s.uri}, MaxConnections: 1})
