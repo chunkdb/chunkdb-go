@@ -18,7 +18,7 @@ type Position struct {
 	Revision uint64
 }
 
-// WatchOptions select an area and an optional retained position to resume after.
+// WatchOptions select a slot, area and optional position to resume after.
 type WatchOptions struct {
 	// Slot selects a durable consumer. Empty keeps an in-memory watch.
 	Slot  string

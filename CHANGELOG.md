@@ -19,6 +19,7 @@ the engine's
 - Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
+- Durable slots: Client/Pool `CreateSlot`, `DropSlot`, typed `Slots`, `WatchOptions.Slot`, and cancellable write-only `Watch.Ack`; slot ACK rejections are recoverable through `Next`, with `CodeSlotLost` for expired history
 - `Client.Watch` and `Pool.Watch` stream typed change, schema and resync events over dedicated logged-in connections, with AREA/AFTER, schema-version decoding, exact overflow coordinates and draining UNWATCH close
 - Transactions: `Client.Transaction(ctx, func(tx *Tx) error, opts...)` and `Pool.Transaction` run `BEGIN` ... `COMMIT` on one connection held for the whole transaction and return the commit version (0 when nothing was written); `Tx` has the block, chunk and area methods without `IfVersion`. On `CONFLICT` the function runs again after a short pause, up to `DefaultTxRetries` (5) times (`TxRetries`); an error from the function rolls back. `CONFLICT` is a `*ConflictError` with its `Reason`, matching `ErrConflict` and `ErrServer`
 - Users: `CreateUser` (`CreateUserOptions`), `SetPassword`, `SetManagesUsers`, `DropUser`, `Grant`, `Revoke` (`Right`, `AllTables`) and `Users` (`User`); the client computes verifiers from passwords (`ComputeVerifier`, `Options.VerifierIterations`, 4096 by default)

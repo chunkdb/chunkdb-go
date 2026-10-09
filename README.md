@@ -99,6 +99,46 @@ After a lost connection, open another watch with `WatchOptions{After: &last}`, w
 
 The stream caches columns by schema version and updates them on schema events. An uncached version triggers DESCRIBE on another short-lived connection; schema lookups release their connections before WATCH setup and after each lookup. If that version is no longer available, Next ends with `ErrProtocol` rather than decoding old rows with new columns; rebuild state and resume. Cancelling Next while waiting leaves the watch open; a failure during schema lookup or decoding ends it. `Close` sends UNWATCH, drains queued pushes through its reply, and closes the dedicated connections. The command timeout bounds closing (five seconds if disabled); idle Next calls use only their context.
 
+### Durable slots
+
+`Client.CreateSlot(ctx, table, name)` and `DropSlot` need ADMIN. `Client.Slots(ctx, table)` returns `[]Slot` with `Table`, `Name`, `Epoch`, `Acked`, `RetainedBytes` and `Lost`; an empty table lists all visible tables. Create/Drop use the default table when empty. Pool exposes the same methods. Names are `[a-z_][a-z0-9_]*`, at most 63 bytes.
+
+Set `WatchOptions.Slot` to resume a durable consumer. The initial position is the stored ACK, or a later `After` position. AFTER does not acknowledge data. Slots replay archived changes, send historical schema descriptions before their rows, then join the live stream. Only changes through the server's persisted durable frontier are sent, including in relaxed mode. A slot allows one active watch (`CodeBusy`).
+
+`watch.Ack(ctx, revision)` writes an ACK without waiting for a reply. It rejects decreasing revisions, revisions beyond the last returned event or initial position, and use on an ordinary watch. Successful writing does not confirm persistence: the server batches ACKs across the table at most every 100 ms; `Close` sends UNWATCH and waits for persistence. Server ACK `INVALID_ARGUMENT` is returned by the next `Next` call; that stream remains usable. Other stream errors end it. Close can also report a terminal asynchronous server error. Context cancellation during a partial ACK write closes the connection because the request may be incomplete.
+
+For exactly-once effects, atomically store your output **and** its `Position` in the same external transaction, then ACK. On reconnect, pass the saved position as `After`, and ignore already applied revisions in that epoch. ACK alone cannot make a separate sink exactly-once: a crash may repeat events after the server's last persisted ACK. For example, after creating the slot and initializing your sink's position:
+
+```go
+last := loadSavedPosition() // your sink's last committed Position
+watch, err := client.Watch(ctx, "world", chunkdb.WatchOptions{
+    Slot: "consumer", After: &last,
+})
+if err != nil { log.Fatal(err) }
+defer watch.Close()
+for {
+    event, err := watch.Next(ctx)
+    if err != nil { log.Fatal(err) }
+    switch e := event.(type) {
+    case *chunkdb.SchemaEvent:
+        // Columns describe later rows; do not ACK a description prefacing a change.
+        continue
+    case *chunkdb.ResyncEvent:
+        log.Fatal("rebuild and save consumer state before resuming")
+    case *chunkdb.ChangeEvent:
+        if e.Position.Epoch == last.Epoch && e.Position.Revision <= last.Revision {
+            continue
+        }
+        // This application function commits output and Position atomically.
+        if err := saveOutputAndPosition(e.Blocks, e.Position); err != nil { log.Fatal(err) }
+        last = e.Position
+        if err := watch.Ack(ctx, last.Revision); err != nil { log.Fatal(err) }
+    }
+}
+```
+
+A schema description prefacing a historical change uses that change's position; acknowledge it only after applying the change. Independently versioned live schema events may be acknowledged after application. If retained history exceeds the server's slot limit, `Lost` becomes true and WATCH ends or fails with `CodeSlotLost`. Rebuild consumer state, drop the lost slot and create it again; creating its existing name fails until it is dropped.
+
 ## API
 
 - blocks: `GetBlock(ctx, table, x, y, columns...)`, `SetBlock(ctx, table, x, y, Record, opts...)`, `DeleteBlock(ctx, table, x, y, opts...)`; writes return the chunk's new version

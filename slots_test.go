@@ -220,3 +220,60 @@ func TestWatchAckInterruptedWrite(t *testing.T) {
 		})
 	}
 }
+
+func TestSlotAckUint64AndConcurrentControls(t *testing.T) {
+	received := make(chan string, 16)
+	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		switch verbOf(command) {
+		case "DESCRIBE":
+			writeRaw(cn, describeReply("world", 1, worldColumns))
+		case "WATCH":
+			writeRaw(cn, "+OK "+watchEpoch+" 18446744073709551615\r\n")
+		case "ACK":
+			received <- command
+		case "UNWATCH":
+			received <- command
+			writeSimple(cn, "OK")
+		}
+	}))
+	c := newTestClient(t, s, nil)
+	w, err := c.Watch(t.Context(), "world", WatchOptions{Slot: "consumer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := w.Ack(canceled, math.MaxUint64); !errors.Is(err, ErrTimeout) {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := w.Ack(t.Context(), math.MaxUint64); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	for range 8 {
+		if got := <-received; got != "ACK 18446744073709551615" {
+			t.Fatal(got)
+		}
+	}
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := w.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := <-received; got != "UNWATCH" {
+		t.Fatal(got)
+	}
+}
