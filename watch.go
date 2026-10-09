@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Area is an inclusive rectangle of chunk coordinates.
@@ -19,6 +20,8 @@ type Position struct {
 
 // WatchOptions select an area and an optional retained position to resume after.
 type WatchOptions struct {
+	// Slot selects a durable consumer. Empty keeps an in-memory watch.
+	Slot  string
 	Area  *Area
 	After *Position
 }
@@ -85,6 +88,13 @@ type Watch struct {
 	nextGate       chan struct{}
 	closeOnce      sync.Once
 	closeErr       error
+	slot           string
+	controlGate    chan struct{}
+	ackContext     context.Context
+	ackCancel      context.CancelFunc
+	ackMu          sync.Mutex
+	delivered      Position
+	acknowledged   uint64
 }
 
 // Watch opens a stream with the client's endpoint, TLS options and login.
@@ -101,6 +111,12 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		return nil, err
 	}
 	statement := "WATCH " + name
+	if opts.Slot != "" {
+		if err := slotName("WATCH", opts.Slot); err != nil {
+			return nil, err
+		}
+		statement += " SLOT '" + opts.Slot + "'"
+	}
 	if a := opts.Area; a != nil {
 		if a.CX0 > a.CX1 || a.CY0 > a.CY1 {
 			return nil, requestErrorf("WATCH", "inverted area")
@@ -115,6 +131,9 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 	}
 	dedicated := c.copyOptions()
 	w := &Watch{client: dedicated, table: name, schemas: make(map[uint64][]Column), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
+	w.slot = opts.Slot
+	w.controlGate = make(chan struct{}, 1)
+	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 	// Seed before WATCH, so schema changes racing with setup are retained in
 	// the stream rather than decoded with a later DESCRIBE's columns.
 	schema, err := w.describe(ctx)
@@ -150,6 +169,8 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		_ = dedicated.Close()
 		return nil, err
 	}
+	w.delivered = w.start
+	w.acknowledged = w.start.Revision
 	return w, nil
 }
 
@@ -197,6 +218,9 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 	}
 	select {
 	case reply := <-w.pushes:
+		if reply.Kind == ReplyError {
+			return nil, replyError(PhaseResponse, "ACK", reply)
+		}
 		event, err := w.decode(ctx, reply)
 		select {
 		case <-w.closing:
@@ -205,6 +229,10 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 		}
 		if err != nil {
 			_ = w.conn.shutdown(err)
+		} else {
+			w.ackMu.Lock()
+			w.delivered = event.GetPosition()
+			w.ackMu.Unlock()
 		}
 		return event, err
 	case <-ctx.Done():
@@ -222,6 +250,9 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 func (w *Watch) Close() error {
 	w.closeOnce.Do(func() {
 		close(w.closing)
+		w.ackCancel()
+		w.controlGate <- struct{}{}
+		defer func() { <-w.controlGate }()
 		w.metadataMu.Lock()
 		lookupCancel := w.metadataCancel
 		w.metadataMu.Unlock()
@@ -439,4 +470,88 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 		w.metadataMu.Unlock()
 	}()
 	return metadata.Describe(lookupCtx, w.table)
+}
+
+// Ack acknowledges applied work on a slot watch. It completes after writing the
+// request, not after persistence: success has no server reply. An asynchronous
+// rejection is returned by Next; INVALID_ARGUMENT leaves the stream open.
+// Revisions must not decrease or exceed the last returned event (or Start).
+// A schema description prefacing a change must only be acknowledged after
+// applying that change. Close flushes accepted acknowledgements via UNWATCH.
+func (w *Watch) Ack(ctx context.Context, revision uint64) error {
+	if err := ctx.Err(); err != nil {
+		return timeoutErrorf("ACK", err, "%s", err)
+	}
+	select {
+	case w.controlGate <- struct{}{}:
+	case <-ctx.Done():
+		return timeoutErrorf("ACK", ctx.Err(), "%s", ctx.Err())
+	case <-w.closing:
+		return closedError("ACK")
+	}
+	defer func() { <-w.controlGate }()
+	select {
+	case <-w.closing:
+		return closedError("ACK")
+	default:
+	}
+	if w.slot == "" {
+		return requestErrorf("ACK", "ACK requires a slot watch")
+	}
+	w.ackMu.Lock()
+	valid := revision >= w.acknowledged && revision <= w.delivered.Revision
+	w.ackMu.Unlock()
+	if !valid {
+		return requestErrorf("ACK", "revision must be between acknowledged and last delivered revision")
+	}
+	statement := "ACK " + strconv.FormatUint(revision, 10)
+	if err := checkLimits(w.conn.info, "ACK", statement, nil); err != nil {
+		return err
+	}
+	wire, err := encodeRequest("ACK", statement, nil)
+	if err != nil {
+		return err
+	}
+	ackCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopClose := context.AfterFunc(w.ackContext, cancel)
+	defer stopClose()
+	deadline := w.client.commandDeadline(ackCtx, "ACK")
+	defer deadline.cancel()
+	cn := w.conn
+	cn.writeMu.Lock()
+	defer cn.writeMu.Unlock()
+	if err := cn.terminalError(); err != nil {
+		return err
+	}
+	if deadline.ctx.Err() != nil {
+		return deadline.err()
+	}
+	if at, ok := deadline.ctx.Deadline(); ok {
+		_ = cn.netConn.SetWriteDeadline(at)
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(deadline.ctx, func() { _ = cn.netConn.SetWriteDeadline(time.Now()); close(interrupted) })
+	_, err = cn.writer.Write(wire)
+	if err == nil {
+		err = cn.writer.Flush()
+	}
+	if !stop() {
+		<-interrupted
+	}
+	_ = cn.netConn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		var wrapped error
+		if deadline.ctx.Err() != nil {
+			wrapped = deadline.err()
+		} else {
+			wrapped = newError(KindConnection, PhaseRequest, "ACK", "write request: "+err.Error(), err)
+		}
+		_ = cn.shutdown(wrapped)
+		return wrapped
+	}
+	w.ackMu.Lock()
+	w.acknowledged = revision
+	w.ackMu.Unlock()
+	return nil
 }

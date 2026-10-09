@@ -107,6 +107,8 @@ const (
 	CodeBadRequest = "BAD_REQUEST"
 	// CodeBusy: the server has no room for the connection.
 	CodeBusy = "BUSY"
+	// CodeSlotLost: a durable slot exceeded its retention limit.
+	CodeSlotLost = "SLOT_LOST"
 	// CodeInternal: a server failure. After a write, a message starting with
 	// "write outcome unknown" means the write may or may not be applied.
 	CodeInternal = "INTERNAL"
