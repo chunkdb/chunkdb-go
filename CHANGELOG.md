@@ -29,7 +29,7 @@ the engine's
 - Tables: `CreateTable` with `ColumnDef` columns, `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` (`Conversion`), `SetTableOption`, `DropTable`, `Tables`, `Describe` and the cached `Schema`, refreshed after the client's own table statements and once when a write's parameter has the wrong size for its column
 - `Do(ctx, statement, params...)` sends any statement and returns the decoded RESP3 `Reply`
 - `FlushWAL`, `Metrics` (`SHOW METRICS`), `DefaultTable`; error codes as `Code*` constants
-- The client drops the connection after the error replies on which the server closes it
+- The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ## 1.1.0 - 2026-09-03
 

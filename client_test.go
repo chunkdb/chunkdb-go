@@ -1117,6 +1117,62 @@ func TestClientInFlightRequestsFailWhenConnectionDrops(t *testing.T) {
 	}
 }
 
+func TestClientReconnectsAfterAClosingErrorReply(t *testing.T) {
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, statement string) {
+		if commandOf(statement) == "SET BLOCK" {
+			writeServerError(conn, "ERR INVALID_ARGUMENT the table has no column nope")
+			_ = conn.Close()
+			return
+		}
+		genericHandler(s, conn, statement)
+	}))
+	client := newTestClient(t, server, nil)
+	if _, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world nope = $1", []byte{1}); !isServerCode(err, CodeInvalidArgument) {
+		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
+	}
+	if err := client.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping after closing error: %v", err)
+	}
+	if got := server.acceptedConns(); got != 2 {
+		t.Fatalf("got %d connections, want 2", got)
+	}
+}
+
+type pendingCloseConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *pendingCloseConn) Close() error {
+	close(c.entered)
+	<-c.release
+	return c.Conn.Close()
+}
+
+func TestClientReconnectsWhileSocketCloseIsPending(t *testing.T) {
+	server := newFakeServer(t, withHello(genericHandler))
+	client := newTestClient(t, server, nil)
+	active := client.active
+	blocked := &pendingCloseConn{Conn: active.netConn, entered: make(chan struct{}), release: make(chan struct{})}
+	active.netConn = blocked
+	finished := make(chan struct{})
+	go func() {
+		_ = active.shutdown(connectionErrorf("", nil, "server closed the connection"))
+		close(finished)
+	}()
+	<-blocked.entered
+	defer func() { close(blocked.release); <-finished }()
+	// Teardown has marked the socket failed but cannot detach it until Close
+	// returns. A plain request must dial without writing into that socket.
+	if err := client.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping during teardown: %v", err)
+	}
+	if got := server.acceptedConns(); got != 2 {
+		t.Fatalf("got %d connections, want 2", got)
+	}
+}
+
 func TestClientReconnectsWhenTheConnectionDiesBeforeUse(t *testing.T) {
 	// The server answers HELLO and hangs up immediately, so the connection is
 	// already dead by the time the client finishes connecting and would publish

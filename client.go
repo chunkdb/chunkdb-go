@@ -289,10 +289,11 @@ func (c *Client) connection(ctx context.Context) (*conn, error) {
 		c.mu.Unlock()
 		return nil, closedError("")
 	}
-	if active := c.active; active != nil {
+	if active := c.active; active != nil && active.terminalError() == nil {
 		c.mu.Unlock()
 		return active, nil
 	}
+	c.active = nil
 	c.mu.Unlock()
 
 	select {
@@ -308,10 +309,11 @@ func (c *Client) connection(ctx context.Context) (*conn, error) {
 		c.mu.Unlock()
 		return nil, closedError("")
 	}
-	if active := c.active; active != nil {
+	if active := c.active; active != nil && active.terminalError() == nil {
 		c.mu.Unlock()
 		return active, nil
 	}
+	c.active = nil
 	c.mu.Unlock()
 
 	established, err := c.dial(ctx)
@@ -752,6 +754,9 @@ func (cn *conn) shutdown(cause error) error {
 	cn.mu.Lock()
 	if cn.failed {
 		cn.mu.Unlock()
+		// Another teardown may still be closing the socket. Complete detaching
+		// before returning a closing error reply to the caller.
+		cn.client.detach(cn)
 		return nil
 	}
 	cn.failed = true

@@ -111,6 +111,39 @@ func (s *txServer) entries() []string {
 
 const conflictReply = "-ERR CONFLICT chunk_changed chunk (0, 0) changed after the snapshot\r\n"
 
+func TestTransactionDoesNotReconnectAfterAClosingErrorReply(t *testing.T) {
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, statement string) {
+		switch commandOf(statement) {
+		case "BEGIN":
+			writeSimple(conn, "OK")
+		case "SET BLOCK":
+			writeServerError(conn, "ERR INVALID_ARGUMENT the table has no column nope")
+			_ = conn.Close()
+		default:
+			genericHandler(s, conn, statement)
+		}
+	}))
+	client := newTestClient(t, server, nil)
+	attempts := 0
+	_, err := client.Transaction(t.Context(), func(tx *Tx) error {
+		attempts++
+		if _, err := tx.call(t.Context(), "SET BLOCK 0 0 IN world nope = $1", [][]byte{{1}}); !isServerCode(err, CodeInvalidArgument) {
+			t.Fatalf("got %v, want INVALID_ARGUMENT", err)
+		}
+		err := tx.DeleteBlock(t.Context(), "world", 1, 1)
+		if !errors.Is(err, ErrConnection) || server.acceptedConns() != 1 {
+			t.Fatalf("statement after closing error: %v on %d connections", err, server.acceptedConns())
+		}
+		return err
+	})
+	if !errors.Is(err, ErrConnection) || attempts != 1 {
+		t.Fatalf("got %v after %d attempts, want a connection error without retry", err, attempts)
+	}
+	if err := client.Ping(t.Context()); err != nil || server.acceptedConns() != 2 {
+		t.Fatalf("Ping after transaction: %v on %d connections", err, server.acceptedConns())
+	}
+}
+
 func TestTransactionRetriesAfterAConflict(t *testing.T) {
 	server, state := newTxServer(t)
 	state.commits = []string{conflictReply, respInt(42)}
