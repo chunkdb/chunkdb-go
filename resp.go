@@ -43,6 +43,8 @@ const (
 	ReplyArray
 	// ReplyMap is "%<n>" followed by n key/value pairs.
 	ReplyMap
+	// ReplyPush carries an unsolicited WATCH event.
+	ReplyPush
 )
 
 // Reply is one decoded server reply. Only the fields belonging to Kind are
@@ -220,7 +222,7 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 		}
 		return Reply{Kind: ReplyBulk, Bulk: payload[:length:length]}, nil
 
-	case '*':
+	case '*', '>':
 		count, err := parseCount(line, "array")
 		if err != nil {
 			return Reply{}, err
@@ -235,7 +237,11 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 			}
 			items = append(items, item)
 		}
-		return Reply{Kind: ReplyArray, Array: items}, nil
+		kind := ReplyArray
+		if prefix == '>' {
+			kind = ReplyPush
+		}
+		return Reply{Kind: kind, Array: items}, nil
 
 	case '%':
 		count, err := parseCount(line, "map")
