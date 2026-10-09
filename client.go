@@ -707,6 +707,10 @@ func (cn *conn) readLoop() {
 		cn.mu.Lock()
 		watch := cn.watch
 		cn.mu.Unlock()
+		if watch == nil && reply.Kind == ReplyPush {
+			_ = cn.shutdown(protocolErrorf("", "push outside a watch"))
+			return
+		}
 		if watch != nil && (reply.Kind == ReplyPush || reply.Kind == ReplyError) {
 			if reply.Kind == ReplyError {
 				_ = cn.shutdown(replyError(PhaseResponse, "WATCH", reply))

@@ -207,3 +207,90 @@ func TestWatchLostConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestWatchOptionsAndStartValidation(t *testing.T) {
+	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		if verbOf(command) == "DESCRIBE" {
+			writeRaw(cn, describeReply("world", 1, worldColumns))
+		} else {
+			writeRaw(cn, "+OK bad 1\r\n")
+		}
+	}))
+	c := newTestClient(t, s, nil)
+	for _, opts := range []WatchOptions{{Area: &Area{1, 0, 0, 0}}, {After: &Position{Epoch: "bad", Revision: 1}}} {
+		if _, err := c.Watch(t.Context(), "world", opts); !errors.Is(err, ErrProtocol) {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.Watch(t.Context(), "world", WatchOptions{Area: &Area{-1, -2, 3, 4}, After: &Position{watchEpoch, math.MaxUint64}}); !errors.Is(err, ErrProtocol) {
+		t.Fatal(err)
+	}
+	if got := s.lastCommand(t); got != "WATCH world AREA -1 -2 TO 3 4 AFTER "+watchEpoch+" 18446744073709551615" {
+		t.Fatal(got)
+	}
+}
+func TestWatchHistoricalSchemaUnavailable(t *testing.T) {
+	col := []string{fakeColumn(1, "v", "i8", false, false, respNull)}
+	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		if verbOf(command) == "DESCRIBE" {
+			writeRaw(cn, describeReply("world", 2, col))
+		} else if verbOf(command) == "WATCH" {
+			writeRaw(cn, "+OK "+watchEpoch+" 10\r\n"+changePush(1, respNull, respArray(respInt(1))))
+		}
+	}))
+	c := newTestClient(t, s, nil)
+	w, err := c.Watch(t.Context(), "world", WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, err := w.Next(t.Context()); !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "schema version 1 unavailable") {
+		t.Fatal(err)
+	}
+	if _, err := w.Next(t.Context()); !errors.Is(err, ErrProtocol) {
+		t.Fatal(err)
+	}
+}
+func TestWatchNextCancellationThenResume(t *testing.T) {
+	ready := make(chan net.Conn, 1)
+	server := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		switch verbOf(command) {
+		case "DESCRIBE":
+			writeRaw(cn, describeReply("world", 1, worldColumns))
+		case "WATCH":
+			writeRaw(cn, "+OK "+watchEpoch+" 10\r\n")
+			ready <- cn
+		case "UNWATCH":
+			writeSimple(cn, "OK")
+		}
+	}))
+	c := newTestClient(t, server, nil)
+	w, err := c.Watch(t.Context(), "world", WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	cn := <-ready
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := w.Next(ctx); !errors.Is(err, ErrTimeout) {
+		t.Fatal(err)
+	}
+	if err := w.conn.terminalError(); err != nil {
+		t.Fatal(err)
+	}
+	writeRaw(cn, push(respBulk("resync"), respBulk(watchEpoch), respInt(11)))
+	if nextWatch(t, w).(*ResyncEvent).Position.Revision != 11 {
+		t.Fatal("cancelled wait consumed event")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestPushOutsideWatchRejected(t *testing.T) {
+	s := newFakeServer(t, respondWith(push(respBulk("resync"), respBulk(watchEpoch), respInt(11))))
+	c := newTestClient(t, s, nil)
+	if err := c.Ping(t.Context()); !errors.Is(err, ErrProtocol) {
+		t.Fatal(err)
+	}
+}
