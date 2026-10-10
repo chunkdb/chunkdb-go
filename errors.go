@@ -196,7 +196,7 @@ type SchemaMismatchError struct {
 }
 
 func (e *SchemaMismatchError) Error() string {
-	return fmt.Sprintf("chunkdb: %s: schema mismatch, the table is at schema version %d", e.Err.Command, e.Current)
+	return fmt.Sprintf("chunkdb: %s: schema mismatch, the table is at schema version %d%s", e.Err.Command, e.Current, serverErrorAdvice(e.Err))
 }
 
 func (e *SchemaMismatchError) Unwrap() error { return e.Err }
@@ -219,12 +219,20 @@ type PermissionDeniedError struct {
 
 func (e *PermissionDeniedError) Error() string {
 	if e.Table == "" {
-		return fmt.Sprintf("chunkdb: %s: permission denied, %s needed", e.Err.Command, e.Right)
+		return fmt.Sprintf("chunkdb: %s: permission denied, %s needed%s", e.Err.Command, e.Right, serverErrorAdvice(e.Err))
 	}
-	return fmt.Sprintf("chunkdb: %s: permission denied, %s on %s needed", e.Err.Command, e.Right, e.Table)
+	return fmt.Sprintf("chunkdb: %s: permission denied, %s on %s needed%s", e.Err.Command, e.Right, e.Table, serverErrorAdvice(e.Err))
 }
 
 func (e *PermissionDeniedError) Unwrap() error { return e.Err }
+
+func serverErrorAdvice(err *Error) string {
+	_, advice, found := strings.Cut(err.ServerMessage, "; ")
+	if found {
+		return "; " + advice
+	}
+	return ""
+}
 
 // The reasons of a [ConflictError].
 const (
@@ -310,7 +318,8 @@ func replyError(phase Phase, command string, reply Reply) error {
 	base := serverError(phase, command, reply.Code, reply.Message)
 	if reply.Code == CodePermissionDenied {
 		// "<right> on <table>", or "MANAGES USERS".
-		right, table, _ := strings.Cut(reply.Message, " on ")
+		details, _, _ := strings.Cut(reply.Message, "; ")
+		right, table, _ := strings.Cut(details, " on ")
 		return &PermissionDeniedError{Right: right, Table: table, Err: base}
 	}
 	if reply.Code == CodeConflict && command != "MIGRATE" {

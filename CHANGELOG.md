@@ -37,6 +37,7 @@ the engine's
 
 ### Fixed
 - Connection errors identify refused addresses and give server, URI scheme, TLS trust and timeout guidance while preserving error types and wrapped causes
+- Typed permission and schema mismatch errors retain server guidance without including it in right or table fields
 - Slot ACK validation uses the last returned change or initial position and lets the server validate decreasing revisions, including retries after rejected ACKs
 - Closing during an ACK write reports the interrupted write or connection error instead of a timeout caused by Close; recoverable ACK rejections received while closing are discarded
 

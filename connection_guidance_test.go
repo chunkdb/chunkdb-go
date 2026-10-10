@@ -3,6 +3,7 @@ package chunkdb
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -51,7 +52,16 @@ func TestConnectionGuidanceTLSMismatch(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		conn.SetDeadline(time.Now().Add(2 * time.Second))
+		// Read the client's TLS record before closing, so unread input cannot
+		// turn the intended plaintext response into a TCP reset.
+		var header [5]byte
+		if _, err := io.ReadFull(conn, header[:]); err != nil {
+			return
+		}
+		if _, err := io.ReadFull(conn, make([]byte, binary.BigEndian.Uint16(header[3:]))); err != nil {
+			return
+		}
 		conn.Write([]byte("plain listener\r\n"))
 	}()
 	_, err = Connect(t.Context(), Options{URI: "chunks://" + listener.Addr().String() + "/", ConnectTimeout: 2 * time.Second})
@@ -66,6 +76,26 @@ func TestConnectionGuidancePlainHelloClosed(t *testing.T) {
 	s := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) { conn.Close() })
 	_, err := Connect(t.Context(), Options{URI: s.uri("")})
 	if !errors.Is(err, ErrConnection) || !errors.Is(err, io.EOF) || !strings.Contains(err.Error(), "chunk:// needs a plain listener") || !strings.Contains(err.Error(), "chunks:// needs TLS") {
+		t.Fatal(err)
+	}
+}
+
+func TestTypedServerErrorsPreserveGuidance(t *testing.T) {
+	for _, message := range []string{"WRITE on world; ask an administrator to grant this right", "MANAGES USERS; ask an administrator to grant this right"} {
+		err := replyError(PhaseResponse, "SET BLOCK", Reply{Kind: ReplyError, Code: CodePermissionDenied, Message: message})
+		var permission *PermissionDeniedError
+		var underlying *Error
+		wantRight, wantTable := "WRITE", "world"
+		if strings.HasPrefix(message, "MANAGES USERS") {
+			wantRight, wantTable = "MANAGES USERS", ""
+		}
+		if !errors.As(err, &permission) || !errors.As(err, &underlying) || !errors.Is(err, ErrPermissionDenied) || permission.Right != wantRight || permission.Table != wantTable || underlying.ServerMessage != message || !strings.Contains(err.Error(), "ask an administrator") {
+			t.Fatal(err)
+		}
+	}
+	err := replyError(PhaseResponse, "SET CHUNK", Reply{Kind: ReplyError, Code: CodeSchemaMismatch, Message: "current=7 schema changed; DESCRIBE the table and re-encode the chunk"})
+	var schema *SchemaMismatchError
+	if !errors.As(err, &schema) || schema.Current != 7 || !errors.Is(err, ErrSchemaMismatch) || !strings.Contains(err.Error(), "re-encode the chunk") {
 		t.Fatal(err)
 	}
 }
