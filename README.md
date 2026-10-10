@@ -19,6 +19,7 @@ CHUNKDB_URI='chunk://admin:your-password@127.0.0.1:4242/' go run ./examples/worl
 
 Use your administrator login and URI-escape special characters in the password.
 For a local server started with `--auth none`, use `chunk://127.0.0.1:4242/`.
+A fresh server starts with no tables; create a named table before data operations.
 The [example](examples/world/main.go) creates `world_go`, writes sixteen typed blocks in four chunks, reads the area, then subscribes before updating one block:
 
 ```text

@@ -344,7 +344,18 @@ func TestIntegrationServerInfo(t *testing.T) {
 	if client.DefaultTable() != "default" {
 		t.Fatalf("got default table %q", client.DefaultTable())
 	}
-	// The server's default table has one bits column.
+	// A connection's fallback table name does not create a table.
+	tables, err := client.Tables(t.Context())
+	if err != nil || len(tables) != 0 {
+		t.Fatalf("fresh Tables: %v, %v", tables, err)
+	}
+	if _, err := client.Describe(t.Context(), ""); !isServerCode(err, CodeNoTable) {
+		t.Fatalf("fresh Describe: %v, want NO_TABLE", err)
+	}
+	createTable(t, client, "default", TableSpec{
+		Columns:    []ColumnDef{{Name: "bits", Type: TypeBits(16)}},
+		ChunkWidth: 16, ChunkHeight: 16,
+	})
 	schema, err := client.Describe(t.Context(), "")
 	if err != nil || schema.Table != "default" || len(schema.Columns) == 0 || schema.Columns[0].ID == 0 {
 		t.Fatalf("Describe: %+v, %v", schema, err)
@@ -696,14 +707,14 @@ func TestIntegrationTables(t *testing.T) {
 
 	spec := typesSpec
 	spec.LargeWidth, spec.LargeHeight = 2, 2
-	spec.Options = TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096}
+	spec.Options = TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096, FeedBufferBytes: 2 << 20, SlotMaxBytes: 4 << 20}
 	createTable(t, client, "land", spec)
 	if err := client.CreateTable(ctx, "land", spec); !isServerCode(err, CodeTableExists) {
 		t.Fatalf("got %v, want TABLE_EXISTS", err)
 	}
 
 	tables, err := client.Tables(ctx)
-	if err != nil || !slices.Contains(tables, "land") || !slices.Contains(tables, "default") {
+	if err != nil || !slices.Equal(tables, []string{"land"}) {
 		t.Fatalf("Tables: %v, %v", tables, err)
 	}
 
@@ -713,7 +724,8 @@ func TestIntegrationTables(t *testing.T) {
 	}
 	if schema.Table != "land" || schema.Version != 1 || len(schema.Columns) != len(spec.Columns) ||
 		schema.ChunkWidth != 4 || schema.ChunkHeight != 4 || schema.LargeWidth != 2 || schema.LargeHeight != 2 ||
-		schema.Options.DurabilityMode != "fsync-wal" || schema.Options.VarMaxChunkBytes != 4096 {
+		schema.Options.DurabilityMode != "fsync-wal" || schema.Options.VarMaxChunkBytes != 4096 ||
+		schema.Options.FeedBufferBytes != 2<<20 || schema.Options.SlotMaxBytes != 4<<20 {
 		t.Fatalf("got %+v", schema)
 	}
 	for i, column := range schema.Columns {
@@ -732,6 +744,12 @@ func TestIntegrationTables(t *testing.T) {
 	if err := client.SetTableOption(ctx, "land", "durability_mode", "relaxed"); err != nil {
 		t.Fatalf("SetTableOption: %v", err)
 	}
+	if err := client.SetTableOption(ctx, "land", "feed_buffer_bytes", 3<<20); err != nil {
+		t.Fatalf("Set feed limit: %v", err)
+	}
+	if err := client.SetTableOption(ctx, "land", "slot_max_bytes", 5<<20); err != nil {
+		t.Fatalf("Set slot limit: %v", err)
+	}
 	if err := client.SetTableOption(ctx, "land", "checkpoint_updates", 64); err != nil {
 		t.Fatalf("SetTableOption: %v", err)
 	}
@@ -739,7 +757,8 @@ func TestIntegrationTables(t *testing.T) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
 	schema, err = client.Schema(ctx, "land")
-	if err != nil || schema.Options.DurabilityMode != "relaxed" || schema.Options.CheckpointUpdates != 64 {
+	if err != nil || schema.Options.DurabilityMode != "relaxed" || schema.Options.CheckpointUpdates != 64 ||
+		schema.Options.FeedBufferBytes != 3<<20 || schema.Options.SlotMaxBytes != 5<<20 {
 		t.Fatalf("got options %+v, %v", schema.Options, err)
 	}
 

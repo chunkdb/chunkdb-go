@@ -445,13 +445,13 @@ func TestClientStatementEncoding(t *testing.T) {
 						{Name: "t", Type: TypeInt(8), Default: -3},
 					},
 					ChunkWidth: 16, ChunkHeight: 8, LargeWidth: 4, LargeHeight: 2,
-					Options: TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096},
+					Options: TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096, FeedBufferBytes: 2 << 20, SlotMaxBytes: 4 << 20},
 				})
 			},
 			"CREATE TABLE land (id u10 REQUIRED, light u4 DEFAULT 15, sign text(8) NULL DEFAULT 'it''s', " +
 				"h f32 DEFAULT 1.5, mask bits(3) DEFAULT b'101', blob bytes(4) DEFAULT x'0aff', far f64 DEFAULT -inf, " +
 				"flag bool DEFAULT TRUE, t i8 DEFAULT -3) CHUNK 16 x 8 LARGE 4 x 2 " +
-				"WITH durability_mode = 'fsync-wal', var_max_chunk_bytes = 4096",
+				"WITH durability_mode = 'fsync-wal', var_max_chunk_bytes = 4096, feed_buffer_bytes = 2097152, slot_max_bytes = 4194304",
 			nil,
 		},
 		{"add column", func() error { return client.AddColumn(ctx, "", ColumnDef{Name: "d2", Type: TypeInt(8), Null: true}) },
@@ -467,6 +467,10 @@ func TestClientStatementEncoding(t *testing.T) {
 			"ALTER TABLE world SET durability_mode = 'relaxed'", nil},
 		{"set option number", func() error { return client.SetTableOption(ctx, "", "checkpoint_updates", 64) },
 			"ALTER TABLE world SET checkpoint_updates = 64", nil},
+		{"set feed limit", func() error { return client.SetTableOption(ctx, "land", "feed_buffer_bytes", 3<<20) },
+			"ALTER TABLE land SET feed_buffer_bytes = 3145728", nil},
+		{"set slot limit", func() error { return client.SetTableOption(ctx, "land", "slot_max_bytes", 5<<20) },
+			"ALTER TABLE land SET slot_max_bytes = 5242880", nil},
 		{"drop table", func() error { return client.DropTable(ctx, "land") }, "DROP TABLE land", nil},
 	}
 
@@ -984,6 +988,7 @@ func TestClientSchemaIsParsedAndCopied(t *testing.T) {
 	want := TableOptions{
 		DurabilityMode: "relaxed", CheckpointUpdates: 256, CheckpointWalBytes: 1 << 20,
 		WalGroupCommitUpdates: 8, CheckpointCompression: "none", VarMaxChunkBytes: 1 << 20,
+		FeedBufferBytes: 64 << 20, SlotMaxBytes: 1 << 30,
 	}
 	if schema.Options != want {
 		t.Fatalf("got options %+v", schema.Options)

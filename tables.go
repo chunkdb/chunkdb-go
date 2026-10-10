@@ -109,6 +109,8 @@ func optionAssignments(options TableOptions) []string {
 	number("wal_group_commit_updates", options.WalGroupCommitUpdates)
 	text("checkpoint_compression", options.CheckpointCompression)
 	number("var_max_chunk_bytes", options.VarMaxChunkBytes)
+	number("feed_buffer_bytes", options.FeedBufferBytes)
+	number("slot_max_bytes", options.SlotMaxBytes)
 	return out
 }
 
