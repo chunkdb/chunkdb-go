@@ -150,6 +150,7 @@ A schema description prefacing a historical change uses that change's position; 
 - users: `CreateUser(ctx, name, password, CreateUserOptions{ManagesUsers})`, `SetPassword`, `SetManagesUsers`, `DropUser`, `Grant(ctx, right, table, user)`, `Revoke`, `Users` (name, `ManagesUsers`, `Grants` per table); see below
 - server: `Ping`, `FlushWAL` (returns once every acknowledged write is durable), `Metrics` (Prometheus text), `ServerInfo()` (version and limits from `HELLO 3`)
 - transactions: `Transaction(ctx, func(tx *Tx) error, opts...)` returns the commit version; see below
+- migrations: `Migrate(ctx, []Migration)` applies named schema steps in order and returns each name with `Status` (`applied` or `skipped`); see below
 - any statement: `Do(ctx, statement, params...)` sends raw parameter frames (`EncodeValue` builds them; `nil` is NULL) and returns the decoded `Reply`
 
 `Pool` mirrors the statement methods and `Transaction`, and adds `WithClient(ctx, fn)`.
@@ -215,6 +216,23 @@ The client refreshes a table's cached schema after its own `CREATE`, `ALTER` or 
 - a chunk form carries the schema version it was encoded for; `SetChunk` refused with `SCHEMA_MISMATCH` fetches the schema, encodes the chunk again and sends it once more, and fails to encode a chunk whose columns no longer match the table's. `SetChunkRaw` returns the `*SchemaMismatchError`
 - a parameter longer than the column now holds makes the server close the connection; that write fails and the next statement uses a fresh schema
 
+## Migrations
+
+Run the same migration list at every start of your app, before serving requests:
+
+```go
+results, err := client.Migrate(ctx, []chunkdb.Migration{
+    {Name: "create_world", Statement: "CREATE TABLE world (v u8) CHUNK 2 x 2"},
+    {Name: "add_label", Statement: "ALTER TABLE world ADD COLUMN label text(16) NULL"},
+})
+if err != nil { log.Fatal(err) }
+for _, result := range results { log.Printf("%s: %s", result.Name, result.Status) }
+```
+
+`Pool.Migrate` uses one leased connection for the list. Each step is committed independently; the list is not a transaction. Concurrent application starts may use the same list: one applies each step and the others skip it. A name already recorded with different statement text returns `CodeConflict` (`ErrConflict`); preserve interior spacing and case when editing application code. Leading and trailing spaces/tabs are ignored. Names are `[a-z_][a-z0-9_]*`, at most 63 bytes.
+
+Steps support `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `GRANT`, `REVOKE`, `CREATE SLOT` and `DROP SLOT`, with the rights of the inner statement. Statements must be single lines without parameters. On failure, the returned results contain completed steps, and `*MigrationError` gives the failed `Name`, zero-based `Index`, and wrapped cause for `errors.Is`/`errors.As`. After a connection failure the step may have completed; retry the same list with the same names and text. If the server reports that recovery is required, restart it before retrying. `Do(ctx, "SHOW MIGRATIONS")` lists recorded steps and requires MANAGES USERS unless authentication is disabled.
+
 ## Options
 
 ```go
@@ -240,7 +258,7 @@ A `Client` is one socket, safe for concurrent use. It connects lazily and reconn
 
 ## Errors
 
-Every failure is an `*Error` with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` for a wrong user or password, `AUTH_REQUIRED` for no user; also `ErrServer`), `ErrPermissionDenied` (`*PermissionDeniedError` with the `Right` and `Table` the statement needs; also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrConflict` (`*ConflictError`), `ErrTLS`, `ErrClosed`. A table the user has no right on reads as `NO_TABLE`. A server whose SCRAM signature does not match fails the login with `ErrConnection`.
+Statement failures carry an `*Error`, directly or wrapped, with its phase, command and, for `-ERR` replies, the server's `ServerCode` (`CodeSyntax`, `CodeInvalidArgument`, `CodeNoTable`, ...) and message. Classify with `errors.Is`: `ErrConnection`, `ErrTimeout`, `ErrProtocol` (malformed replies, client-side validation, a server of an older protocol), `ErrServer`, `ErrAuth` (`AUTH_FAILED` for a wrong user or password, `AUTH_REQUIRED` for no user; also `ErrServer`), `ErrPermissionDenied` (`*PermissionDeniedError` with the `Right` and `Table` the statement needs; also `ErrServer`), `ErrVersionMismatch` (`*VersionMismatchError`), `ErrSchemaMismatch` (`*SchemaMismatchError`), `ErrConflict` (`*ConflictError` for transactions; `*Error` for a migration name with different statement text, wrapped by `*MigrationError` when using `Migrate`), `ErrTLS`, `ErrClosed`. A table the user has no right on reads as `NO_TABLE`. A server whose SCRAM signature does not match fails the login with `ErrConnection`.
 
 ## Limits
 

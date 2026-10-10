@@ -17,8 +17,8 @@ import (
 // before anything is sent. An error reply is returned as an error: an
 // [*Error], or a [*VersionMismatchError].
 //
-// A CREATE TABLE, ALTER TABLE or DROP TABLE sent through Do drops the client's
-// cached schema of that table.
+// A CREATE TABLE, ALTER TABLE or DROP TABLE sent through Do, including inside
+// MIGRATE, drops the client's cached schema of that table.
 func (c *Client) Do(ctx context.Context, statement string, params ...[]byte) (Reply, error) {
 	if table, ok := tableStatementTarget(statement); ok {
 		defer c.forgetSchema(table)
@@ -58,6 +58,9 @@ func commandOf(statement string) string {
 // statement names.
 func tableStatementTarget(statement string) (string, bool) {
 	fields := strings.Fields(statement)
+	if len(fields) >= 5 && strings.EqualFold(fields[0], "MIGRATE") {
+		fields = fields[2:]
+	}
 	if len(fields) < 3 || !strings.EqualFold(fields[1], "TABLE") {
 		return "", false
 	}
