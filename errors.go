@@ -63,6 +63,10 @@ var (
 	// ErrPermissionDenied matches a statement refused because the user lacks
 	// the right it needs. The error is a [*PermissionDeniedError].
 	ErrPermissionDenied = errors.New("chunkdb: permission denied")
+	// ErrConflict matches a transaction the server ended with CONFLICT:
+	// nothing of it was written, and running it again may succeed. The error
+	// is a [*ConflictError].
+	ErrConflict = errors.New("chunkdb: transaction conflict")
 )
 
 // Server error codes, as reported in [Error.ServerCode].
@@ -91,6 +95,9 @@ const (
 	// CodeSchemaMismatch: SET CHUNK of a form encoded for another schema
 	// version than the table's; nothing changed. See [SchemaMismatchError].
 	CodeSchemaMismatch = "SCHEMA_MISMATCH"
+	// CodeConflict: the server ended a transaction without writing anything;
+	// running it again may succeed. See [ConflictError].
+	CodeConflict = "CONFLICT"
 	// CodeNoTable: the table does not exist.
 	CodeNoTable = "NO_TABLE"
 	// CodeTableExists: CREATE TABLE of a name that is taken.
@@ -151,6 +158,8 @@ func (e *Error) Is(target error) bool {
 		return e.ServerCode == CodeSchemaMismatch
 	case ErrPermissionDenied:
 		return e.ServerCode == CodePermissionDenied
+	case ErrConflict:
+		return e.ServerCode == CodeConflict
 	}
 	return false
 }
@@ -213,6 +222,40 @@ func (e *PermissionDeniedError) Error() string {
 
 func (e *PermissionDeniedError) Unwrap() error { return e.Err }
 
+// The reasons of a [ConflictError].
+const (
+	// ConflictChunkChanged: another write changed a chunk the transaction
+	// read or wrote after its snapshot.
+	ConflictChunkChanged = "chunk_changed"
+	// ConflictDuration: the transaction was open longer than the server
+	// allows.
+	ConflictDuration = "duration"
+	// ConflictHistoryLimit: the table kept too many earlier chunk states for
+	// open transactions.
+	ConflictHistoryLimit = "history_limit"
+	// ConflictTableChanged: the table was altered or dropped.
+	ConflictTableChanged = "table_changed"
+)
+
+// ConflictError is returned when the server ends a transaction with
+// CONFLICT, at COMMIT or at any statement inside it. The transaction has
+// ended and nothing of it was written; running it again may succeed.
+// [Client.Transaction] runs it again before it returns this error. It wraps
+// the server's [*Error] (code [CodeConflict]) and matches [ErrConflict] and
+// [ErrServer].
+type ConflictError struct {
+	// Reason is why the transaction ended: [ConflictChunkChanged],
+	// [ConflictDuration], [ConflictHistoryLimit] or [ConflictTableChanged].
+	Reason string
+	Err    *Error
+}
+
+func (e *ConflictError) Error() string {
+	return fmt.Sprintf("chunkdb: %s: transaction conflict, %s", e.Err.Command, e.Err.ServerMessage)
+}
+
+func (e *ConflictError) Unwrap() error { return e.Err }
+
 func newError(kind Kind, phase Phase, command, message string, cause error) *Error {
 	return &Error{Kind: kind, Phase: phase, Command: command, Message: message, Err: cause}
 }
@@ -256,14 +299,22 @@ func serverError(phase Phase, command, code, message string) *Error {
 
 // replyError converts an error reply into the error a call returns: a
 // [*VersionMismatchError] for VERSION_MISMATCH, a [*SchemaMismatchError] for
-// SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, an
-// [*Error] otherwise.
+// SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, a
+// [*ConflictError] for CONFLICT, an [*Error] otherwise.
 func replyError(phase Phase, command string, reply Reply) error {
 	base := serverError(phase, command, reply.Code, reply.Message)
 	if reply.Code == CodePermissionDenied {
 		// "<right> on <table>", or "MANAGES USERS".
 		right, table, _ := strings.Cut(reply.Message, " on ")
 		return &PermissionDeniedError{Right: right, Table: table, Err: base}
+	}
+	if reply.Code == CodeConflict {
+		// "<reason> <message>".
+		reason, _, _ := strings.Cut(reply.Message, " ")
+		if reason == "" {
+			return protocolErrorf(command, "malformed %s reply: %q", reply.Code, reply.Message)
+		}
+		return &ConflictError{Reason: reason, Err: base}
 	}
 	if reply.Code != CodeVersionMismatch && reply.Code != CodeSchemaMismatch {
 		return base

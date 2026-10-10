@@ -272,6 +272,14 @@ func isTransportFailure(err error) bool {
 	return errors.Is(err, ErrConnection) || errors.Is(err, ErrTimeout) || errors.Is(err, ErrTLS)
 }
 
+// Transaction runs [Client.Transaction] on a leased client, which serves no
+// other operation until the transaction ends.
+func (p *Pool) Transaction(ctx context.Context, fn func(tx *Tx) error, opts ...TxOption) (uint64, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+		return c.Transaction(ctx, fn, opts...)
+	})
+}
+
 // Do runs [Client.Do] on a leased client.
 func (p *Pool) Do(ctx context.Context, statement string, params ...[]byte) (Reply, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (Reply, error) {

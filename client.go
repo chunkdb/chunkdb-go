@@ -134,6 +134,9 @@ type Client struct {
 	// dialGate serializes connection attempts so concurrent callers share one
 	// dial instead of opening redundant sockets.
 	dialGate chan struct{}
+	// txGate lets one transaction at a time take every pipeline slot; see
+	// [Client.holdConnection].
+	txGate chan struct{}
 
 	mu     sync.Mutex
 	active *conn
@@ -159,6 +162,7 @@ func NewClient(opts Options) (*Client, error) {
 		opts:     resolved,
 		slots:    make(chan struct{}, resolved.pipelineDepth),
 		dialGate: make(chan struct{}, 1),
+		txGate:   make(chan struct{}, 1),
 		schemas:  make(map[string]*Schema),
 	}, nil
 }
@@ -245,6 +249,39 @@ func (c *Client) acquireSlot(ctx context.Context, command string) (func(), error
 	}
 }
 
+// holdConnection gives the caller the connection to itself: it takes every
+// pipeline slot, so no other request of the client is sent until release.
+// Requests already in flight finish first; later ones wait. txGate admits one
+// holder at a time, so two transactions never each take part of the slots
+// and wait on each other.
+func (c *Client) holdConnection(ctx context.Context, command string) (release func(), err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, timeoutErrorf(command, err, "%s", err)
+	}
+	select {
+	case c.txGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, timeoutErrorf(command, ctx.Err(), "%s", ctx.Err())
+	}
+	taken := 0
+	release = func() {
+		for range taken {
+			<-c.slots
+		}
+		<-c.txGate
+	}
+	for taken < cap(c.slots) {
+		select {
+		case c.slots <- struct{}{}:
+			taken++
+		case <-ctx.Done():
+			release()
+			return nil, timeoutErrorf(command, ctx.Err(), "%s", ctx.Err())
+		}
+	}
+	return release, nil
+}
+
 // connection returns the live connection, dialing when necessary.
 func (c *Client) connection(ctx context.Context) (*conn, error) {
 	c.mu.Lock()
@@ -252,10 +289,11 @@ func (c *Client) connection(ctx context.Context) (*conn, error) {
 		c.mu.Unlock()
 		return nil, closedError("")
 	}
-	if active := c.active; active != nil {
+	if active := c.active; active != nil && active.terminalError() == nil {
 		c.mu.Unlock()
 		return active, nil
 	}
+	c.active = nil
 	c.mu.Unlock()
 
 	select {
@@ -271,10 +309,11 @@ func (c *Client) connection(ctx context.Context) (*conn, error) {
 		c.mu.Unlock()
 		return nil, closedError("")
 	}
-	if active := c.active; active != nil {
+	if active := c.active; active != nil && active.terminalError() == nil {
 		c.mu.Unlock()
 		return active, nil
 	}
+	c.active = nil
 	c.mu.Unlock()
 
 	established, err := c.dial(ctx)
@@ -527,16 +566,25 @@ func (c *Client) exec(ctx context.Context, command, statement string, params [][
 	if err != nil {
 		return Reply{}, err
 	}
-	if info := established.info; info != nil {
-		if len(statement)+2 > info.MaxLineBytes {
-			return Reply{}, requestErrorf(command, "the statement takes %d bytes; the server takes lines of at most %d",
-				len(statement)+2, info.MaxLineBytes)
-		}
-		if len(params) > info.MaxParameters {
-			return Reply{}, requestErrorf(command, "%d parameters; the server takes at most %d", len(params), info.MaxParameters)
-		}
+	if err := checkLimits(established.info, command, statement, params); err != nil {
+		return Reply{}, err
 	}
 	return c.execOn(ctx, established, command, statement, params)
+}
+
+// checkLimits refuses a statement the server's HELLO limits do not admit.
+func checkLimits(info *ServerInfo, command, statement string, params [][]byte) error {
+	if info == nil {
+		return nil
+	}
+	if len(statement)+2 > info.MaxLineBytes {
+		return requestErrorf(command, "the statement takes %d bytes; the server takes lines of at most %d",
+			len(statement)+2, info.MaxLineBytes)
+	}
+	if len(params) > info.MaxParameters {
+		return requestErrorf(command, "%d parameters; the server takes at most %d", len(params), info.MaxParameters)
+	}
+	return nil
 }
 
 func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte) (Reply, error) {
@@ -706,6 +754,9 @@ func (cn *conn) shutdown(cause error) error {
 	cn.mu.Lock()
 	if cn.failed {
 		cn.mu.Unlock()
+		// Another teardown may still be closing the socket. Complete detaching
+		// before returning a closing error reply to the caller.
+		cn.client.detach(cn)
 		return nil
 	}
 	cn.failed = true

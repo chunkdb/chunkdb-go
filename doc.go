@@ -25,7 +25,8 @@
 // Values are typed by the table's columns. A client caches each table's
 // schema ([Client.Schema]) to encode parameters and decode chunks;
 // [EncodeValue] lists the Go types of each column type. [Client.Do] sends any
-// statement with raw parameters.
+// statement with raw parameters. [Client.Transaction] reads one snapshot of
+// a table and writes several chunks together, running again on a conflict.
 //
 // Every request method takes a [context.Context]. Cancelling it aborts the
 // call; because the protocol has no request identifiers, an aborted in-flight

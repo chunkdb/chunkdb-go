@@ -162,18 +162,41 @@ type staleSchemaError struct {
 func (e *staleSchemaError) Error() string { return e.err.Error() }
 func (e *staleSchemaError) Unwrap() error { return e.err }
 
-// withSchema runs fn with the cached schema of table, fetching it when none
-// is cached. When fn reports a stale schema, it fetches the schema again and
-// runs fn once more.
-func withSchema[T any](ctx context.Context, c *Client, table string, fn func(*Schema) (T, error)) (T, error) {
-	schema := c.cachedSchema(table)
-	fresh := schema == nil
-	if fresh {
-		var err error
-		if schema, err = c.fetchSchema(ctx, table); err != nil {
-			var zero T
-			return zero, err
-		}
+// session runs the block, chunk and area statements and supplies the schemas
+// they encode and decode values with: a [Client], or a [Tx], which sends on
+// its transaction's connection and cannot ask DESCRIBE inside it.
+type session interface {
+	call(ctx context.Context, statement string, params [][]byte) (Reply, error)
+	tableName(command, table string) (string, error)
+	// schemaOf returns the schema of table, and whether it was fetched from
+	// the server for this call.
+	schemaOf(ctx context.Context, table string) (schema *Schema, fresh bool, err error)
+	// refetchSchema returns a newer schema of table after fn reported stale,
+	// the error the stale schema caused, or fails.
+	refetchSchema(ctx context.Context, table string, stale error) (*Schema, error)
+	forgetSchema(table string)
+}
+
+func (c *Client) schemaOf(ctx context.Context, table string) (*Schema, bool, error) {
+	if schema := c.cachedSchema(table); schema != nil {
+		return schema, false, nil
+	}
+	schema, err := c.fetchSchema(ctx, table)
+	return schema, true, err
+}
+
+func (c *Client) refetchSchema(ctx context.Context, table string, _ error) (*Schema, error) {
+	return c.fetchSchema(ctx, table)
+}
+
+// withSchema runs fn with the schema of table, fetching it when none is
+// cached. When fn reports a stale schema, it fetches the schema again and runs
+// fn once more.
+func withSchema[T any](ctx context.Context, s session, table string, fn func(*Schema) (T, error)) (T, error) {
+	schema, fresh, err := s.schemaOf(ctx, table)
+	if err != nil {
+		var zero T
+		return zero, err
 	}
 	value, err := fn(schema)
 	var stale *staleSchemaError
@@ -183,7 +206,7 @@ func withSchema[T any](ctx context.Context, c *Client, table string, fn func(*Sc
 	if fresh && stale.local {
 		return value, stale.err
 	}
-	if schema, err = c.fetchSchema(ctx, table); err != nil {
+	if schema, err = s.refetchSchema(ctx, table, stale.err); err != nil {
 		return value, err
 	}
 	value, err = fn(schema)
@@ -223,6 +246,11 @@ func (c *Client) Describe(ctx context.Context, table string) (*Schema, error) {
 
 func (c *Client) fetchSchema(ctx context.Context, table string) (*Schema, error) {
 	reply, err := c.call(ctx, "DESCRIBE "+table, nil)
+	return c.keepSchema(table, reply, err)
+}
+
+// keepSchema parses the reply to DESCRIBE table and caches the schema.
+func (c *Client) keepSchema(table string, reply Reply, err error) (*Schema, error) {
 	if err != nil {
 		if isServerCode(err, CodeNoTable) {
 			c.forgetSchema(table)
@@ -263,21 +291,25 @@ func columnNames(schema *Schema, indexes []int) []string {
 // columns, or every column of the client's cached schema. An absent block
 // returns a nil Record and no error.
 func (c *Client) GetBlock(ctx context.Context, table string, x, y int64, columns ...string) (Record, error) {
+	return getBlock(ctx, c, table, x, y, columns)
+}
+
+func getBlock(ctx context.Context, s session, table string, x, y int64, columns []string) (Record, error) {
 	const command = "GET BLOCK"
-	name, err := c.tableName(command, table)
+	name, err := s.tableName(command, table)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
 		return nil, err
 	}
-	record, err := withSchema(ctx, c, name, func(schema *Schema) (Record, error) {
+	record, err := withSchema(ctx, s, name, func(schema *Schema) (Record, error) {
 		indexes, err := formColumns(schema, columns)
 		if err != nil {
 			return nil, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := c.call(ctx, "GET BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+columnsClause(names), nil)
+		reply, err := s.call(ctx, "GET BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+columnsClause(names), nil)
 		if err != nil {
 			if isNoColumn(err) {
 				return nil, &staleSchemaError{err: err}
@@ -318,33 +350,43 @@ func (c *Client) GetBlock(ctx context.Context, table string, x, y int64, columns
 // answer BAD_REQUEST and close the connection; that write fails, and the next
 // statement uses a fresh schema.
 func (c *Client) SetBlock(ctx context.Context, table string, x, y int64, values Record, opts ...WriteOption) (uint64, error) {
-	const command = "SET BLOCK"
-	name, err := c.tableName(command, table)
+	reply, err := setBlock(ctx, c, table, x, y, values, ifVersionClause(opts))
 	if err != nil {
 		return 0, err
 	}
+	return versionOf(reply, "SET BLOCK")
+}
+
+// setBlock sends SET BLOCK with the clause after the assignments, and returns
+// its reply.
+func setBlock(ctx context.Context, s session, table string, x, y int64, values Record, clause string) (Reply, error) {
+	const command = "SET BLOCK"
+	name, err := s.tableName(command, table)
+	if err != nil {
+		return Reply{}, err
+	}
 	if len(values) == 0 {
-		return 0, requestErrorf(command, "SET BLOCK needs at least one column")
+		return Reply{}, requestErrorf(command, "SET BLOCK needs at least one column")
 	}
 	names := slices.Sorted(maps.Keys(values))
 	if err := checkNames(command, "column", names...); err != nil {
-		return 0, err
+		return Reply{}, err
 	}
-	version, err := withSchema(ctx, c, name, func(schema *Schema) (uint64, error) {
+	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
 		var statement strings.Builder
 		statement.WriteString("SET BLOCK " + coord(x) + " " + coord(y) + " IN " + name + " ")
 		params := make([][]byte, 0, len(names))
 		for i, columnName := range names {
 			column, ok := schema.Column(columnName)
 			if !ok {
-				return 0, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s", name, columnName), local: true}
+				return Reply{}, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s", name, columnName), local: true}
 			}
 			value, err := normalize(columnName, column.Type, values[columnName])
 			if err != nil {
-				return 0, err
+				return Reply{}, err
 			}
 			if value == nil && !column.Null {
-				return 0, requestErrorf(command, "column %s cannot be NULL", columnName)
+				return Reply{}, requestErrorf(command, "column %s cannot be NULL", columnName)
 			}
 			var param []byte
 			if value != nil {
@@ -356,59 +398,66 @@ func (c *Client) SetBlock(ctx context.Context, table string, x, y int64, values 
 			}
 			statement.WriteString(columnName + " = $" + strconv.Itoa(i+1))
 		}
-		statement.WriteString(ifVersionClause(opts))
-		reply, err := c.call(ctx, statement.String(), params)
+		statement.WriteString(clause)
+		reply, err := s.call(ctx, statement.String(), params)
 		if err != nil {
 			if isWrongSize(err) || isNoColumn(err) {
-				return 0, &staleSchemaError{err: err}
+				return Reply{}, &staleSchemaError{err: err}
 			}
 			if isServerCode(err, CodeBadRequest) {
 				// A frame longer than its column holds: the connection is
 				// closed, so the write is not sent again, but the next
 				// statement uses a fresh schema.
-				c.forgetSchema(name)
+				s.forgetSchema(name)
 			}
-			return 0, err
+			return Reply{}, err
 		}
-		return versionOf(reply, command)
+		return reply, nil
 	})
-	return version, annotate(command, err)
+	return reply, annotate(command, err)
 }
 
 // DeleteBlock deletes block (x, y) of table ("" is the default table) and
 // returns the chunk's version after it.
 func (c *Client) DeleteBlock(ctx context.Context, table string, x, y int64, opts ...WriteOption) (uint64, error) {
-	const command = "DELETE BLOCK"
-	name, err := c.tableName(command, table)
+	reply, err := deleteBlock(ctx, c, table, x, y, ifVersionClause(opts))
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.call(ctx, "DELETE BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+ifVersionClause(opts), nil)
+	return versionOf(reply, "DELETE BLOCK")
+}
+
+func deleteBlock(ctx context.Context, s session, table string, x, y int64, clause string) (Reply, error) {
+	name, err := s.tableName("DELETE BLOCK", table)
 	if err != nil {
-		return 0, err
+		return Reply{}, err
 	}
-	return versionOf(reply, command)
+	return s.call(ctx, "DELETE BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+clause, nil)
 }
 
 // GetChunk reads chunk (cx, cy) of table ("" is the default table), decoded
 // with the client's cached schema ([DecodeChunk]): the named columns, or every
 // column. A chunk without blocks has no present block and its version.
 func (c *Client) GetChunk(ctx context.Context, table string, cx, cy int64, columns ...string) (*Chunk, error) {
+	return getChunk(ctx, c, table, cx, cy, columns)
+}
+
+func getChunk(ctx context.Context, s session, table string, cx, cy int64, columns []string) (*Chunk, error) {
 	const command = "GET CHUNK"
-	name, err := c.tableName(command, table)
+	name, err := s.tableName(command, table)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
 		return nil, err
 	}
-	chunk, err := withSchema(ctx, c, name, func(schema *Schema) (*Chunk, error) {
+	chunk, err := withSchema(ctx, s, name, func(schema *Schema) (*Chunk, error) {
 		indexes, err := formColumns(schema, columns)
 		if err != nil {
 			return nil, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := c.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(names), nil)
+		reply, err := s.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(names), nil)
 		if err != nil {
 			if isNoColumn(err) {
 				return nil, &staleSchemaError{err: err}
@@ -437,15 +486,19 @@ func decodeOrStale(schema *Schema, form []byte, names []string) (*Chunk, error) 
 // [Client.SetChunkRaw] writes a form of every column back, to this or another
 // chunk.
 func (c *Client) GetChunkRaw(ctx context.Context, table string, cx, cy int64, columns ...string) ([]byte, error) {
+	return getChunkRaw(ctx, c, table, cx, cy, columns)
+}
+
+func getChunkRaw(ctx context.Context, s session, table string, cx, cy int64, columns []string) ([]byte, error) {
 	const command = "GET CHUNK"
-	name, err := c.tableName(command, table)
+	name, err := s.tableName(command, table)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
 		return nil, err
 	}
-	reply, err := c.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(columns), nil)
+	reply, err := s.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(columns), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -462,23 +515,31 @@ func (c *Client) GetChunkRaw(ctx context.Context, table string, cx, cy int64, co
 // chunk again and sends it once more. A chunk whose columns no longer match the
 // table's then fails to encode.
 func (c *Client) SetChunk(ctx context.Context, table string, cx, cy int64, chunk *Chunk, opts ...WriteOption) (uint64, error) {
-	const command = "SET CHUNK"
-	name, err := c.tableName(command, table)
+	reply, err := setChunk(ctx, c, table, cx, cy, chunk, ifVersionClause(opts))
 	if err != nil {
 		return 0, err
 	}
-	version, err := withSchema(ctx, c, name, func(schema *Schema) (uint64, error) {
+	return versionOf(reply, "SET CHUNK")
+}
+
+func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk *Chunk, clause string) (Reply, error) {
+	const command = "SET CHUNK"
+	name, err := s.tableName(command, table)
+	if err != nil {
+		return Reply{}, err
+	}
+	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
 		form, err := EncodeChunk(schema, chunk)
 		if err != nil {
-			return 0, err
+			return Reply{}, err
 		}
-		version, err := c.setChunkForm(ctx, name, cx, cy, form, opts)
+		reply, err := setChunkForm(ctx, s, name, cx, cy, form, clause)
 		if errors.Is(err, ErrSchemaMismatch) {
-			return 0, &staleSchemaError{err: err}
+			return Reply{}, &staleSchemaError{err: err}
 		}
-		return version, err
+		return reply, err
 	})
-	return version, annotate(command, err)
+	return reply, annotate(command, err)
 }
 
 // SetChunkRaw replaces every column of chunk (cx, cy) in table ("" is the
@@ -487,23 +548,27 @@ func (c *Client) SetChunk(ctx context.Context, table string, cx, cy int64, chunk
 // is not read; a form of another schema version than the table's fails with a
 // [*SchemaMismatchError].
 func (c *Client) SetChunkRaw(ctx context.Context, table string, cx, cy int64, form []byte, opts ...WriteOption) (uint64, error) {
-	const command = "SET CHUNK"
-	name, err := c.tableName(command, table)
-	if err != nil {
-		return 0, err
-	}
-	if form == nil {
-		return 0, requestErrorf(command, "the chunk form is nil")
-	}
-	return c.setChunkForm(ctx, name, cx, cy, form, opts)
-}
-
-func (c *Client) setChunkForm(ctx context.Context, table string, cx, cy int64, form []byte, opts []WriteOption) (uint64, error) {
-	reply, err := c.call(ctx, "SET CHUNK "+coord(cx)+" "+coord(cy)+" IN "+table+" $1"+ifVersionClause(opts), [][]byte{form})
+	reply, err := setChunkRaw(ctx, c, table, cx, cy, form, ifVersionClause(opts))
 	if err != nil {
 		return 0, err
 	}
 	return versionOf(reply, "SET CHUNK")
+}
+
+func setChunkRaw(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string) (Reply, error) {
+	const command = "SET CHUNK"
+	name, err := s.tableName(command, table)
+	if err != nil {
+		return Reply{}, err
+	}
+	if form == nil {
+		return Reply{}, requestErrorf(command, "the chunk form is nil")
+	}
+	return setChunkForm(ctx, s, name, cx, cy, form, clause)
+}
+
+func setChunkForm(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string) (Reply, error) {
+	return s.call(ctx, "SET CHUNK "+coord(cx)+" "+coord(cy)+" IN "+table+" $1"+clause, [][]byte{form})
 }
 
 // GetArea reads the chunks from (cx0, cy0) to (cx1, cy1) of table ("" is the
@@ -511,34 +576,46 @@ func (c *Client) setChunkForm(ctx context.Context, table string, cx, cy int64, f
 // present block, in ascending CX then CY. One read covers at most
 // [ServerInfo.MaxAreaChunks] chunks.
 func (c *Client) GetArea(ctx context.Context, table string, cx0, cy0, cx1, cy1 int64, columns ...string) ([]AreaChunk, error) {
-	return c.getArea(ctx, table, coord(cx0)+" "+coord(cy0)+" TO "+coord(cx1)+" "+coord(cy1), columns)
+	return getArea(ctx, c, table, areaRange(cx0, cy0, cx1, cy1), columns)
 }
 
 // GetAreaAround reads the chunks within radius chunks of (cx, cy), like
 // [Client.GetArea].
 func (c *Client) GetAreaAround(ctx context.Context, table string, cx, cy, radius int64, columns ...string) ([]AreaChunk, error) {
-	if radius < 0 {
-		return nil, requestErrorf("GET AREA", "the radius must not be negative")
+	area, err := areaAround(cx, cy, radius)
+	if err != nil {
+		return nil, err
 	}
-	return c.getArea(ctx, table, "AROUND "+coord(cx)+" "+coord(cy)+" RADIUS "+coord(radius), columns)
+	return getArea(ctx, c, table, area, columns)
 }
 
-func (c *Client) getArea(ctx context.Context, table, area string, columns []string) ([]AreaChunk, error) {
+func areaRange(cx0, cy0, cx1, cy1 int64) string {
+	return coord(cx0) + " " + coord(cy0) + " TO " + coord(cx1) + " " + coord(cy1)
+}
+
+func areaAround(cx, cy, radius int64) (string, error) {
+	if radius < 0 {
+		return "", requestErrorf("GET AREA", "the radius must not be negative")
+	}
+	return "AROUND " + coord(cx) + " " + coord(cy) + " RADIUS " + coord(radius), nil
+}
+
+func getArea(ctx context.Context, s session, table, area string, columns []string) ([]AreaChunk, error) {
 	const command = "GET AREA"
-	name, err := c.tableName(command, table)
+	name, err := s.tableName(command, table)
 	if err != nil {
 		return nil, err
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
 		return nil, err
 	}
-	chunks, err := withSchema(ctx, c, name, func(schema *Schema) ([]AreaChunk, error) {
+	chunks, err := withSchema(ctx, s, name, func(schema *Schema) ([]AreaChunk, error) {
 		indexes, err := formColumns(schema, columns)
 		if err != nil {
 			return nil, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := c.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names), nil)
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names), nil)
 		if err != nil {
 			if isNoColumn(err) {
 				return nil, &staleSchemaError{err: err}
