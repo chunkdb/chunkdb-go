@@ -2,12 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
-This client follows [Semantic Versioning](https://semver.org/). Version 1.x
-speaks the `chunkdb` 1.x protocol, version 2.x speaks protocol 3 (CQL); see
-the engine's
+This client follows [Semantic Versioning](https://semver.org/). Version 2.x
+uses protocol 3 (CQL); see the engine's
 [compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
 
 ## Unreleased
+
+### Documentation
+- Rewrite the README and package overview for chunkdb 2.0, with separate data, values, users, transactions, feed/slots, migrations, backup and connection guides.
 
 ### Breaking
 - Users replace the token: a connection logs in with SCRAM-SHA-256 (`HELLO 3 USER <name> $1`, then `AUTH $1`), from `chunk://user:password@host:4242/` or `Options.User` and `Options.Password`, and checks the server's signature; a mismatch is an `ErrConnection` error. Without a user the client sends `HELLO 3`, for servers started with `--auth none`. `Options.Token`, `URI.Token` and the token in the URI are removed; `URI` has `User` and `Password`

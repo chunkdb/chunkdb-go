@@ -39,6 +39,9 @@ func (e *MigrationError) Unwrap() error { return e.Err }
 // and trailing spaces/tabs are removed; interior spacing and case are kept.
 // Each step is durable independently; this is not a transaction. After a
 // transport failure its outcome may be unknown: retry the same named step.
+// A recovery-required server error requires a server restart before retrying.
+// Inner statements require their normal rights; migrations require a
+// single-process read-write server and cannot run inside a transaction.
 func (c *Client) Migrate(ctx context.Context, steps []Migration) ([]MigrationResult, error) {
 	results := make([]MigrationResult, 0, len(steps))
 	for i, step := range steps {

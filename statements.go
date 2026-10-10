@@ -15,7 +15,8 @@ import (
 // decoded reply. A parameter is the binary form of a value ([EncodeValue]);
 // nil is NULL. Statements are single lines: one containing CR or LF is refused
 // before anything is sent. An error reply is returned as an error: an
-// [*Error], or a [*VersionMismatchError].
+// [*Error] or a typed permission, version, schema, or conflict error.
+// BACKUP is available through Do and uses paths on the server filesystem.
 //
 // A CREATE TABLE, ALTER TABLE or DROP TABLE sent through Do, including inside
 // MIGRATE, drops the client's cached schema of that table.

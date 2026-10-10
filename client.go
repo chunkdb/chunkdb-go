@@ -124,8 +124,9 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 // time; raise [Options.PipelineDepth] to keep several requests in flight on the
 // same socket, whose replies come back in request order. The connection is
 // established lazily and re-established on the next request after a transport
-// failure. A request is never resent after a transport failure; the one retry
-// a client makes is described at [Client.SetBlock].
+// failure. A request is never resent after a transport failure. Typed writes may
+// refresh stale schema and retry as documented by [Client.SetBlock] and
+// [Client.SetChunk].
 //
 // A client keeps the schemas of the tables it uses, to encode and decode
 // values; see [Client.Schema].
