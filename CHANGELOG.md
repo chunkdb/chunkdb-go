@@ -33,6 +33,10 @@ the engine's
 - `FlushWAL`, `Metrics` (`SHOW METRICS`), `DefaultTable`; error codes as `Code*` constants
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
+### Fixed
+- Slot ACK validation uses the last returned change or initial position and lets the server validate decreasing revisions, including retries after rejected ACKs
+- Closing during an ACK write reports the interrupted write or connection error instead of a timeout caused by Close; recoverable ACK rejections received while closing are discarded
+
 ## 1.1.0 - 2026-09-03
 
 ### Added

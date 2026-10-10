@@ -291,7 +291,7 @@ func TestWatchAckInterruptedWrite(t *testing.T) {
 			defer right.Close()
 			observed := &ackBlockingConn{Conn: left, entered: make(chan struct{})}
 			c, _ := NewClient(Options{CommandTimeout: -1})
-			w := &Watch{client: c, slot: "consumer", start: Position{watchEpoch, 10}, delivered: Position{watchEpoch, 10}, acknowledged: 10, controlGate: make(chan struct{}, 1), closing: make(chan struct{}), done: make(chan struct{})}
+			w := &Watch{client: c, slot: "consumer", start: Position{watchEpoch, 10}, delivered: Position{watchEpoch, 10}, controlGate: make(chan struct{}, 1), closing: make(chan struct{}), done: make(chan struct{})}
 			w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 			defer w.ackCancel()
 			w.conn = &conn{client: c, netConn: observed, writer: bufio.NewWriter(observed), watch: w}

@@ -94,7 +94,6 @@ type Watch struct {
 	ackCancel      context.CancelFunc
 	ackMu          sync.Mutex
 	delivered      Position
-	acknowledged   uint64
 }
 
 // Watch opens a stream with the client's endpoint, TLS options and login.
@@ -170,7 +169,6 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		return nil, err
 	}
 	w.delivered = w.start
-	w.acknowledged = w.start.Revision
 	return w, nil
 }
 
@@ -229,9 +227,9 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 		}
 		if err != nil {
 			_ = w.conn.shutdown(err)
-		} else {
+		} else if change, ok := event.(*ChangeEvent); ok {
 			w.ackMu.Lock()
-			w.delivered = event.GetPosition()
+			w.delivered = change.Position
 			w.ackMu.Unlock()
 		}
 		return event, err
@@ -245,8 +243,12 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 }
 
 // Close sends UNWATCH, discards queued pushes through its +OK and closes the
-// dedicated connections. The client's CommandTimeout bounds draining (the
-// default applies when it was disabled). Close is idempotent.
+// dedicated connections. Recoverable ACK rejections received while closing are
+// discarded. Close cancels an in-flight Ack; if its write is interrupted, the
+// connection closes without UNWATCH and both calls report the write or
+// connection error, rather than ErrTimeout caused by Close. Caller cancellation
+// and command deadlines still report ErrTimeout. The client's CommandTimeout
+// bounds draining (the default applies when it was disabled). Close is idempotent.
 func (w *Watch) Close() error {
 	w.closeOnce.Do(func() {
 		close(w.closing)
@@ -475,9 +477,11 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 // Ack acknowledges applied work on a slot watch. It completes after writing the
 // request, not after persistence: success has no server reply. An asynchronous
 // rejection is returned by Next; INVALID_ARGUMENT leaves the stream open.
-// Revisions must not decrease or exceed the last returned event (or Start).
-// A schema description prefacing a change must only be acknowledged after
-// applying that change. Close flushes accepted acknowledgements via UNWATCH.
+// The client rejects revisions above the last ChangeEvent returned by Next (or
+// Start before any change); schema and resync events do not advance this bound.
+// The server validates decreasing revisions because writing does not confirm
+// acceptance. Close flushes accepted acknowledgements via UNWATCH unless it
+// interrupts an in-flight write; see Close for cancellation and error handling.
 func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 	if err := ctx.Err(); err != nil {
 		return timeoutErrorf("ACK", err, "%s", err)
@@ -499,10 +503,10 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 		return requestErrorf("ACK", "ACK requires a slot watch")
 	}
 	w.ackMu.Lock()
-	valid := revision >= w.acknowledged && revision <= w.delivered.Revision
+	valid := revision <= w.delivered.Revision
 	w.ackMu.Unlock()
 	if !valid {
-		return requestErrorf("ACK", "revision must be between acknowledged and last delivered revision")
+		return requestErrorf("ACK", "revision must not exceed the last returned change or start position")
 	}
 	statement := "ACK " + strconv.FormatUint(revision, 10)
 	if err := checkLimits(w.conn.info, "ACK", statement, nil); err != nil {
@@ -512,12 +516,21 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 	if err != nil {
 		return err
 	}
-	ackCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stopClose := context.AfterFunc(w.ackContext, cancel)
+	ackCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stopClose := context.AfterFunc(w.ackContext, func() { cancel(ErrClosed) })
 	defer stopClose()
 	deadline := w.client.commandDeadline(ackCtx, "ACK")
 	defer deadline.cancel()
+	interruptionError := func() error {
+		if ctx.Err() != nil {
+			return timeoutErrorf("ACK", ctx.Err(), "%s", ctx.Err())
+		}
+		if context.Cause(deadline.ctx) == ErrClosed {
+			return newError(KindConnection, PhaseRequest, "ACK", "write request interrupted by Close", ErrClosed)
+		}
+		return deadline.err()
+	}
 	cn := w.conn
 	cn.writeMu.Lock()
 	defer cn.writeMu.Unlock()
@@ -525,7 +538,7 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 		return err
 	}
 	if deadline.ctx.Err() != nil {
-		return deadline.err()
+		return interruptionError()
 	}
 	if at, ok := deadline.ctx.Deadline(); ok {
 		_ = cn.netConn.SetWriteDeadline(at)
@@ -543,15 +556,12 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 	if err != nil {
 		var wrapped error
 		if deadline.ctx.Err() != nil {
-			wrapped = deadline.err()
+			wrapped = interruptionError()
 		} else {
 			wrapped = newError(KindConnection, PhaseRequest, "ACK", "write request: "+err.Error(), err)
 		}
 		_ = cn.shutdown(wrapped)
 		return wrapped
 	}
-	w.ackMu.Lock()
-	w.acknowledged = revision
-	w.ackMu.Unlock()
 	return nil
 }
