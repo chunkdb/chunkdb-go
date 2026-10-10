@@ -19,7 +19,7 @@ fmt.Println("recorded:", len(records.Array))
 Run the same list at application startup; a recorded name with the same statement is `skipped`.
 Different text for that name returns `ErrConflict`; case and interior spacing matter, while the Go client trims leading/trailing spaces and tabs.
 Each step is durable independently; earlier successes remain when a later step fails.
-`*MigrationError` preserves completed results, failed `Name`, zero-based `Index` and the wrapped cause for `errors.Is`/`errors.As`.
+Completed results are returned alongside the error; `*MigrationError` gives the failed `Name`, zero-based `Index` and wrapped cause for `errors.Is`/`errors.As`.
 Concurrent starts can share a list; `Pool.Migrate` leases one connection for it.
 After a connection failure, retry the same names and text because the outcome may be unknown; a recovery-required error requires a server restart first.
 Names are `[a-z_][a-z0-9_]*`, at most 63 bytes.

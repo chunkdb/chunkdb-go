@@ -18,6 +18,7 @@
 //	if err != nil { return err }
 //	block, err := client.GetBlock(ctx, "world_go", 0, 0)
 //	if err != nil { return err }
+//	fmt.Println(block["tile"], block["label"])
 //
 // The runnable world example is at examples/world in the repository.
 // Every statement names a table; "" uses [Options.Table], then the URI path,
