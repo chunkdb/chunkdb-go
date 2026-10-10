@@ -13,7 +13,7 @@ func TestIntegrationWatch(t *testing.T) {
 			name = "tls"
 		}
 		t.Run(name, func(t *testing.T) {
-			s := startServer(t, serverConfig{tls: secure, workers: 2})
+			s := startServer(t, serverConfig{tls: secure, workers: 2, args: []string{"--feed-linger-ms", "0"}})
 			c := connectIntegration(t, s, func(o *Options) {
 				if secure {
 					o.CA = s.caPEM
@@ -78,7 +78,7 @@ func TestIntegrationWatch(t *testing.T) {
 			if err := c.Ping(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			// Closing the last subscriber frees retained history; AFTER now resyncs.
+			// With linger disabled, closing the last subscriber frees retained history.
 			fresh, err := c.Watch(t.Context(), "watched", WatchOptions{After: &last})
 			if err != nil {
 				t.Fatal(err)
@@ -131,5 +131,40 @@ func TestIntegrationPoolWatch(t *testing.T) {
 	}
 	if _, err := pool.Watch(t.Context(), "watched", WatchOptions{}); !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
+	}
+}
+
+func TestIntegrationWatchLinger(t *testing.T) {
+	s := startServer(t, serverConfig{workers: 2})
+	c := connectIntegration(t, s, nil)
+	createTable(t, c, "watched", TableSpec{Columns: []ColumnDef{{Name: "v", Type: TypeUint(8)}}, ChunkWidth: 2, ChunkHeight: 2})
+	w, err := c.Watch(t.Context(), "watched", WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": 1}); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := nextWatch(t, w).(*ChangeEvent)
+	if !ok {
+		t.Fatal("first write did not produce a change")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	version, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := c.Watch(t.Context(), "watched", WatchOptions{After: &first.Position})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Close()
+	event := nextWatch(t, resumed)
+	change, ok := event.(*ChangeEvent)
+	if !ok || change.Position.Revision != version || change.Blocks[0].Before["v"] != uint64(1) || change.Blocks[0].After["v"] != uint64(2) {
+		t.Fatalf("default linger lost the disconnected write: %#v", event)
 	}
 }
