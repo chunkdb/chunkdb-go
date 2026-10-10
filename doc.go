@@ -21,7 +21,7 @@
 //	fmt.Println(block["tile"], block["label"])
 //
 // The runnable world example is at examples/world in the repository.
-// Every statement names a table; "" uses [Options.Table], then the URI path,
+// Table operations name a table; "" uses [Options.Table], then the URI path,
 // then [DefaultTableName]. [EncodeValue] lists each column type's Go values.
 // A nil record means an absent block; a nil field means NULL.
 //
@@ -29,7 +29,7 @@
 //
 // [Client] is safe for concurrent use and owns one connection; [Pool] leases
 // multiple connections. Credentials use SCRAM-SHA-256; chunks:// selects TLS.
-// Every method takes a context. An interrupted in-flight ordinary request
+// Network request methods take a context. An interrupted in-flight ordinary request
 // closes its connection; the next request reconnects without replaying the
 // failed request. A failed write's outcome may be unknown.
 //

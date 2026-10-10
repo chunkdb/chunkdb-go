@@ -34,7 +34,7 @@ Creating its table requires ADMIN on `*`; reading and writing require READ and W
 ## Use the client
 
 Connect with `ConnectURI(ctx, uri)` and close the client when finished.
-Every method takes a context and a table name; `""` uses `Options.Table`, then the URI path, then `default`.
+Data operations take a context and a table name; `""` uses `Options.Table`, then the URI path, then `default`.
 A `Client` is safe for concurrent use; `Pool` provides multiple connections.
 
 | Task | Guide with examples |
