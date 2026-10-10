@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Area is an inclusive rectangle of chunk coordinates.
@@ -17,8 +18,10 @@ type Position struct {
 	Revision uint64
 }
 
-// WatchOptions select an area and an optional retained position to resume after.
+// WatchOptions select a slot, area and optional position to resume after.
 type WatchOptions struct {
+	// Slot selects a durable consumer. Empty keeps an in-memory watch.
+	Slot  string
 	Area  *Area
 	After *Position
 }
@@ -85,6 +88,12 @@ type Watch struct {
 	nextGate       chan struct{}
 	closeOnce      sync.Once
 	closeErr       error
+	slot           string
+	controlGate    chan struct{}
+	ackContext     context.Context
+	ackCancel      context.CancelFunc
+	ackMu          sync.Mutex
+	delivered      Position
 }
 
 // Watch opens a stream with the client's endpoint, TLS options and login.
@@ -101,6 +110,12 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		return nil, err
 	}
 	statement := "WATCH " + name
+	if opts.Slot != "" {
+		if err := slotName("WATCH", opts.Slot); err != nil {
+			return nil, err
+		}
+		statement += " SLOT '" + opts.Slot + "'"
+	}
 	if a := opts.Area; a != nil {
 		if a.CX0 > a.CX1 || a.CY0 > a.CY1 {
 			return nil, requestErrorf("WATCH", "inverted area")
@@ -115,6 +130,9 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 	}
 	dedicated := c.copyOptions()
 	w := &Watch{client: dedicated, table: name, schemas: make(map[uint64][]Column), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
+	w.slot = opts.Slot
+	w.controlGate = make(chan struct{}, 1)
+	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 	// Seed before WATCH, so schema changes racing with setup are retained in
 	// the stream rather than decoded with a later DESCRIBE's columns.
 	schema, err := w.describe(ctx)
@@ -150,6 +168,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		_ = dedicated.Close()
 		return nil, err
 	}
+	w.delivered = w.start
 	return w, nil
 }
 
@@ -197,6 +216,9 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 	}
 	select {
 	case reply := <-w.pushes:
+		if reply.Kind == ReplyError {
+			return nil, replyError(PhaseResponse, "ACK", reply)
+		}
 		event, err := w.decode(ctx, reply)
 		select {
 		case <-w.closing:
@@ -205,6 +227,10 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 		}
 		if err != nil {
 			_ = w.conn.shutdown(err)
+		} else if change, ok := event.(*ChangeEvent); ok {
+			w.ackMu.Lock()
+			w.delivered = change.Position
+			w.ackMu.Unlock()
 		}
 		return event, err
 	case <-ctx.Done():
@@ -217,11 +243,18 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 }
 
 // Close sends UNWATCH, discards queued pushes through its +OK and closes the
-// dedicated connections. The client's CommandTimeout bounds draining (the
-// default applies when it was disabled). Close is idempotent.
+// dedicated connections. Recoverable ACK rejections received while closing are
+// discarded. Close cancels an in-flight Ack; if its write is interrupted, the
+// connection closes without UNWATCH and both calls report the write or
+// connection error, rather than ErrTimeout caused by Close. Caller cancellation
+// and command deadlines still report ErrTimeout. The client's CommandTimeout
+// bounds draining (the default applies when it was disabled). Close is idempotent.
 func (w *Watch) Close() error {
 	w.closeOnce.Do(func() {
 		close(w.closing)
+		w.ackCancel()
+		w.controlGate <- struct{}{}
+		defer func() { <-w.controlGate }()
 		w.metadataMu.Lock()
 		lookupCancel := w.metadataCancel
 		w.metadataMu.Unlock()
@@ -439,4 +472,96 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 		w.metadataMu.Unlock()
 	}()
 	return metadata.Describe(lookupCtx, w.table)
+}
+
+// Ack acknowledges applied work on a slot watch. It completes after writing the
+// request, not after persistence: success has no server reply. An asynchronous
+// rejection is returned by Next; INVALID_ARGUMENT leaves the stream open.
+// The client rejects revisions above the last ChangeEvent returned by Next (or
+// Start before any change); schema and resync events do not advance this bound.
+// The server validates decreasing revisions because writing does not confirm
+// acceptance. Close flushes accepted acknowledgements via UNWATCH unless it
+// interrupts an in-flight write; see Close for cancellation and error handling.
+func (w *Watch) Ack(ctx context.Context, revision uint64) error {
+	if err := ctx.Err(); err != nil {
+		return timeoutErrorf("ACK", err, "%s", err)
+	}
+	select {
+	case w.controlGate <- struct{}{}:
+	case <-ctx.Done():
+		return timeoutErrorf("ACK", ctx.Err(), "%s", ctx.Err())
+	case <-w.closing:
+		return closedError("ACK")
+	}
+	defer func() { <-w.controlGate }()
+	select {
+	case <-w.closing:
+		return closedError("ACK")
+	default:
+	}
+	if w.slot == "" {
+		return requestErrorf("ACK", "ACK requires a slot watch")
+	}
+	w.ackMu.Lock()
+	valid := revision <= w.delivered.Revision
+	w.ackMu.Unlock()
+	if !valid {
+		return requestErrorf("ACK", "revision must not exceed the last returned change or start position")
+	}
+	statement := "ACK " + strconv.FormatUint(revision, 10)
+	if err := checkLimits(w.conn.info, "ACK", statement, nil); err != nil {
+		return err
+	}
+	wire, err := encodeRequest("ACK", statement, nil)
+	if err != nil {
+		return err
+	}
+	ackCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stopClose := context.AfterFunc(w.ackContext, func() { cancel(ErrClosed) })
+	defer stopClose()
+	deadline := w.client.commandDeadline(ackCtx, "ACK")
+	defer deadline.cancel()
+	interruptionError := func() error {
+		if ctx.Err() != nil {
+			return timeoutErrorf("ACK", ctx.Err(), "%s", ctx.Err())
+		}
+		if context.Cause(deadline.ctx) == ErrClosed {
+			return newError(KindConnection, PhaseRequest, "ACK", "write request interrupted by Close", ErrClosed)
+		}
+		return deadline.err()
+	}
+	cn := w.conn
+	cn.writeMu.Lock()
+	defer cn.writeMu.Unlock()
+	if err := cn.terminalError(); err != nil {
+		return err
+	}
+	if deadline.ctx.Err() != nil {
+		return interruptionError()
+	}
+	if at, ok := deadline.ctx.Deadline(); ok {
+		_ = cn.netConn.SetWriteDeadline(at)
+	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(deadline.ctx, func() { _ = cn.netConn.SetWriteDeadline(time.Now()); close(interrupted) })
+	_, err = cn.writer.Write(wire)
+	if err == nil {
+		err = cn.writer.Flush()
+	}
+	if !stop() {
+		<-interrupted
+	}
+	_ = cn.netConn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		var wrapped error
+		if deadline.ctx.Err() != nil {
+			wrapped = interruptionError()
+		} else {
+			wrapped = newError(KindConnection, PhaseRequest, "ACK", "write request: "+err.Error(), err)
+		}
+		_ = cn.shutdown(wrapped)
+		return wrapped
+	}
+	return nil
 }

@@ -641,11 +641,12 @@ type conn struct {
 
 	writeMu sync.Mutex
 
-	mu      sync.Mutex
-	queue   []*pending
-	failed  bool
-	termErr error
-	watch   *Watch
+	mu           sync.Mutex
+	queue        []*pending
+	failed       bool
+	termErr      error
+	watch        *Watch
+	watchStarted bool
 
 	// info is the HELLO reply; set before the connection is published.
 	info *ServerInfo
@@ -706,13 +707,14 @@ func (cn *conn) readLoop() {
 
 		cn.mu.Lock()
 		watch := cn.watch
+		streaming := cn.watchStarted
 		cn.mu.Unlock()
 		if watch == nil && reply.Kind == ReplyPush {
 			_ = cn.shutdown(protocolErrorf("", "push outside a watch"))
 			return
 		}
 		if watch != nil && (reply.Kind == ReplyPush || reply.Kind == ReplyError) {
-			if reply.Kind == ReplyError {
+			if reply.Kind == ReplyError && !(streaming && watch.slot != "" && reply.Code == CodeInvalidArgument) {
 				_ = cn.shutdown(replyError(PhaseResponse, "WATCH", reply))
 				return
 			}
@@ -728,6 +730,11 @@ func (cn *conn) readLoop() {
 		if waiter == nil {
 			_ = cn.shutdown(protocolErrorf("", "unsolicited response from server"))
 			return
+		}
+		if waiter.command == "WATCH" && reply.Kind == ReplySimple {
+			cn.mu.Lock()
+			cn.watchStarted = true
+			cn.mu.Unlock()
 		}
 		waiter.ch <- result{reply: reply}
 	}
