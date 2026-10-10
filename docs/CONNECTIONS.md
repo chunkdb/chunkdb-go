@@ -21,7 +21,7 @@ if err := client.Ping(ctx); err != nil { return err }
 ```
 
 `NewClient` is lazy; `Connect`/`ConnectURI` perform the connection and handshake.
-ConnectTimeout bounds dialing, TLS and HELLO; CommandTimeout bounds one reply.
+ConnectTimeout bounds dialing and TLS; CommandTimeout bounds each HELLO, AUTH or statement reply.
 Both default to five seconds; a negative value disables the client deadline while the context still applies.
 A Client is safe for concurrent use; pipelining keeps ordered requests/replies on one socket, and its default depth is one.
 After transport failure the failed request is not resent; the next request reconnects.

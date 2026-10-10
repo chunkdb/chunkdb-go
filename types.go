@@ -38,8 +38,8 @@ type Options struct {
 	// [DefaultVerifierIterations]; fewer are refused.
 	VerifierIterations int
 
-	// ConnectTimeout bounds establishing the socket, the TLS handshake and
-	// HELLO. Zero means [DefaultTimeout]; a negative value disables the
+	// ConnectTimeout bounds establishing the socket and the TLS handshake.
+	// Zero means [DefaultTimeout]; a negative value disables the
 	// client-side deadline and leaves cancellation to the caller's context.
 	ConnectTimeout time.Duration
 	// CommandTimeout bounds waiting for one reply. Zero means
