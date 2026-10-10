@@ -63,9 +63,8 @@ var (
 	// ErrPermissionDenied matches a statement refused because the user lacks
 	// the right it needs. The error is a [*PermissionDeniedError].
 	ErrPermissionDenied = errors.New("chunkdb: permission denied")
-	// ErrConflict matches a transaction the server ended with CONFLICT:
-	// nothing of it was written, and running it again may succeed. The error
-	// is a [*ConflictError].
+	// ErrConflict matches CONFLICT: a failed transaction ([*ConflictError]),
+	// or a migration name already used for different statement text ([*Error]).
 	ErrConflict = errors.New("chunkdb: transaction conflict")
 )
 
@@ -95,8 +94,8 @@ const (
 	// CodeSchemaMismatch: SET CHUNK of a form encoded for another schema
 	// version than the table's; nothing changed. See [SchemaMismatchError].
 	CodeSchemaMismatch = "SCHEMA_MISMATCH"
-	// CodeConflict: the server ended a transaction without writing anything;
-	// running it again may succeed. See [ConflictError].
+	// CodeConflict: a transaction conflict (see [ConflictError]), or a
+	// migration name already used for different statement text.
 	CodeConflict = "CONFLICT"
 	// CodeNoTable: the table does not exist.
 	CodeNoTable = "NO_TABLE"
@@ -311,7 +310,7 @@ func replyError(phase Phase, command string, reply Reply) error {
 		right, table, _ := strings.Cut(reply.Message, " on ")
 		return &PermissionDeniedError{Right: right, Table: table, Err: base}
 	}
-	if reply.Code == CodeConflict {
+	if reply.Code == CodeConflict && command != "MIGRATE" {
 		// "<reason> <message>".
 		reason, _, _ := strings.Cut(reply.Message, " ")
 		if reason == "" {
