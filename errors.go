@@ -63,9 +63,8 @@ var (
 	// ErrPermissionDenied matches a statement refused because the user lacks
 	// the right it needs. The error is a [*PermissionDeniedError].
 	ErrPermissionDenied = errors.New("chunkdb: permission denied")
-	// ErrConflict matches a transaction the server ended with CONFLICT:
-	// nothing of it was written, and running it again may succeed. The error
-	// is a [*ConflictError].
+	// ErrConflict matches CONFLICT: a failed transaction ([*ConflictError]),
+	// or a migration name already used for different statement text ([*Error]).
 	ErrConflict = errors.New("chunkdb: transaction conflict")
 )
 
@@ -95,8 +94,8 @@ const (
 	// CodeSchemaMismatch: SET CHUNK of a form encoded for another schema
 	// version than the table's; nothing changed. See [SchemaMismatchError].
 	CodeSchemaMismatch = "SCHEMA_MISMATCH"
-	// CodeConflict: the server ended a transaction without writing anything;
-	// running it again may succeed. See [ConflictError].
+	// CodeConflict: a transaction conflict (see [ConflictError]), or a
+	// migration name already used for different statement text.
 	CodeConflict = "CONFLICT"
 	// CodeNoTable: the table does not exist.
 	CodeNoTable = "NO_TABLE"
@@ -112,6 +111,8 @@ const (
 	CodeSlotLost = "SLOT_LOST"
 	// CodeInternal: a server failure. After a write, a message starting with
 	// "write outcome unknown" means the write may or may not be applied.
+	// A migration recovery error requires a server restart before retrying
+	// the same named step; its outcome may also be unknown.
 	CodeInternal = "INTERNAL"
 )
 
@@ -303,7 +304,8 @@ func serverError(phase Phase, command, code, message string) *Error {
 // replyError converts an error reply into the error a call returns: a
 // [*VersionMismatchError] for VERSION_MISMATCH, a [*SchemaMismatchError] for
 // SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, a
-// [*ConflictError] for CONFLICT, an [*Error] otherwise.
+// [*ConflictError] for transaction CONFLICT, an [*Error] otherwise (including
+// migration CONFLICT).
 func replyError(phase Phase, command string, reply Reply) error {
 	base := serverError(phase, command, reply.Code, reply.Message)
 	if reply.Code == CodePermissionDenied {
@@ -311,7 +313,7 @@ func replyError(phase Phase, command string, reply Reply) error {
 		right, table, _ := strings.Cut(reply.Message, " on ")
 		return &PermissionDeniedError{Right: right, Table: table, Err: base}
 	}
-	if reply.Code == CodeConflict {
+	if reply.Code == CodeConflict && command != "MIGRATE" {
 		// "<reason> <message>".
 		reason, _, _ := strings.Cut(reply.Message, " ")
 		if reason == "" {

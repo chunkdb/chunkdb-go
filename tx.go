@@ -69,7 +69,8 @@ func (c *Client) Transaction(ctx context.Context, fn func(tx *Tx) error, opts ..
 
 	for attempt := 0; ; attempt++ {
 		version, err := c.runTransaction(ctx, fn)
-		if !errors.Is(err, ErrConflict) || attempt >= options.retries {
+		var conflict *ConflictError
+		if !errors.As(err, &conflict) || attempt >= options.retries {
 			return version, err
 		}
 		if err := txBackoff(ctx, attempt); err != nil {
@@ -112,8 +113,9 @@ func (c *Client) runTransaction(ctx context.Context, fn func(tx *Tx) error) (uin
 
 	tx := &Tx{client: c, conn: established, tables: make(map[string]bool)}
 	err = tx.run(fn)
+	var conflict *ConflictError
 	switch {
-	case tx.conflict != nil && (err == nil || errors.Is(err, ErrConflict)):
+	case tx.conflict != nil && (err == nil || errors.As(err, &conflict)):
 		// A statement's CONFLICT ended the transaction, which stays on the
 		// connection until ROLLBACK.
 		tx.rollback(ctx)

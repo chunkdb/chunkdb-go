@@ -3,6 +3,7 @@ package chunkdb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strconv"
@@ -193,6 +194,64 @@ func TestTransactionRollsBackOnACallbackError(t *testing.T) {
 	// The client goes on outside a transaction on the same connection.
 	if err := client.Ping(t.Context()); err != nil || server.acceptedConns() != 1 {
 		t.Fatalf("Ping: %v on %d connections", err, server.acceptedConns())
+	}
+}
+
+func TestTransactionDoesNotRetryMigrationConflict(t *testing.T) {
+	for _, priorTransactionConflict := range []bool{false, true} {
+		t.Run(strconv.FormatBool(priorTransactionConflict), func(t *testing.T) {
+			server, state := newTxServer(t)
+			if priorTransactionConflict {
+				state.replies["GET BLOCK"] = []string{conflictReply}
+			}
+			client := newTestClient(t, server, nil)
+			migrationServer := newFakeServer(t, respondWith("-ERR CONFLICT migration 'create_world' has a different statement\r\n"))
+			migrator := newTestClient(t, migrationServer, nil)
+			attempts := 0
+			_, err := client.Transaction(t.Context(), func(tx *Tx) error {
+				attempts++
+				if priorTransactionConflict {
+					if _, err := tx.GetBlock(t.Context(), "world", 0, 0, "id"); !errors.Is(err, ErrConflict) {
+						t.Fatal(err)
+					}
+				}
+				_, err := migrator.Migrate(t.Context(), []Migration{{"create_world", "CREATE TABLE world (v u8) CHUNK 2 x 2"}})
+				return fmt.Errorf("application startup: %w", err)
+			})
+			var migration *MigrationError
+			var transaction *ConflictError
+			if attempts != 1 || !errors.Is(err, ErrConflict) || !errors.As(err, &migration) || errors.As(err, &transaction) {
+				t.Fatal(attempts, err)
+			}
+			want := []string{"BEGIN", "ROLLBACK"}
+			if priorTransactionConflict {
+				want = []string{"BEGIN", "DESCRIBE world", "GET BLOCK 0 0 FROM world COLUMNS id", "ROLLBACK"}
+			}
+			if got := state.statements(); !slices.Equal(got, want) || len(migrationServer.commands()) != 2 {
+				t.Fatal(got, migrationServer.commands())
+			}
+		})
+	}
+}
+
+func TestTransactionRetriesWrappedStatementConflict(t *testing.T) {
+	server, state := newTxServer(t)
+	state.replies["DELETE BLOCK"] = []string{conflictReply}
+	client := newTestClient(t, server, nil)
+	attempts := 0
+	version, err := client.Transaction(t.Context(), func(tx *Tx) error {
+		attempts++
+		if err := tx.DeleteBlock(t.Context(), "world", 0, 0); err != nil {
+			return fmt.Errorf("delete cell: %w", err)
+		}
+		return nil
+	})
+	if err != nil || version != 42 || attempts != 2 {
+		t.Fatal(version, err, attempts)
+	}
+	want := []string{"BEGIN", "DELETE BLOCK 0 0 FROM world", "ROLLBACK", "BEGIN", "DELETE BLOCK 0 0 FROM world", "COMMIT"}
+	if got := state.statements(); !slices.Equal(got, want) {
+		t.Fatal(got)
 	}
 }
 
