@@ -26,7 +26,6 @@ Revisions order events; timestamps may move backwards.
 
 Save `event.GetPosition()` only after applying the event, and use `WatchOptions.After` when reconnecting.
 An ordinary watch has bounded in-memory history and may produce `ResyncEvent`; this requests a state rebuild, not an ordinary change.
-Read state on another connection while continuing to consume the watch, replacing disappeared chunks and applying only changes newer than each scanned chunk's version.
 See the server's [resynchronization procedure](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md#resynchronizing).
 `SchemaEvent` supplies columns for following changes; the client caches schema versions and uses short-lived lookups for missing versions.
 If a needed schema is unavailable, `Next` returns `ErrProtocol` instead of decoding with another schema.
@@ -60,11 +59,12 @@ An empty table in `Slots` lists every visible table; in Create/Drop it means the
 A slot has one active watch (`CodeBusy`); its start is its persisted ACK or a later `After` position.
 AFTER does not acknowledge work.
 Slots replay archived changes, including historical schemas, and then join the live stream; they send only persisted durable changes, even in relaxed mode.
-`Ack` writes without a success reply: accepted ACKs are batched by the server, and `Close` waits for persistence through UNWATCH unless closing interrupts an in-flight write.
+`Ack` returns after writing the request, without a success reply; `Close` waits for persistence through UNWATCH unless closing interrupts an in-flight write.
+See [server ACK persistence](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md#durable-slots) for batching and durability.
 The client accepts ACKs only through its last returned ChangeEvent or initial position; SchemaEvent and ResyncEvent cannot raise that bound.
 An asynchronous `INVALID_ARGUMENT` rejection appears in `Next` and leaves the stream usable; decreasing ACKs are validated by the server.
 To avoid duplicate external effects, commit output and its Position atomically in your sink, then ACK; ACK alone does not provide exactly-once effects.
-When retention exceeds the server's limit, `Slot.Lost` is true and WATCH returns `CodeSlotLost`; rebuild state, drop the slot and recreate it.
+When retention exceeds the server's limit, `Slot.Lost` is true and WATCH returns `CodeSlotLost`; follow the server's [resync procedure](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md#resynchronizing).
 
 Idle `Next` waits use their context, without a command timeout; cancelling a wait leaves the watch open.
 Lookup or decoding failures end the stream; reconnect and resumption are application-controlled.

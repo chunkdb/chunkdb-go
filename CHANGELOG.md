@@ -9,6 +9,7 @@ uses protocol 3 (CQL); see the engine's
 ## Unreleased
 
 ### Documentation
+- Use timestamped backup names and link to the server's resync and ACK persistence guidance.
 - Rewrite the README and package overview for chunkdb 2.0, with separate data, values, users, transactions, feed/slots, migrations, backup and connection guides.
 
 ### Breaking

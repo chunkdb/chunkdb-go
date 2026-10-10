@@ -30,13 +30,14 @@ Migrations require a single-process read-write server and cannot run inside a tr
 ## Online backup
 
 ```go
-backup, err := client.Do(ctx, "BACKUP TO 'go-docs'")
+backupName := "go-docs-" + time.Now().UTC().Format("20060102T150405.000000000Z")
+backup, err := client.Do(ctx, fmt.Sprintf("BACKUP TO '%s'", backupName))
 if err != nil { return err }
 fmt.Println("backup complete:", backup.Kind == chunkdb.ReplyMap)
 ```
 
 BACKUP uses server-local storage under `--backup-dir`; its destination must be absent or empty, and needs MANAGES USERS unless authentication is disabled.
-The relative name above must be unused; use a new name for another snapshot.
+The example generates a fresh timestamped relative name for each snapshot.
 The reply carries per-table cuts and counts; data across tables need not represent one simultaneous cut.
 Only one backup runs at a time; another receives `CodeBusy`.
 If the connection fails, inspect the server-side result before assuming completion: a write may have succeeded before its reply was lost.
