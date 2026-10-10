@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -380,6 +381,13 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 	// connection, so nothing else would.
 	if err := c.helloOn(ctx, established); err != nil {
 		_ = established.shutdown(err)
+		var typed *Error
+		if !c.opts.tls && errors.Is(err, ErrConnection) && errors.As(err, &typed) && typed.Phase != PhaseAuth {
+			hinted := *typed
+			hinted.Message += "; check the URI scheme: chunk:// needs a plain listener, chunks:// needs TLS"
+			hinted.Err = err
+			return nil, &hinted
+		}
 		return nil, err
 	}
 	return established, nil
@@ -496,15 +504,18 @@ func (c *Client) tlsConfig() (*tls.Config, error) {
 // problems as [ErrTLS], and everything else as [ErrConnection].
 func (c *Client) wrapDialError(parent, dialCtx context.Context, address string, err error) *Error {
 	if dialCtx.Err() != nil && parent.Err() == nil {
-		return timeoutErrorf("CONNECT", err, "connection timeout after %s", c.opts.connectTimeout)
+		return timeoutErrorf("CONNECT", err, "connection timeout to %s after %s; check the server address, port and network, or increase ConnectTimeout", address, c.opts.connectTimeout)
 	}
 	if parent.Err() != nil {
 		return timeoutErrorf("CONNECT", parent.Err(), "%s", parent.Err())
 	}
 	if isTLSError(err) {
-		return newError(KindTLS, PhaseTLS, "CONNECT", "connect "+address+": "+err.Error(), err)
+		return newError(KindTLS, PhaseTLS, "CONNECT", "TLS connection to "+address+": "+err.Error()+"; use chunks:// only with a TLS listener and check the trusted CA and server hostname", err)
 	}
-	return connectionErrorf("CONNECT", err, "connect %s: %s", address, err)
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return connectionErrorf("CONNECT", err, "connection refused at %s: %s; start the server and check its listen address and port", address, err)
+	}
+	return connectionErrorf("CONNECT", err, "connect %s: %s; check the server address, port and network", address, err)
 }
 
 func isTLSError(err error) bool {
@@ -556,7 +567,7 @@ func (d callDeadline) err() *Error {
 	if d.parent.Err() != nil {
 		return timeoutErrorf(d.command, d.parent.Err(), "%s", d.parent.Err())
 	}
-	return timeoutErrorf(d.command, d.ctx.Err(), "command timeout after %s", d.timeout)
+	return timeoutErrorf(d.command, d.ctx.Err(), "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
 }
 
 // exec runs one statement on the live connection. The caller must already
