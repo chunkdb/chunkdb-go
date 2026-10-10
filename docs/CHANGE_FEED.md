@@ -64,7 +64,7 @@ See [server ACK persistence](https://github.com/chunkdb/chunkdb/blob/main/docs/C
 The client accepts ACKs only through its last returned ChangeEvent or initial position; SchemaEvent and ResyncEvent cannot raise that bound.
 An asynchronous `INVALID_ARGUMENT` rejection appears in `Next` and leaves the stream usable; decreasing ACKs are validated by the server.
 To avoid duplicate external effects, commit output and its Position atomically in your sink, then ACK; ACK alone does not provide exactly-once effects.
-When retention exceeds the server's limit, `Slot.Lost` is true and WATCH returns `CodeSlotLost`; follow the server's [resync procedure](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md#resynchronizing).
+When retention exceeds the server's limit, `Slot.Lost` is true and WATCH returns `CodeSlotLost`; follow the server's [slot recovery guidance](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md#durable-slots).
 
 Idle `Next` waits use their context, without a command timeout; cancelling a wait leaves the watch open.
 Lookup or decoding failures end the stream; reconnect and resumption are application-controlled.
