@@ -141,8 +141,11 @@ func TestSlotWatchAckNoReplyAndRecoverableError(t *testing.T) {
 	if nextWatch(t, w).GetPosition().Revision != 12 {
 		t.Fatal("stream ended after ACK rejection")
 	}
-	if err := w.Ack(t.Context(), 10); !errors.Is(err, ErrProtocol) {
-		t.Fatal(err)
+	if err := w.Ack(t.Context(), 10); err != nil {
+		t.Fatal("lower ACK after rejection:", err)
+	}
+	if got := <-commands; got != "ACK 10" {
+		t.Fatal(got)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -158,6 +161,105 @@ func TestSlotWatchAckNoReplyAndRecoverableError(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestSlotAckBoundOnlyAdvancesOnChanges(t *testing.T) {
+	commands := make(chan string, 8)
+	columns := []string{fakeColumn(1, "v", "u8", false, false, respNull)}
+	frames := push(respBulk("schema"), respBulk(watchEpoch), respInt(11), respInt(1), respArray(columns...)) +
+		changePush(1, respNull, respArray(respInt(2))) +
+		push(respBulk("resync"), respBulk(watchEpoch), respInt(12)) +
+		push(respBulk("schema"), respBulk(watchEpoch), respInt(13), respInt(2), respArray(columns...))
+	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		switch verbOf(command) {
+		case "DESCRIBE":
+			writeRaw(cn, describeReply("world", 1, columns))
+		case "WATCH":
+			writeRaw(cn, "+OK "+watchEpoch+" 10\r\n"+frames)
+		case "ACK":
+			commands <- command
+		case "UNWATCH":
+			writeSimple(cn, "OK")
+		}
+	}))
+	c := newTestClient(t, s, nil)
+	w, err := c.Watch(t.Context(), "world", WatchOptions{Slot: "consumer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, ok := nextWatch(t, w).(*SchemaEvent); !ok {
+		t.Fatal("expected historical schema")
+	}
+	if err := w.Ack(t.Context(), 11); !errors.Is(err, ErrProtocol) {
+		t.Fatal("historical schema advanced ACK bound:", err)
+	}
+	if err := w.Ack(t.Context(), 10); err != nil {
+		t.Fatal("start position ACK:", err)
+	}
+	if _, ok := nextWatch(t, w).(*ChangeEvent); !ok {
+		t.Fatal("expected change")
+	}
+	if err := w.Ack(t.Context(), 11); err != nil {
+		t.Fatal("returned change ACK:", err)
+	}
+	if _, ok := nextWatch(t, w).(*ResyncEvent); !ok {
+		t.Fatal("expected resync")
+	}
+	if err := w.Ack(t.Context(), 12); !errors.Is(err, ErrProtocol) {
+		t.Fatal("resync advanced ACK bound:", err)
+	}
+	if _, ok := nextWatch(t, w).(*SchemaEvent); !ok {
+		t.Fatal("expected live schema")
+	}
+	if err := w.Ack(t.Context(), 13); !errors.Is(err, ErrProtocol) {
+		t.Fatal("live schema advanced ACK bound:", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ACK 10", "ACK 11"} {
+		select {
+		case got := <-commands:
+			if got != want {
+				t.Fatal(got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("missing", want)
+		}
+	}
+	select {
+	case got := <-commands:
+		t.Fatal("unexpected ACK:", got)
+	default:
+	}
+}
+
+func TestSlotCloseDiscardsAckRejections(t *testing.T) {
+	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		switch verbOf(command) {
+		case "DESCRIBE":
+			writeRaw(cn, describeReply("world", 1, worldColumns))
+		case "WATCH":
+			writeRaw(cn, "+OK "+watchEpoch+" 10\r\n")
+		case "UNWATCH":
+			writeRaw(cn, "-ERR INVALID_ARGUMENT rejected ACK\r\n+OK\r\n")
+		}
+	}))
+	c := newTestClient(t, s, nil)
+	w, err := c.Watch(t.Context(), "world", WatchOptions{Slot: "consumer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Ack(t.Context(), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal("closing must discard recoverable ACK rejection:", err)
+	}
+	if _, err := w.Next(t.Context()); !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+}
+
 func TestSlotWatchStartupInvalidArgument(t *testing.T) {
 	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
 		if verbOf(command) == "DESCRIBE" {
@@ -200,21 +302,29 @@ func TestWatchAckInterruptedWrite(t *testing.T) {
 			go func() { result <- w.Ack(ctx, 10) }()
 			<-observed.entered
 			if closeWatch {
-				if err := w.Close(); !errors.Is(err, ErrTimeout) {
-					t.Fatal(err)
+				if err := w.Close(); !errors.Is(err, ErrConnection) || errors.Is(err, ErrTimeout) {
+					t.Fatal("Close must report the aborted write:", err)
 				}
 			} else {
 				cancel()
 			}
 			select {
 			case err := <-result:
-				if !errors.Is(err, ErrTimeout) {
+				want := ErrTimeout
+				if closeWatch {
+					want = ErrConnection
+				}
+				if !errors.Is(err, want) || (closeWatch && errors.Is(err, ErrTimeout)) {
 					t.Fatal(err)
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("ACK write did not stop")
 			}
-			if err := w.conn.terminalError(); !errors.Is(err, ErrTimeout) {
+			want := ErrTimeout
+			if closeWatch {
+				want = ErrConnection
+			}
+			if err := w.conn.terminalError(); !errors.Is(err, want) || (closeWatch && errors.Is(err, ErrTimeout)) {
 				t.Fatal(err)
 			}
 		})
