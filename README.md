@@ -2,6 +2,27 @@
 
 Official Go client for [`chunkdb`](https://github.com/chunkdb/chunkdb). It speaks protocol 3: one CQL statement per request, values sent as binary parameters, typed replies. It does not connect to servers of an earlier protocol; see the engine's [compatibility policy](https://github.com/chunkdb/chunkdb/blob/main/docs/COMPATIBILITY.md).
 
+## World in five minutes
+
+Start a server using the [server quick start](https://github.com/chunkdb/chunkdb/blob/main/docs/QUICK_START.md), then run the [world example](examples/world/main.go) with Go 1.25 or newer:
+
+```bash
+git clone https://github.com/chunkdb/chunkdb-go.git
+cd chunkdb-go
+CHUNKDB_URI='chunk://admin:your-password@127.0.0.1:4242/' go run ./examples/world
+```
+
+Use the administrator login from your server and URI-escape special characters in its password. The example creates `world_go` with `tile u8` and `label text(16)`, writes a 4×4 area, reads its blocks and chunks, then subscribes before updating `(0,0)` and prints the observed change:
+
+```text
+schema: applied
+area: 4 chunks, 16 blocks written
+block (0,0): tile=1 label=grass
+change (0,0): tile=2 label=water
+```
+
+Run the same command again: the named schema migration is `skipped`, and the example overwrites the same 4×4 area before watching another update. It needs ADMIN on `*` to create the table and READ/WRITE on `world_go`. For a server started with `--auth none`, use `CHUNKDB_URI='chunk://127.0.0.1:4242/'`.
+
 Requirements: Go 1.25 or newer and a reachable chunkdb server of protocol 3. Standard library only.
 
 ```bash

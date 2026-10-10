@@ -19,6 +19,7 @@ the engine's
 - Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
+- A runnable `examples/world` creates a typed table, fills and reads an area, and observes an update through WATCH; the integration suite runs it twice to check its repeatable named migration
 - Client/Pool `Migrate` apply named schema steps in order with `applied`/`skipped` results, partial results and a wrapping `MigrationError` identifying the first failed step; migration `CONFLICT` preserves the server error without transaction retry semantics
 - Durable slots: Client/Pool `CreateSlot`, `DropSlot`, typed `Slots`, `WatchOptions.Slot`, and cancellable write-only `Watch.Ack`; slot ACK rejections are recoverable through `Next`, with `CodeSlotLost` for expired history
 - `Client.Watch` and `Pool.Watch` stream typed change, schema and resync events over dedicated logged-in connections, with AREA/AFTER, schema-version decoding, exact overflow coordinates and draining UNWATCH close
@@ -35,6 +36,7 @@ the engine's
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ### Fixed
+- Connection errors identify refused addresses and give server, URI scheme, TLS trust and timeout guidance while preserving error types and wrapped causes
 - Slot ACK validation uses the last returned change or initial position and lets the server validate decreasing revisions, including retries after rejected ACKs
 - Closing during an ACK write reports the interrupted write or connection error instead of a timeout caused by Close; recoverable ACK rejections received while closing are discarded
 
