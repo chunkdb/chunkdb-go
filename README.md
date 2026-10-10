@@ -31,7 +31,7 @@ change (0,0): tile=2 label=water
 Run it again: the named schema step is `skipped`, and the data is written again.
 Creating its table requires ADMIN on `*`; reading and writing require READ and WRITE on `world_go`.
 
-`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk; a written empty chunk retains its versioned form until its stored and cached state are removed.
+`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk; a written empty chunk retains its versioned form until its disk artifacts and cached state are removed.
 
 ## Use the client
 

@@ -41,7 +41,7 @@ for coord, err := range client.AllChunks(ctx, "world_go", 0) {
 }
 ```
 
-`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk. Build a fresh form with `NewChunk(schema)` and perform an ordinary first write; NULL supplies no version for `IfVersion`. A written chunk with all blocks deleted retains its empty form and version until its stored and cached state are removed.
+`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk. Build a fresh form with `NewChunk(schema)` and perform an ordinary first write; NULL supplies no version for `IfVersion`. A written chunk with all blocks deleted retains its empty form and version until its disk artifacts and cached state are removed.
 
 `SetChunk` replaces the entire chunk; `Chunk.Present` distinguishes absent blocks.
 `Schema.Locate(x, y)` maps absolute blocks to chunk and local coordinates, including negative addresses.
