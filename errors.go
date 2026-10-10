@@ -111,6 +111,8 @@ const (
 	CodeSlotLost = "SLOT_LOST"
 	// CodeInternal: a server failure. After a write, a message starting with
 	// "write outcome unknown" means the write may or may not be applied.
+	// A migration recovery error requires a server restart before retrying
+	// the same named step; its outcome may also be unknown.
 	CodeInternal = "INTERNAL"
 )
 
@@ -302,7 +304,8 @@ func serverError(phase Phase, command, code, message string) *Error {
 // replyError converts an error reply into the error a call returns: a
 // [*VersionMismatchError] for VERSION_MISMATCH, a [*SchemaMismatchError] for
 // SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, a
-// [*ConflictError] for CONFLICT, an [*Error] otherwise.
+// [*ConflictError] for transaction CONFLICT, an [*Error] otherwise (including
+// migration CONFLICT).
 func replyError(phase Phase, command string, reply Reply) error {
 	base := serverError(phase, command, reply.Code, reply.Message)
 	if reply.Code == CodePermissionDenied {

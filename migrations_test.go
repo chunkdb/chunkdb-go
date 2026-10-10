@@ -61,6 +61,32 @@ func TestMigrateStopsAndPreservesConflict(t *testing.T) {
 	}
 }
 
+func TestMigrateStopsAfterTransportOrValidationFailure(t *testing.T) {
+	for _, transport := range []bool{false, true} {
+		s := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
+			if strings.Contains(command, "'failed'") {
+				conn.Close()
+				return
+			}
+			writeSimple(conn, "applied")
+		}))
+		c := newTestClient(t, s, nil)
+		second := Migration{"failed", "DROP TABLE other"}
+		wantErr := ErrConnection
+		wantCommands := 3
+		if !transport {
+			second.Statement = "DROP TABLE other\n"
+			wantErr = ErrProtocol
+			wantCommands = 2
+		}
+		got, err := c.Migrate(t.Context(), []Migration{{"first", "DROP TABLE world"}, second, {"later", "DROP TABLE later"}})
+		var failed *MigrationError
+		if !reflect.DeepEqual(got, []MigrationResult{{"first", "applied"}}) || !errors.Is(err, wantErr) || !errors.As(err, &failed) || failed.Index != 1 || failed.Name != "failed" || len(s.commands()) != wantCommands {
+			t.Fatal(got, err, s.commands())
+		}
+	}
+}
+
 func TestMigrateRejectsInvalidStepBeforeSending(t *testing.T) {
 	invalid := []Migration{{"", "DROP TABLE world"}, {"Upper", "DROP TABLE world"}, {"bad'name", "DROP TABLE world"}, {strings.Repeat("a", 64), "DROP TABLE world"}, {"valid", " \t"}, {"valid", "\nDROP TABLE world"}, {"valid", "DROP TABLE world\r"}, {"valid", "DROP TABLE world\x00"}}
 	for _, step := range invalid {
