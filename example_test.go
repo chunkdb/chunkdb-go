@@ -159,6 +159,9 @@ func ExampleIfVersion() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		if chunk == nil {
+			log.Fatal("chunk has not been written; generate it with an ordinary write first")
+		}
 		light := uint64(0)
 		if value, ok := chunk.Columns["light"][0].(uint64); ok {
 			light = value
