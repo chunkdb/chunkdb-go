@@ -113,7 +113,8 @@ func optionAssignments(options TableOptions) []string {
 }
 
 // AddColumn adds a column to table ("" is the default table). A REQUIRED
-// column needs a default. Chunks written before take its default, or NULL.
+// column needs a default when the table has present blocks. Chunks written
+// before take its default, or NULL.
 func (c *Client) AddColumn(ctx context.Context, table string, column ColumnDef) error {
 	const command = "ALTER TABLE"
 	name, err := c.tableName(command, table)
