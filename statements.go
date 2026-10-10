@@ -442,7 +442,7 @@ func deleteBlock(ctx context.Context, s session, table string, x, y int64, claus
 // GetChunk reads chunk (cx, cy) of table ("" is the default table), decoded
 // with the client's cached schema ([DecodeChunk]): the named columns, or every
 // column. A never-written chunk returns nil, nil. A written chunk with no
-// present blocks keeps its empty form and version until collection removes it.
+// present blocks keeps its empty form and version until its stored and cached state are removed.
 func (c *Client) GetChunk(ctx context.Context, table string, cx, cy int64, columns ...string) (*Chunk, error) {
 	return getChunk(ctx, c, table, cx, cy, columns)
 }
