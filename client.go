@@ -645,6 +645,7 @@ type conn struct {
 	queue   []*pending
 	failed  bool
 	termErr error
+	watch   *Watch
 
 	// info is the HELLO reply; set before the connection is published.
 	info *ServerInfo
@@ -703,6 +704,26 @@ func (cn *conn) readLoop() {
 			return
 		}
 
+		cn.mu.Lock()
+		watch := cn.watch
+		cn.mu.Unlock()
+		if watch == nil && reply.Kind == ReplyPush {
+			_ = cn.shutdown(protocolErrorf("", "push outside a watch"))
+			return
+		}
+		if watch != nil && (reply.Kind == ReplyPush || reply.Kind == ReplyError) {
+			if reply.Kind == ReplyError {
+				_ = cn.shutdown(replyError(PhaseResponse, "WATCH", reply))
+				return
+			}
+			select {
+			case watch.pushes <- reply:
+			case <-watch.closing:
+			case <-watch.done:
+				return
+			}
+			continue
+		}
 		waiter := cn.popPending()
 		if waiter == nil {
 			_ = cn.shutdown(protocolErrorf("", "unsolicited response from server"))
@@ -766,6 +787,9 @@ func (cn *conn) shutdown(cause error) error {
 	err := cn.termErr
 	queued := cn.queue
 	cn.queue = nil
+	if cn.watch != nil {
+		close(cn.watch.done)
+	}
 	cn.mu.Unlock()
 
 	closeErr := cn.netConn.Close()

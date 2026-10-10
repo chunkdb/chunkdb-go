@@ -61,6 +61,44 @@ Every method names its table; `""` is the default table: `Options.Table`, else t
 
 A value that does not fit its column (out of range, too long, wrong type) fails with `ErrProtocol` before anything is sent. Values always travel as parameters, so text and bytes may hold any byte, CR and LF included.
 
+## Watching changes
+
+`Client.Watch` and `Pool.Watch` open a dedicated connection with the same login and TLS options. Ordinary requests remain available, including with a pool of one connection. Close each watch separately; closing its originating client or pool does not close the stream. WATCH needs server support for change feeds and READ on the table.
+
+```go
+watch, err := client.Watch(ctx, "world", chunkdb.WatchOptions{
+    Area: &chunkdb.Area{CX0: 0, CY0: 0, CX1: 3, CY1: 3},
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer watch.Close()
+last := watch.Start()
+for {
+    event, err := watch.Next(ctx)
+    if err != nil {
+        log.Printf("watch ended after %v: %v", last, err)
+        break
+    }
+    switch e := event.(type) {
+    case *chunkdb.ChangeEvent:
+        fmt.Println(e.User, e.Blocks) // complete Before/After records, nil for absence
+    case *chunkdb.SchemaEvent:
+        fmt.Println(e.Version, e.Columns)
+    case *chunkdb.ResyncEvent:
+        // Re-read state on client before applying subsequent changes.
+        fmt.Println("rebuild state through", e.Position)
+    }
+    last = event.GetPosition() // persist only after handling the event
+}
+```
+
+AREA bounds are inclusive **chunk** coordinates. Block axes are `int64`, or `ChunkOffset{Chunk, Offset}` when the absolute address does not fit int64. Row values have the same types as `GetBlock`; NULL fields are nil, and an absent Before or After is a nil record. User is a `*string`, nil for anonymous writes. Revisions order events; timestamps may move backwards.
+
+After a lost connection, open another watch with `WatchOptions{After: &last}`, where `last` is the last successfully applied position. There is no automatic reconnect or replay of user work. On `ResyncEvent`, keep reading while another connection re-reads state with `Describe`, `ScanChunks`/`GetChunk` or `GetArea`; replace the scanned state, including disappeared chunks, and apply later changes to a chunk only above its read version. Persist the resync frontier with the rebuilt state. See the server's [resync guide](https://github.com/chunkdb/chunkdb/blob/feat/change-feed/docs/CHANGE_FEED.md#resynchronizing).
+
+The stream caches columns by schema version and updates them on schema events. An uncached version triggers DESCRIBE on another short-lived connection; schema lookups release their connections before WATCH setup and after each lookup. If that version is no longer available, Next ends with `ErrProtocol` rather than decoding old rows with new columns; rebuild state and resume. Cancelling Next while waiting leaves the watch open; a failure during schema lookup or decoding ends it. `Close` sends UNWATCH, drains queued pushes through its reply, and closes the dedicated connections. The command timeout bounds closing (five seconds if disabled); idle Next calls use only their context.
+
 ## API
 
 - blocks: `GetBlock(ctx, table, x, y, columns...)`, `SetBlock(ctx, table, x, y, Record, opts...)`, `DeleteBlock(ctx, table, x, y, opts...)`; writes return the chunk's new version
