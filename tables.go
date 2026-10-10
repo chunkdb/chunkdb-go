@@ -109,11 +109,14 @@ func optionAssignments(options TableOptions) []string {
 	number("wal_group_commit_updates", options.WalGroupCommitUpdates)
 	text("checkpoint_compression", options.CheckpointCompression)
 	number("var_max_chunk_bytes", options.VarMaxChunkBytes)
+	number("feed_buffer_bytes", options.FeedBufferBytes)
+	number("slot_max_bytes", options.SlotMaxBytes)
 	return out
 }
 
 // AddColumn adds a column to table ("" is the default table). A REQUIRED
-// column needs a default. Chunks written before take its default, or NULL.
+// column needs a default when the table has present blocks. Chunks written
+// before take its default, or NULL.
 func (c *Client) AddColumn(ctx context.Context, table string, column ColumnDef) error {
 	const command = "ALTER TABLE"
 	name, err := c.tableName(command, table)

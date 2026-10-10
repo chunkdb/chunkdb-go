@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"math"
@@ -343,7 +344,18 @@ func TestIntegrationServerInfo(t *testing.T) {
 	if client.DefaultTable() != "default" {
 		t.Fatalf("got default table %q", client.DefaultTable())
 	}
-	// The server's default table has one bits column.
+	// A connection's fallback table name does not create a table.
+	tables, err := client.Tables(t.Context())
+	if err != nil || len(tables) != 0 {
+		t.Fatalf("fresh Tables: %v, %v", tables, err)
+	}
+	if _, err := client.Describe(t.Context(), ""); !isServerCode(err, CodeNoTable) {
+		t.Fatalf("fresh Describe: %v, want NO_TABLE", err)
+	}
+	createTable(t, client, "default", TableSpec{
+		Columns:    []ColumnDef{{Name: "bits", Type: TypeBits(16)}},
+		ChunkWidth: 16, ChunkHeight: 16,
+	})
 	schema, err := client.Describe(t.Context(), "")
 	if err != nil || schema.Table != "default" || len(schema.Columns) == 0 || schema.Columns[0].ID == 0 {
 		t.Fatalf("Describe: %+v, %v", schema, err)
@@ -413,6 +425,50 @@ func TestIntegrationTypedBlocks(t *testing.T) {
 	}
 }
 
+func TestIntegrationChunkNull(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+	for _, columns := range [][]string{nil, {"id"}} {
+		chunk, err := client.GetChunk(ctx, "", 0, 0, columns...)
+		if err != nil || chunk != nil {
+			t.Fatalf("never-written chunk: %+v, %v", chunk, err)
+		}
+		if raw, err := client.GetChunkRaw(ctx, "", 0, 0, columns...); err != nil || raw != nil {
+			t.Fatalf("never-written raw chunk: %v, %v", raw, err)
+		}
+	}
+	checkUnpopulated := func() {
+		t.Helper()
+		area, err := client.GetArea(ctx, "", 0, 0, 0, 0)
+		if err != nil || len(area) != 0 {
+			t.Fatalf("empty area: %+v, %v", area, err)
+		}
+		page, err := client.ScanChunks(ctx, "", nil, 0)
+		if err != nil || len(page.Chunks) != 0 || page.More {
+			t.Fatalf("empty scan: %+v, %v", page, err)
+		}
+	}
+	checkUnpopulated()
+	if _, err := client.SetBlock(ctx, "", 0, 0, Record{"id": 1}); err != nil {
+		t.Fatal(err)
+	}
+	version, err := client.DeleteBlock(ctx, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := client.GetChunk(ctx, "", 0, 0)
+	if err != nil || chunk == nil || chunk.Version != version || slices.Contains(chunk.Present, true) {
+		t.Fatalf("written empty chunk: %+v, %v", chunk, err)
+	}
+	raw, err := client.GetChunkRaw(ctx, "", 0, 0, "id")
+	if err != nil || len(raw) < 16 || binary.LittleEndian.Uint64(raw) != version {
+		t.Fatalf("written empty raw chunk: %v, %v", raw, err)
+	}
+	checkUnpopulated()
+}
+
 func TestIntegrationIfVersion(t *testing.T) {
 	server := startServer(t, serverConfig{})
 	client := connectIntegration(t, server, nil)
@@ -462,17 +518,25 @@ func TestIntegrationIfVersion(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Current != written {
 		t.Fatalf("got %v, want a mismatch at version %d", err, written)
 	}
-	// An absent chunk has a version too, so a write can create it only while
-	// it is still absent.
+	// NULL has no version; create a fresh form with an ordinary write.
 	empty, err := client.GetChunk(ctx, "things", 7, 7)
-	if err != nil || slices.Contains(empty.Present, true) {
-		t.Fatalf("GetChunk of an absent chunk: %+v, %v", empty, err)
+	if err != nil || empty != nil {
+		t.Fatalf("never-written chunk: %+v, %v", empty, err)
 	}
+	if raw, err := client.GetChunkRaw(ctx, "things", 7, 7); err != nil || raw != nil {
+		t.Fatalf("never-written raw chunk: %v, %v", raw, err)
+	}
+	schema, err := client.Schema(ctx, "things")
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty = NewChunk(schema)
 	empty.SetBlock(0, 0, Record{"id": 1})
-	if _, err := client.SetChunk(ctx, "things", 7, 7, empty, IfVersion(empty.Version)); err != nil {
+	created, err := client.SetChunk(ctx, "things", 7, 7, empty)
+	if err != nil {
 		t.Fatalf("SetChunk creating a chunk: %v", err)
 	}
-	if _, err := client.SetChunk(ctx, "things", 7, 7, empty, IfVersion(empty.Version)); !errors.Is(err, ErrVersionMismatch) {
+	if _, err := client.SetChunk(ctx, "things", 7, 7, empty, IfVersion(created+1)); !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("got %v, want a mismatch", err)
 	}
 }
@@ -643,14 +707,14 @@ func TestIntegrationTables(t *testing.T) {
 
 	spec := typesSpec
 	spec.LargeWidth, spec.LargeHeight = 2, 2
-	spec.Options = TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096}
+	spec.Options = TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096, FeedBufferBytes: 2 << 20, SlotMaxBytes: 4 << 20}
 	createTable(t, client, "land", spec)
 	if err := client.CreateTable(ctx, "land", spec); !isServerCode(err, CodeTableExists) {
 		t.Fatalf("got %v, want TABLE_EXISTS", err)
 	}
 
 	tables, err := client.Tables(ctx)
-	if err != nil || !slices.Contains(tables, "land") || !slices.Contains(tables, "default") {
+	if err != nil || !slices.Equal(tables, []string{"land"}) {
 		t.Fatalf("Tables: %v, %v", tables, err)
 	}
 
@@ -660,7 +724,8 @@ func TestIntegrationTables(t *testing.T) {
 	}
 	if schema.Table != "land" || schema.Version != 1 || len(schema.Columns) != len(spec.Columns) ||
 		schema.ChunkWidth != 4 || schema.ChunkHeight != 4 || schema.LargeWidth != 2 || schema.LargeHeight != 2 ||
-		schema.Options.DurabilityMode != "fsync-wal" || schema.Options.VarMaxChunkBytes != 4096 {
+		schema.Options.DurabilityMode != "fsync-wal" || schema.Options.VarMaxChunkBytes != 4096 ||
+		schema.Options.FeedBufferBytes != 2<<20 || schema.Options.SlotMaxBytes != 4<<20 {
 		t.Fatalf("got %+v", schema)
 	}
 	for i, column := range schema.Columns {
@@ -679,6 +744,12 @@ func TestIntegrationTables(t *testing.T) {
 	if err := client.SetTableOption(ctx, "land", "durability_mode", "relaxed"); err != nil {
 		t.Fatalf("SetTableOption: %v", err)
 	}
+	if err := client.SetTableOption(ctx, "land", "feed_buffer_bytes", 3<<20); err != nil {
+		t.Fatalf("Set feed limit: %v", err)
+	}
+	if err := client.SetTableOption(ctx, "land", "slot_max_bytes", 5<<20); err != nil {
+		t.Fatalf("Set slot limit: %v", err)
+	}
 	if err := client.SetTableOption(ctx, "land", "checkpoint_updates", 64); err != nil {
 		t.Fatalf("SetTableOption: %v", err)
 	}
@@ -686,7 +757,8 @@ func TestIntegrationTables(t *testing.T) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
 	schema, err = client.Schema(ctx, "land")
-	if err != nil || schema.Options.DurabilityMode != "relaxed" || schema.Options.CheckpointUpdates != 64 {
+	if err != nil || schema.Options.DurabilityMode != "relaxed" || schema.Options.CheckpointUpdates != 64 ||
+		schema.Options.FeedBufferBytes != 3<<20 || schema.Options.SlotMaxBytes != 5<<20 {
 		t.Fatalf("got options %+v, %v", schema.Options, err)
 	}
 

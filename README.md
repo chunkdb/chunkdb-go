@@ -19,6 +19,7 @@ CHUNKDB_URI='chunk://admin:your-password@127.0.0.1:4242/' go run ./examples/worl
 
 Use your administrator login and URI-escape special characters in the password.
 For a local server started with `--auth none`, use `chunk://127.0.0.1:4242/`.
+A fresh server starts with no tables; create a named table before data operations.
 The [example](examples/world/main.go) creates `world_go`, writes sixteen typed blocks in four chunks, reads the area, then subscribes before updating one block:
 
 ```text
@@ -30,6 +31,8 @@ change (0,0): tile=2 label=water
 
 Run it again: the named schema step is `skipped`, and the data is written again.
 Creating its table requires ADMIN on `*`; reading and writing require READ and WRITE on `world_go`.
+
+`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk; a written empty chunk retains its versioned form until its disk artifacts and cached state are removed.
 
 ## Use the client
 

@@ -31,7 +31,7 @@ chunk.SetBlock(0, 0, chunkdb.Record{"tile": 5, "label": "lake"})
 if _, err := client.SetChunk(ctx, "world_go", 2, 0, chunk); err != nil { return err }
 read, err := client.GetChunk(ctx, "world_go", 2, 0)
 if err != nil { return err }
-fmt.Println(read.Block(0, 0)["label"])
+if read != nil { fmt.Println(read.Block(0, 0)["label"]) }
 area, err := client.GetArea(ctx, "world_go", 0, 0, 2, 1)
 if err != nil { return err }
 fmt.Println("chunks:", len(area))
@@ -40,6 +40,8 @@ for coord, err := range client.AllChunks(ctx, "world_go", 0) {
     fmt.Println(coord.CX, coord.CY)
 }
 ```
+
+`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk. Build a fresh form with `NewChunk(schema)` and perform an ordinary first write; NULL supplies no version for `IfVersion`. A written chunk with all blocks deleted retains its empty form and version until its disk artifacts and cached state are removed.
 
 `SetChunk` replaces the entire chunk; `Chunk.Present` distinguishes absent blocks.
 `Schema.Locate(x, y)` maps absolute blocks to chunk and local coordinates, including negative addresses.
@@ -63,6 +65,7 @@ if err := client.DropTable(ctx, "scratch"); err != nil { return err }
 
 `Tables` lists tables, `Describe` refreshes a schema and `Schema` uses the client's cache.
 Chunk and large-chunk geometry is fixed at creation.
+`TableSpec.Options.FeedBufferBytes` and `SlotMaxBytes` set positive per-table byte budgets for the in-memory feed and durable-slot retention. Omitted (zero) fields use the server's configured defaults: normally 64 MiB and 1 GiB. `Describe` reports the effective values in `Schema.Options`; `SetTableOption` changes them using `"feed_buffer_bytes"` or `"slot_max_bytes"`.
 `RenameColumn`, `DropColumn`, `AlterColumnType` and `SetTableOption` change schema or runtime options; the server validates each operation.
 A narrowing conversion uses `ConvertNone`, `ConvertClamp`, `ConvertDefault` or `ConvertTruncate` as appropriate to the type.
 The client invalidates schema caches after its own table statements, including those inside `Migrate`, and refreshes when a typed write detects stale schema.

@@ -332,6 +332,8 @@ func describeReply(table string, version int64, columns []string) string {
 			"wal_group_commit_updates", respInt(8),
 			"checkpoint_compression", respBulk("none"),
 			"var_max_chunk_bytes", respInt(1<<20),
+			"feed_buffer_bytes", respInt(64<<20),
+			"slot_max_bytes", respInt(1<<30),
 		),
 	)
 }
