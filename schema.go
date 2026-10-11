@@ -25,6 +25,13 @@ type Column struct {
 // Schema is a table as DESCRIBE reports it.
 type Schema struct {
 	Table string
+	// Epoch identifies the table lifetime; Revision is its completed commit frontier.
+	Epoch    string
+	Revision uint64
+	// Dims is the number of coordinate axes.
+	Dims int
+	// ChunkColumns describe rows attached to chunks.
+	ChunkColumns []Column
 	// Version is the schema version; every column change raises it.
 	Version uint64
 	// Columns are in schema order.
@@ -75,12 +82,21 @@ func (s *Schema) clone() *Schema {
 		return nil
 	}
 	out := *s
+	out.ChunkColumns = cloneColumns(s.ChunkColumns)
 	out.Columns = make([]Column, len(s.Columns))
 	for i, column := range s.Columns {
 		column.Default = cloneValue(column.Default)
 		out.Columns[i] = column
 	}
 	return &out
+}
+
+func cloneColumns(columns []Column) []Column {
+	out := slices.Clone(columns)
+	for i := range out {
+		out[i].Default = cloneValue(out[i].Default)
+	}
+	return out
 }
 
 func cloneValue(v any) any {
@@ -102,7 +118,7 @@ func parseSchema(reply Reply) (*Schema, error) {
 	if reply.Kind != ReplyMap {
 		return bad("not a map")
 	}
-	schema := &Schema{}
+	schema := &Schema{Dims: 2}
 
 	table, ok := reply.Lookup("table")
 	if !ok || table.Kind != ReplyBulk {
@@ -114,6 +130,42 @@ func parseSchema(reply Reply) (*Schema, error) {
 		return bad("version")
 	}
 
+	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns"} {
+		value, exists := reply.Lookup(key)
+		if !exists {
+			continue
+		}
+		switch key {
+		case "epoch":
+			if value.Kind != ReplyBulk || !validEpoch(string(value.Bulk)) {
+				return bad(key)
+			}
+			schema.Epoch = string(value.Bulk)
+		case "revision":
+			n, valid := value.Uint64()
+			if !valid {
+				return bad(key)
+			}
+			schema.Revision = n
+		case "dims":
+			n, valid := value.Int64()
+			if !valid || (n != 2 && n != 3) {
+				return bad(key)
+			}
+			schema.Dims = int(n)
+		case "chunk_columns":
+			if value.Kind != ReplyArray {
+				return bad(key)
+			}
+			for _, entry := range value.Array {
+				column, err := parseColumn(entry)
+				if err != nil {
+					return nil, err
+				}
+				schema.ChunkColumns = append(schema.ChunkColumns, column)
+			}
+		}
+	}
 	columns, ok := reply.Lookup("columns")
 	if !ok || columns.Kind != ReplyArray || len(columns.Array) == 0 {
 		return bad("columns")
@@ -143,8 +195,18 @@ func parseSchema(reply Reply) (*Schema, error) {
 			return bad("option name")
 		}
 		value := entry.Value
-		number, _ := value.Uint64()
+		number, validNumber := value.Uint64()
 		text := string(value.Bulk)
+		switch string(entry.Key.Bulk) {
+		case "durability_mode", "checkpoint_compression":
+			if value.Kind != ReplyBulk {
+				return bad("option value")
+			}
+		case "checkpoint_updates", "checkpoint_wal_bytes", "wal_group_commit_updates", "var_max_chunk_bytes", "feed_buffer_bytes", "slot_max_bytes":
+			if !validNumber {
+				return bad("option value")
+			}
+		}
 		switch string(entry.Key.Bulk) {
 		case "durability_mode":
 			schema.Options.DurabilityMode = text
@@ -187,7 +249,7 @@ func parseColumn(item Reply) (Column, error) {
 	}
 	column.Name = string(name.Bulk)
 	typeName, ok := item.Lookup("type")
-	if !ok || typeName.Kind != ReplyBulk {
+	if !ok || typeName.Kind != ReplyBulk || len(typeName.Bulk) == 0 {
 		return bad("type")
 	}
 	t, err := ParseColumnType(string(typeName.Bulk))

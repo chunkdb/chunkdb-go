@@ -142,3 +142,346 @@ func TestFoundationUnknownColumnAndExtendedRows(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func foundationHelloReply() string {
+	return respMap("protocol", respInt(3), "server_version", respBulk("test"),
+		"max_line_bytes", respInt(65536), "max_parameters", respInt(65535),
+		"max_area_chunks", respInt(256), "max_response_bytes", respInt(64<<20), "max_scan_limit", respInt(1024), "server_signature", respNull,
+		"connection_id", "(18446744073709551615\r\n", "features", respArray(respBulk("protocol_foundation"), respBulk("read_metadata")),
+		"options", respMap("client_name", respBulk("worker"), "future", respArray(respBulk("opaque"))),
+		"not_applied", respMap("statement_timeout_ms", respMap("reason", respBulk("implementation_pending"), "extra", respInt(1)), "default_tag", respMap("reason", respBulk("implementation_pending")), "future", respMap("reason", respBulk("unknown_option"))),
+		"idle_timeout_ms", respInt(60000), "limits", respMap("max_area_chunks", respInt(256), "max_area_response_bytes", respInt(67108864), "txn_max_written_chunks", respInt(64), "txn_max_read_chunks", respInt(1024), "max_watches", respInt(64), "max_returning_rows", respInt(65536), "max_expression_nodes", respInt(256), "future", respNull))
+}
+
+func TestFoundationHelloOptions(t *testing.T) {
+	tag := []byte{0, 255}
+	opts := Options{SessionOptions: map[string]any{"CLIENT_NAME": "worker", "statement_timeout_ms": uint64(math.MaxUint64), "default_tag": tag, "future": true}}
+	server := newFakeServer(t, func(s *fakeServer, conn net.Conn, statement string) {
+		if statement != "HELLO 3 WITH client_name = $1, default_tag = $2, future = TRUE, statement_timeout_ms = 18446744073709551615" {
+			t.Errorf("unexpected HELLO: %s", statement)
+		}
+		params := s.paramsOf(conn)
+		if len(params) != 2 || string(params[0]) != "worker" || string(params[1]) != string([]byte{0, 255}) {
+			t.Errorf("params: %v", params)
+		}
+		writeRaw(conn, foundationHelloReply())
+	})
+	opts.URI = server.uri("")
+	c, err := NewClient(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	tag[0] = 9
+	opts.SessionOptions["CLIENT_NAME"] = "changed"
+	if err := c.Connect(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	info := c.ServerInfo()
+	if info.ConnectionID != math.MaxUint64 || !info.Supports("read_metadata") || info.Supports("returning") || info.NotApplied["default_tag"] != "implementation_pending" || info.Limits.MaxExpressionNodes != 256 {
+		t.Fatal(info)
+	}
+	info.Features[0] = "changed"
+	info.Options["future"].Array[0].Bulk[0] = 'x'
+	info.NotApplied["default_tag"] = "changed"
+	again := c.ServerInfo()
+	if !again.Supports("protocol_foundation") || string(again.Options["future"].Array[0].Bulk) != "opaque" || again.NotApplied["default_tag"] != "implementation_pending" {
+		t.Fatal("ServerInfo aliases internal state")
+	}
+	normalized, err := sessionOptions(map[string]any{"default_tag": []byte(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, params := helloOptions("HELLO 3 USER bot $1", [][]byte{[]byte("auth")}, normalized)
+	if len(params) != 2 || params[1] == nil || len(params[1]) != 0 {
+		t.Fatal("empty tag became NULL", params)
+	}
+	for _, invalid := range []map[string]any{{"CLIENT_NAME": "a", "client_name": "b"}, {"client_name": []byte("a")}, {"statement_timeout_ms": -1}, {"default_tag": make([]byte, 257)}, {"future": 1.5}} {
+		if _, err := NewClient(Options{SessionOptions: invalid}); !errors.Is(err, ErrProtocol) {
+			t.Fatal(invalid, err)
+		}
+	}
+}
+
+func TestFoundationHelloKnownFieldValidation(t *testing.T) {
+	for _, key := range []string{"connection_id", "features", "options", "not_applied", "idle_timeout_ms", "limits"} {
+		r := readOne(t, foundationHelloReply())
+		for i := range r.Map {
+			if string(r.Map[i].Key.Bulk) == key {
+				r.Map[i].Value = Reply{Kind: ReplyNull}
+			}
+		}
+		if _, err := parseServerInfo(r); !errors.Is(err, ErrProtocol) {
+			t.Fatal(key, err)
+		}
+	}
+	r := readOne(t, foundationHelloReply())
+	for i := range r.Map {
+		if string(r.Map[i].Key.Bulk) == "connection_id" {
+			r.Map[i].Value = Reply{Kind: ReplyInteger}
+		}
+	}
+	if _, err := parseServerInfo(r); !errors.Is(err, ErrProtocol) {
+		t.Fatal(err)
+	}
+}
+
+func TestFoundationReadMetadata(t *testing.T) {
+	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, statement string) {
+		switch {
+		case strings.HasPrefix(statement, "DESCRIBE"):
+			writeRaw(conn, describeReply("world", 1, []string{fakeColumn(1, "id", "u8", false, false, respInt(0))}))
+		case strings.HasPrefix(statement, "GET BLOCK"):
+			row := respArray(respInt(7), respMap("future", respNull))
+			if strings.Contains(statement, "GET BLOCK 1 ") {
+				row = respNull
+			}
+			v := "(18446744073709551615\r\n"
+			if strings.Contains(statement, "GET BLOCK 2 ") {
+				v = respNull
+			}
+			version, schema := strings.Contains(statement, "WITH VERSION"), strings.Contains(statement, "WITH SCHEMA")
+			switch {
+			case version && schema:
+				writeRaw(conn, respArray(v, respInt(1), row, respNull))
+			case version:
+				writeRaw(conn, respArray(v, row, respNull))
+			case schema:
+				writeRaw(conn, respArray(respInt(1), row, respNull))
+			default:
+				writeRaw(conn, row)
+			}
+		case strings.HasPrefix(statement, "GET AREA"):
+			writeRaw(conn, respArray(respInt(1), respArray(), respMap("future", respNull)))
+		}
+	}))
+	c := newTestClient(t, server, nil)
+	for _, opts := range []ReadOptions{{}, {WithVersion: true}, {WithSchema: true}, {WithVersion: true, WithSchema: true}} {
+		for x := int64(0); x < 3; x++ {
+			got, err := c.GetBlockWithOptions(t.Context(), "world", x, 0, opts)
+			if err != nil {
+				t.Fatal(opts, x, err)
+			}
+			if x == 1 {
+				if got.Record != nil {
+					t.Fatal(got)
+				}
+			} else if got.Record["id"] != uint64(7) {
+				t.Fatal(got)
+			}
+			if opts.WithVersion && x != 2 {
+				if got.Version == nil || *got.Version != math.MaxUint64 {
+					t.Fatal(got)
+				}
+			} else if got.Version != nil {
+				t.Fatal(got)
+			}
+			if opts.WithSchema && got.SchemaVersion != 1 {
+				t.Fatal(got)
+			}
+		}
+	}
+	area, err := c.GetAreaWithSchema(t.Context(), "world", 0, 0, 1, 1)
+	if err != nil || area.SchemaVersion != 1 || area.Chunks == nil || len(area.Chunks) != 0 {
+		t.Fatal(area, err)
+	}
+	for _, wire := range []string{respNull, respArray(respNull), respArray(respBulk("x"), respInt(1), respNull), respArray(respInt(1), respBulk("x"), respNull)} {
+		if _, _, err := parseBlockEnvelope(readOne(t, wire), ReadOptions{true, true}); !errors.Is(err, ErrProtocol) {
+			t.Fatal(wire, err)
+		}
+	}
+}
+
+func TestFoundationDescribeMetadata(t *testing.T) {
+	r := readOne(t, describeReply("world", 1, []string{fakeColumn(1, "id", "u8", false, false, respInt(0))}))
+	r.Map = append(r.Map, MapEntry{readOne(t, respBulk("epoch")), readOne(t, respBulk(watchEpoch))}, MapEntry{readOne(t, respBulk("revision")), readOne(t, "(18446744073709551615\r\n")}, MapEntry{readOne(t, respBulk("dims")), readOne(t, respInt(2))}, MapEntry{readOne(t, respBulk("chunk_columns")), readOne(t, respArray(fakeColumn(2, "meta", "future", false, false, respBulk("value"))))})
+	schema, err := parseSchema(r)
+	if err != nil || schema.Epoch != watchEpoch || schema.Revision != math.MaxUint64 || schema.Dims != 2 || string(schema.ChunkColumns[0].Default.([]byte)) != "value" {
+		t.Fatal(schema, err)
+	}
+	clone := schema.clone()
+	clone.ChunkColumns[0].Default.([]byte)[0] = 'x'
+	if string(schema.ChunkColumns[0].Default.([]byte)) != "value" {
+		t.Fatal("chunk default aliases schema")
+	}
+	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns"} {
+		bad := cloneReply(r)
+		for i := range bad.Map {
+			if string(bad.Map[i].Key.Bulk) == key {
+				bad.Map[i].Value = Reply{Kind: ReplyNull}
+			}
+		}
+		if _, err := parseSchema(bad); !errors.Is(err, ErrProtocol) {
+			t.Fatal(key, err)
+		}
+	}
+}
+
+func foundationSchemaPush(dims int64) string {
+	return push(respBulk("schema"), respMap("epoch", respBulk(watchEpoch), "revision", respInt(11), "schema_version", respInt(2), "dims", respInt(dims), "columns", respArray(fakeColumn(1, "id", "u8", false, false, respInt(0)), fakeColumn(2, "future", "new_type", false, false, respBulk("raw"))), "chunk_columns", respArray(fakeColumn(3, "meta", "bool", false, false, respBool(false))), "extra", respArray()), respNull)
+}
+
+func TestFoundationFeedPrefixes(t *testing.T) {
+	for _, dims := range []int64{2, 3} {
+		w := &Watch{schemas: make(map[uint64][]Column)}
+		schemaEvent, err := w.decode(t.Context(), readOne(t, foundationSchemaPush(dims)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		se := schemaEvent.(*SchemaEvent)
+		se.Columns[0].Name = "changed"
+		se.ChunkColumns[0].Name = "changed"
+		axes := []string{respInt(-1), respArray(respInt(math.MaxInt64), respInt(3), respNull)}
+		chunkAxes := []string{respInt(-2), respInt(4)}
+		if dims == 3 {
+			axes = append(axes, respInt(5))
+			chunkAxes = append(chunkAxes, respInt(6))
+		}
+		block := append(append([]string{}, axes...), respNull, respArray(respInt(9), respBulk("new"), respNull), respNull)
+		chunk := append(append([]string{}, chunkAxes...), respNull, respArray(respBool(true), respNull), respNull)
+		a := []string{respBulk("change"), respBulk(watchEpoch), respInt(12), respInt(123), respNull, respInt(2), respArray(respArray(block...)), respBulk(""), "(18446744073709551615\r\n", respArray(respArray(chunk...)), respNull}
+		event, err := w.decode(t.Context(), readOne(t, push(a...)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := event.(*ChangeEvent)
+		if e.Tag == nil || len(e.Tag) != 0 || e.Txn == nil || *e.Txn != math.MaxUint64 || e.Blocks[0].After["id"] != uint64(9) || string(e.Blocks[0].After["future"].([]byte)) != "new" || e.ChunkChanges[0].After["meta"] != true {
+			t.Fatal(e)
+		}
+		if dims == 3 && (e.Blocks[0].Z != int64(5) || e.ChunkChanges[0].CZ == nil || *e.ChunkChanges[0].CZ != 6) {
+			t.Fatal(e)
+		}
+		frame := append(append([]string{}, chunkAxes...), "(18446744073709551615\r\n", respBulk("rawform"), respNull)
+		chunks, err := w.decode(t.Context(), readOne(t, push(respBulk("chunks"), respBulk(watchEpoch), respInt(13), respInt(124), respBulk("writer"), respInt(2), respArray(respArray(frame...)), respNull, respNull, respNull)))
+		if err != nil || string(chunks.(*ChunksEvent).Chunks[0].Form) != "rawform" || chunks.(*ChunksEvent).Chunks[0].Version != math.MaxUint64 {
+			t.Fatal(chunks, err)
+		}
+		for index, wire := range map[int]string{3: respBulk("bad"), 4: respInt(1), 5: respNull, 6: respNull, 7: respInt(1), 8: respBulk("id"), 9: respNull} {
+			invalid := append([]string{}, a...)
+			invalid[index] = wire
+			if _, err := w.decode(t.Context(), readOne(t, push(invalid...))); !errors.Is(err, ErrProtocol) {
+				t.Fatal(index, err)
+			}
+		}
+	}
+	w := &Watch{schemas: make(map[uint64][]Column)}
+	catalog, err := w.decode(t.Context(), readOne(t, push(respBulk("catalog"), respBulk(watchEpoch), respInt(14), respInt(125), respNull, respArray(respMap("kind", respBulk("table"), "action", respBulk("create"), "name", respBulk("world"), "table", respNull, "data", respMap("future", respNull), "extra", respNull)), "(18446744073709551615\r\n", respNull)))
+	if err != nil || *catalog.(*CatalogEvent).Txn != math.MaxUint64 {
+		t.Fatal(catalog, err)
+	}
+	for _, wire := range []string{respInt(-1), "(18446744073709551616\r\n", respBulk("1")} {
+		if _, err := nullableUint64(readOne(t, wire)); !errors.Is(err, ErrProtocol) {
+			t.Fatal(wire, err)
+		}
+	}
+	resync, err := w.decode(t.Context(), readOne(t, push(respBulk("resync"), respBulk(watchEpoch), respInt(15), respBulk(watchEpoch), "(18446744073709551615\r\n", respNull)))
+	if err != nil || *resync.(*ResyncEvent).ForkRevision != math.MaxUint64 {
+		t.Fatal(resync, err)
+	}
+}
+
+func TestFoundationProgressDeliveryAckAndFilters(t *testing.T) {
+	acked := make(chan string, 4)
+	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, statement string) {
+		switch verbOf(statement) {
+		case "HELLO":
+			writeRaw(conn, foundationHelloReply())
+		case "DESCRIBE":
+			writeRaw(conn, describeReply("world", 1, []string{fakeColumn(1, "id", "u8", false, false, respInt(0))}))
+		case "CREATE":
+			if statement != "CREATE SLOT IF NOT EXISTS 'consumer' ON world AREA -1 -2 TO 3 4 COLUMNS (id) NO BEFORE CHUNKS" {
+				t.Errorf("slot: %s", statement)
+			}
+			writeSimple(conn, "OK")
+		case "WATCH":
+			if statement != "WATCH world SLOT 'consumer' COLUMNS (id) NO BEFORE CHUNKS TAKEOVER ACK TIMEOUT 1000" {
+				t.Errorf("watch: %s", statement)
+			}
+			writeRaw(conn, respMap("epoch", respBulk(watchEpoch), "revision", respInt(10), "extra", respNull)+push(respBulk("future"), respArray("(18446744073709551616\r\n"))+foundationSchemaPush(2)+push(respBulk("progress"), respBulk(watchEpoch), respInt(12), respNull)+push(respBulk("resync"), respBulk(watchEpoch), respInt(13), respNull, respNull, respNull))
+		case "ACK":
+			acked <- statement
+		case "UNWATCH":
+			writeSimple(conn, "OK")
+		}
+	})
+	c := newTestClient(t, server, nil)
+	if err := c.CreateSlotWithOptions(t.Context(), "world", "consumer", SlotOptions{Area: &Area{-1, -2, 3, 4}, Columns: []string{"id"}, NoBefore: true, Chunks: true, IfNotExists: true}); err != nil {
+		t.Fatal(err)
+	}
+	w, err := c.Watch(t.Context(), "world", WatchOptions{Slot: "consumer", Columns: []string{"id"}, NoBefore: true, Chunks: true, Takeover: true, AckTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.Ack(t.Context(), 12); !errors.Is(err, ErrProtocol) {
+		t.Fatal("undelivered progress advanced ACK", err)
+	}
+	if _, ok := nextWatch(t, w).(*SchemaEvent); !ok {
+		t.Fatal("schema")
+	}
+	if err := w.Ack(t.Context(), 11); !errors.Is(err, ErrProtocol) {
+		t.Fatal("schema advanced ACK", err)
+	}
+	if nextWatch(t, w).(*ProgressEvent).Position.Revision != 12 {
+		t.Fatal("progress")
+	}
+	if err := w.Ack(t.Context(), 12); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-acked:
+		if got != "ACK 12" {
+			t.Fatal(got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ACK did not reach server")
+	}
+	if _, ok := nextWatch(t, w).(*ResyncEvent); !ok {
+		t.Fatal("resync")
+	}
+	if err := w.Ack(t.Context(), 13); !errors.Is(err, ErrProtocol) {
+		t.Fatal("resync advanced ACK", err)
+	}
+	for _, opts := range []WatchOptions{{Takeover: true}, {AckTimeout: time.Second}, {Slot: "consumer", AckTimeout: -1}, {Slot: "consumer", AckTimeout: time.Nanosecond}, {Columns: []string{}}, {Columns: []string{"id", "id"}}} {
+		if _, err := c.Watch(t.Context(), "world", opts); !errors.Is(err, ErrProtocol) {
+			t.Fatal(opts, err)
+		}
+	}
+}
+
+func TestFoundationRejectedParametersKeepConnection(t *testing.T) {
+	server := newFakeServer(t, func(s *fakeServer, conn net.Conn, statement string) {
+		switch verbOf(statement) {
+		case "HELLO":
+			writeRaw(conn, foundationHelloReply())
+		case "PING":
+			writeSimple(conn, "PONG")
+		default:
+			if len(s.paramsOf(conn)) != 2 {
+				t.Errorf("incorrect lexical framing: %v", s.paramsOf(conn))
+			}
+			writeRaw(conn, "-ERR SYNTAX reason=parameter_refs Future-Key=retained diagnostic\r\n")
+		}
+	})
+	c := newTestClient(t, server, nil)
+	if err := c.Ping(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Do(t.Context(), "bad $1 $1", []byte("one"), []byte("two"))
+	var typed *Error
+	if !errors.As(err, &typed) || typed.ServerCode != CodeSyntax || typed.ServerKeys["Future-Key"] != "retained" {
+		t.Fatal(err)
+	}
+	if err := c.Ping(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	hellos := 0
+	for _, statement := range server.commands() {
+		if verbOf(statement) == "HELLO" {
+			hellos++
+		}
+	}
+	if hellos != 1 {
+		t.Fatal("rejection caused reconnect", server.commands())
+	}
+}

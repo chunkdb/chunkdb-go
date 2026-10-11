@@ -25,6 +25,15 @@ type WatchOptions struct {
 	Slot  string
 	Area  *Area
 	After *Position
+	// Columns selects a persisted projection; nil inherits slot filters.
+	Columns  []string
+	NoBefore bool
+	Chunks   bool
+	// Takeover revokes the current owner of Slot.
+	Takeover bool
+	// AckTimeout requires a slot and a positive whole number of milliseconds.
+	// Zero disables this watch's acknowledgement deadline.
+	AckTimeout time.Duration
 }
 
 // Coordinate is an absolute int64 block coordinate, or a ChunkOffset when
@@ -44,6 +53,7 @@ type Event interface{ GetPosition() Position }
 // Nil rows denote absence; a nil field within a row denotes NULL.
 type BlockChange struct {
 	X, Y          Coordinate
+	Z             Coordinate
 	Before, After Record
 }
 
@@ -54,21 +64,30 @@ type ChangeEvent struct {
 	User          *string
 	SchemaVersion uint64
 	Blocks        []BlockChange
+	Tag           []byte
+	Txn           *uint64
+	ChunkChanges  []ChunkChange
 }
 
 func (e *ChangeEvent) GetPosition() Position { return e.Position }
 
 // SchemaEvent supplies the columns for subsequent events of Version.
 type SchemaEvent struct {
-	Position Position
-	Version  uint64
-	Columns  []Column
+	Position     Position
+	Version      uint64
+	Columns      []Column
+	Dims         int
+	ChunkColumns []Column
 }
 
 func (e *SchemaEvent) GetPosition() Position { return e.Position }
 
 // ResyncEvent asks the consumer to re-read state on another connection.
-type ResyncEvent struct{ Position Position }
+type ResyncEvent struct {
+	Position     Position
+	ParentEpoch  *string
+	ForkRevision *uint64
+}
 
 func (e *ResyncEvent) GetPosition() Position { return e.Position }
 
@@ -84,6 +103,7 @@ type Watch struct {
 	table          string
 	start          Position
 	schemas        map[uint64][]Column
+	schemaDetails  map[uint64]*Schema
 	pushes         chan Reply
 	closing, done  chan struct{}
 	nextGate       chan struct{}
@@ -117,12 +137,24 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		}
 		statement += " SLOT '" + opts.Slot + "'"
 	}
-	if a := opts.Area; a != nil {
-		if a.CX0 > a.CX1 || a.CY0 > a.CY1 {
-			return nil, requestErrorf("WATCH", "inverted area")
-		}
-		statement += " AREA " + coord(a.CX0) + " " + coord(a.CY0) + " TO " + coord(a.CX1) + " " + coord(a.CY1)
+	filters, err := feedFilterClause("WATCH", opts.Area, opts.Columns, opts.NoBefore, opts.Chunks)
+	if err != nil {
+		return nil, err
 	}
+	statement += filters
+	if opts.Takeover {
+		if opts.Slot == "" {
+			return nil, requestErrorf("WATCH", "TAKEOVER requires a slot")
+		}
+		statement += " TAKEOVER"
+	}
+	if opts.AckTimeout != 0 {
+		if opts.Slot == "" || opts.AckTimeout < 0 || opts.AckTimeout%time.Millisecond != 0 {
+			return nil, requestErrorf("WATCH", "ACK TIMEOUT requires a slot and positive whole milliseconds")
+		}
+		statement += " ACK TIMEOUT " + strconv.FormatInt(int64(opts.AckTimeout/time.Millisecond), 10)
+	}
+
 	if p := opts.After; p != nil {
 		if !validEpoch(p.Epoch) {
 			return nil, requestErrorf("WATCH", "epoch must be 32 hex digits")
@@ -130,7 +162,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		statement += " AFTER " + p.Epoch + " " + strconv.FormatUint(p.Revision, 10)
 	}
 	dedicated := c.copyOptions()
-	w := &Watch{client: dedicated, table: name, schemas: make(map[uint64][]Column), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
+	w := &Watch{client: dedicated, table: name, schemas: make(map[uint64][]Column), schemaDetails: make(map[uint64]*Schema), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
 	w.slot = opts.Slot
 	w.controlGate = make(chan struct{}, 1)
 	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
@@ -141,6 +173,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		return nil, err
 	}
 	w.schemas[schema.Version] = schema.Columns
+	w.schemaDetails[schema.Version] = schema
 	cn, err := dedicated.connection(ctx)
 	if err != nil {
 		_ = dedicated.Close()
@@ -228,10 +261,16 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 		}
 		if err != nil {
 			_ = w.conn.shutdown(err)
-		} else if change, ok := event.(*ChangeEvent); ok {
-			w.ackMu.Lock()
-			w.delivered = change.Position
-			w.ackMu.Unlock()
+		} else {
+			switch event.(type) {
+			case *ChangeEvent, *ProgressEvent, *ChunksEvent, *CatalogEvent:
+				w.ackMu.Lock()
+				position := event.GetPosition()
+				if position.Epoch == w.delivered.Epoch && position.Revision > w.delivered.Revision {
+					w.delivered = position
+				}
+				w.ackMu.Unlock()
+			}
 		}
 		return event, err
 	case <-ctx.Done():
@@ -297,6 +336,9 @@ func validEpoch(s string) bool {
 	return err == nil
 }
 func parseWatchStart(reply Reply) (Position, error) {
+	if reply.Kind == ReplyMap {
+		return parsePositionMap(reply)
+	}
 	fields := strings.Fields(reply.Text)
 	if reply.Kind != ReplySimple || len(fields) != 3 || fields[0] != "OK" || !validEpoch(fields[1]) {
 		return Position{}, protocolErrorf("WATCH", "expected +OK epoch revision")
@@ -308,7 +350,7 @@ func parseWatchStart(reply Reply) (Position, error) {
 	return Position{Epoch: fields[1], Revision: rev}, nil
 }
 
-func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
+func (w *Watch) decodeLegacy(ctx context.Context, r Reply) (Event, error) {
 	bad := func() (Event, error) { return nil, protocolErrorf("WATCH", "malformed push") }
 	if r.Kind != ReplyPush || len(r.Array) < 3 {
 		return bad()
@@ -324,12 +366,12 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 	pos := Position{Epoch: string(a[1].Bulk), Revision: rev}
 	switch string(a[0].Bulk) {
 	case "resync":
-		if len(a) != 3 {
+		if len(a) < 3 {
 			return bad()
 		}
 		return &ResyncEvent{Position: pos}, nil
 	case "schema":
-		if len(a) != 5 || a[4].Kind != ReplyArray || len(a[4].Array) == 0 {
+		if len(a) < 5 || a[4].Kind != ReplyArray || len(a[4].Array) == 0 {
 			return bad()
 		}
 		version, ok := a[3].Uint64()
@@ -356,7 +398,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		eventColumns := (&Schema{Columns: columns}).clone().Columns
 		return &SchemaEvent{Position: pos, Version: version, Columns: eventColumns}, nil
 	case "change":
-		if len(a) != 7 || a[6].Kind != ReplyArray {
+		if len(a) < 7 || a[6].Kind != ReplyArray {
 			return bad()
 		}
 		ms, ok := a[3].Uint64()
@@ -480,7 +522,7 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 // It returns after writing the request, before persistence; success has no reply.
 // [Watch.Next] reports asynchronous rejections; INVALID_ARGUMENT leaves the stream open.
 //
-// The client rejects revisions beyond the last ChangeEvent returned by Next, or Start before the first change.
+// The client rejects revisions beyond the last change, chunks, catalog or progress event returned by Next, or Start before the first change.
 // Schema and resync events do not advance that bound.
 // The server validates decreasing revisions because writing does not confirm acceptance.
 //
@@ -510,7 +552,7 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 	valid := revision <= w.delivered.Revision
 	w.ackMu.Unlock()
 	if !valid {
-		return requestErrorf("ACK", "revision must not exceed the last returned change or start position")
+		return requestErrorf("ACK", "revision must not exceed the last returned change, chunks, catalog, progress or start position")
 	}
 	statement := "ACK " + strconv.FormatUint(revision, 10)
 	if err := checkLimits(w.conn.info, "ACK", statement, nil); err != nil {

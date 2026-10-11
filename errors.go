@@ -448,16 +448,6 @@ func parseErrorKeys(message string) (map[string]string, string) {
 		if !found || key == "" {
 			break
 		}
-		valid := true
-		for _, c := range key {
-			if c != '_' && !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') {
-				valid = false
-				break
-			}
-		}
-		if !valid {
-			break
-		}
 		if decoded, err := neturl.PathUnescape(value); err == nil {
 			value = decoded
 		}

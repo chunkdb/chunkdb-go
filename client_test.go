@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -205,7 +206,7 @@ func TestClientServerInfo(t *testing.T) {
 		MaxAreaChunks: 256, MaxResponseBytes: 64 << 20, MaxScanLimit: 1024,
 	}
 	info := client.ServerInfo()
-	if info == nil || *info != want {
+	if info == nil || !reflect.DeepEqual(*info, want) {
 		t.Fatalf("got %+v, want %+v", info, want)
 	}
 	// The result is a copy.

@@ -97,3 +97,19 @@ Zero uses server defaults, normally 64 MiB and 1 GiB; `Describe` reports effecti
 
 Use [Migrations](OPERATIONS.md) for repeatable schema setup.
 See the [package reference](https://pkg.go.dev/github.com/chunkdb/chunkdb-go/v2) for method arguments.
+
+## Read metadata
+
+`GetBlockWithMetadata` returns a BlockRead with Record, nullable Version and SchemaVersion.
+`GetBlockWithOptions` selects individual metadata fields with ReadOptions.WithVersion and WithSchema.
+An absent block in a written chunk retains its version; a never-written chunk or transaction-private modified chunk has a nil Version.
+The schema version remains available for absent rows.
+
+`GetAreaWithSchema` returns AreaRead.Chunks and SchemaVersion, including for an empty area.
+Client, Tx and Pool expose these helpers.
+Rows and requested metadata share the server's read boundary; area reads retain their existing consistency across chunks.
+DESCRIBE supplies Schema.Epoch, Revision, Dims and ChunkColumns independently of Schema.Version.
+
+Unknown column types retain their type name and decode row/default values as raw bytes.
+Known neighboring columns remain typed.
+Typed legacy chunk forms with unknown-width columns fail explicitly; use raw forms or a projection of known columns.

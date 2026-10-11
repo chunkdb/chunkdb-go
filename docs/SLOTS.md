@@ -57,9 +57,9 @@ After a crash, skip already applied revisions; an ACK alone cannot prevent dupli
 |---|---|
 | Slot names | `[a-z_][a-z0-9_]*`, at most 63 bytes. |
 | Create or drop | ADMIN on the table. |
-| Active watches | One per slot; another receives `CodeBusy`. |
+| Active watches | One per slot; another receives `CodeSlotBusy`. |
 | Retention | Table's `slot_max_bytes`; exceeded history makes the slot lost. |
-| ACK bound | Last delivered ChangeEvent or initial position. |
+| ACK bound | Last delivered change/chunks/progress event or initial position. |
 
 AFTER selects a later starting point without acknowledging it.
 Slots replay durable archived changes, including in relaxed durability mode.
@@ -68,3 +68,17 @@ A lost slot returns `CodeSlotLost`.
 Rebuild your consumer state, drop the lost slot, and create it again before resuming.
 
 See [Change feed](CHANGE_FEED.md) for events and [server recovery](https://github.com/chunkdb/chunkdb/blob/main/docs/FEED_RESUME.md) for lost slots.
+
+`CreateSlotWithOptions` persists Area, Columns, NoBefore and Chunks filters.
+Omitted watch filters inherit the slot's filters; explicitly supplied filters must match.
+Changing filters requires a different slot, and IfNotExists also checks the existing filters.
+Dropping a projected column makes the slot lost instead of broadening its projection.
+
+WatchOptions.Takeover requires a slot and revokes its previous owner with `KILLED reason=slot_takeover`.
+Taking over another user's connection additionally requires ADMIN on `*`.
+WatchOptions.AckTimeout takes positive whole milliseconds; zero disables that watch deadline.
+The deadline starts with the first unacknowledged change and is not refreshed by later changes or progress.
+
+Next must return a progress event before Ack can cover its revision.
+Schema, resync and unknown events never raise that bound.
+Takeover resumes from the persisted ACK, so unacknowledged events remain replayable.

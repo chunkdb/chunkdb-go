@@ -46,7 +46,8 @@ tile: 6
 - A revision orders committed changes within a table; timestamps can move backwards.
 - An epoch identifies the table's lifetime and changes when you drop and recreate it.
 - Save `event.GetPosition()` after applying the event; resume with `WatchOptions.After`.
-- `ResyncEvent` requires rebuilding local state; `SchemaEvent` supplies changed columns.
+- `ResyncEvent` requests rebuilding local state; ParentEpoch and ForkRevision identify available lineage.
+- `SchemaEvent` supplies Dims, Columns and ChunkColumns for its schema version.
 
 Use [Slots](SLOTS.md) to resume a durable consumer.
 
@@ -56,3 +57,13 @@ User is nil for anonymous writes; `ChunkOffset` represents coordinates outside i
 Close drains within CommandTimeout, using five seconds when that timeout is disabled.
 
 See [Change feed](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md) for resynchronization and slot recovery.
+
+ProgressEvent reports a completed position when filters omit changes.
+Persist that position before acknowledging it.
+Unknown push kinds are fully decoded and ignored without consuming an ordinary reply or advancing acknowledgements.
+Known event prefixes accept trailing extensions while validating their known fields.
+
+ChangeEvent exposes nullable Tag and Txn, plus ChunkChanges for chunk-column rows.
+ChunksEvent carries raw forms or nil deletion forms; CatalogEvent decodes the reserved catalog envelope.
+Decoding these envelopes does not advertise WATCH CATALOG or other unavailable features.
+Txn is a nullable exact uint64; empty tags remain distinct from nil tags.

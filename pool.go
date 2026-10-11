@@ -58,9 +58,11 @@ func NewPool(opts PoolOptions) (*Pool, error) {
 		return nil, requestErrorf("", "MinConnections must be <= MaxConnections")
 	}
 	// Surface malformed URIs and options now rather than on first acquire.
-	if _, err := resolveOptions(opts.Options); err != nil {
+	resolved, err := resolveOptions(opts.Options)
+	if err != nil {
 		return nil, err
 	}
+	opts.SessionOptions = resolved.sessionOptions
 
 	acquireTimeout := opts.AcquireTimeout
 	if acquireTimeout == 0 {

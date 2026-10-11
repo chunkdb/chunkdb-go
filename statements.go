@@ -297,43 +297,57 @@ func (c *Client) GetBlock(ctx context.Context, table string, x, y int64, columns
 }
 
 func getBlock(ctx context.Context, s session, table string, x, y int64, columns []string) (Record, error) {
+	result, err := getBlockWithOptions(ctx, s, table, x, y, ReadOptions{}, columns)
+	return result.Record, err
+}
+
+func getBlockWithOptions(ctx context.Context, s session, table string, x, y int64, opts ReadOptions, columns []string) (BlockRead, error) {
 	const command = "GET BLOCK"
 	name, err := s.tableName(command, table)
 	if err != nil {
-		return nil, err
+		return BlockRead{}, err
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
-		return nil, err
+		return BlockRead{}, err
 	}
-	record, err := withSchema(ctx, s, name, func(schema *Schema) (Record, error) {
+	record, err := withSchema(ctx, s, name, func(schema *Schema) (BlockRead, error) {
 		indexes, err := formColumns(schema, columns)
 		if err != nil {
-			return nil, &staleSchemaError{err: err, local: true}
+			return BlockRead{}, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := s.call(ctx, "GET BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+columnsClause(names), nil)
+		reply, err := s.call(ctx, "GET BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+columnsClause(names)+opts.clauses(), nil)
 		if err != nil {
 			if isNoColumn(err) {
-				return nil, &staleSchemaError{err: err}
+				return BlockRead{}, &staleSchemaError{err: err}
 			}
-			return nil, err
+			return BlockRead{}, err
 		}
+		result, row, err := parseBlockEnvelope(reply, opts)
+		if err != nil {
+			return BlockRead{}, err
+		}
+		if opts.WithSchema && result.SchemaVersion != schema.Version {
+			return BlockRead{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
+		}
+		reply = row
 		if reply.Kind == ReplyNull {
-			return nil, nil
+			return result, nil
 		}
 		if reply.Kind != ReplyArray || len(reply.Array) < len(indexes) {
-			return nil, &staleSchemaError{err: protocolErrorf(command, "expected %d values", len(indexes))}
+			return BlockRead{}, &staleSchemaError{err: protocolErrorf(command, "expected %d values", len(indexes))}
 		}
 		record := make(Record, len(indexes))
 		for i, index := range indexes {
 			column := schema.Columns[index]
 			value, err := decodeValue(column.Type, reply.Array[i])
 			if err != nil {
-				return nil, &staleSchemaError{err: err}
+				return BlockRead{}, &staleSchemaError{err: err}
 			}
 			record[column.Name] = value
 		}
-		return record, nil
+		result.Record = record
+		return result, nil
 	})
 	return record, annotate(command, err)
 }
@@ -611,48 +625,73 @@ func areaAround(cx, cy, radius int64) (string, error) {
 }
 
 func getArea(ctx context.Context, s session, table, area string, columns []string) ([]AreaChunk, error) {
+	result, err := getAreaWithSchema(ctx, s, table, area, false, columns)
+	return result.Chunks, err
+}
+
+func getAreaWithSchema(ctx context.Context, s session, table, area string, withMetadata bool, columns []string) (AreaRead, error) {
 	const command = "GET AREA"
 	name, err := s.tableName(command, table)
 	if err != nil {
-		return nil, err
+		return AreaRead{}, err
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
-		return nil, err
+		return AreaRead{}, err
 	}
-	chunks, err := withSchema(ctx, s, name, func(schema *Schema) ([]AreaChunk, error) {
+	chunks, err := withSchema(ctx, s, name, func(schema *Schema) (AreaRead, error) {
 		indexes, err := formColumns(schema, columns)
 		if err != nil {
-			return nil, &staleSchemaError{err: err, local: true}
+			return AreaRead{}, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names), nil)
+		clause := ""
+		if withMetadata {
+			clause = " WITH SCHEMA"
+		}
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil)
 		if err != nil {
 			if isNoColumn(err) {
-				return nil, &staleSchemaError{err: err}
+				return AreaRead{}, &staleSchemaError{err: err}
 			}
-			return nil, err
+			return AreaRead{}, err
+		}
+		result := AreaRead{}
+		if withMetadata {
+			if reply.Kind != ReplyArray || len(reply.Array) < 2 {
+				return AreaRead{}, protocolErrorf(command, "invalid schema envelope")
+			}
+			version, ok := reply.Array[0].Uint64()
+			if !ok {
+				return AreaRead{}, protocolErrorf(command, "invalid schema version")
+			}
+			result.SchemaVersion = version
+			if version != schema.Version {
+				return AreaRead{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
+			}
+			reply = reply.Array[1]
 		}
 		if reply.Kind != ReplyArray {
-			return nil, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
+			return AreaRead{}, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
 		}
 		chunks := make([]AreaChunk, 0, len(reply.Array))
 		for _, item := range reply.Array {
 			if item.Kind != ReplyArray || len(item.Array) < 3 {
-				return nil, protocolErrorf(command, "expected [cx, cy, chunk] entries")
+				return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
 			}
 			cx, okX := item.Array[0].Int64()
 			cy, okY := item.Array[1].Int64()
 			form, err := expectBulk(item.Array[2], command)
 			if !okX || !okY || err != nil {
-				return nil, protocolErrorf(command, "expected [cx, cy, chunk] entries")
+				return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
 			}
 			chunk, err := decodeOrStale(schema, form, names)
 			if err != nil {
-				return nil, err
+				return AreaRead{}, err
 			}
 			chunks = append(chunks, AreaChunk{CX: cx, CY: cy, Chunk: chunk})
 		}
-		return chunks, nil
+		result.Chunks = chunks
+		return result, nil
 	})
 	return chunks, annotate(command, err)
 }

@@ -8,7 +8,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"maps"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +21,8 @@ import (
 const protocolVersion = 3
 
 type resolvedOptions struct {
+	sessionOptions map[string]any
+
 	uri            URI
 	connectTimeout time.Duration
 	commandTimeout time.Duration
@@ -94,7 +98,12 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		return resolvedOptions{}, connectionErrorf("", nil, "invalid table name %q: names are [a-z_][a-z0-9_]*", table)
 	}
 
+	session, err := sessionOptions(opts.SessionOptions)
+	if err != nil {
+		return resolvedOptions{}, err
+	}
 	return resolvedOptions{
+		sessionOptions: session,
 		uri: URI{
 			Scheme:   scheme,
 			Secure:   secure,
@@ -212,6 +221,12 @@ func (c *Client) ServerInfo() *ServerInfo {
 		return nil
 	}
 	info := *c.hello
+	info.Features = slices.Clone(info.Features)
+	info.Options = maps.Clone(info.Options)
+	for key, value := range info.Options {
+		info.Options[key] = cloneReply(value)
+	}
+	info.NotApplied = maps.Clone(info.NotApplied)
 	return &info
 }
 
@@ -403,7 +418,8 @@ func (c *Client) helloOn(ctx context.Context, established *conn) error {
 		err       error
 	)
 	if c.opts.uri.User == "" {
-		reply, err = c.execOn(ctx, established, "HELLO", "HELLO 3", nil)
+		statement, params := helloOptions("HELLO 3", nil, c.opts.sessionOptions)
+		reply, err = c.execOn(ctx, established, "HELLO", statement, params)
 		err = c.helloError(err)
 	} else {
 		reply, signature, err = c.login(ctx, established)
@@ -435,8 +451,8 @@ func (c *Client) login(ctx context.Context, established *conn) (Reply, string, e
 		return Reply{}, "", err
 	}
 	exchange := newScramLogin(c.opts.uri.User, nonce)
-	reply, err := c.execOn(ctx, established, "HELLO", "HELLO 3 USER "+c.opts.uri.User+" $1",
-		[][]byte{[]byte(exchange.clientFirst())})
+	statement, params := helloOptions("HELLO 3 USER "+c.opts.uri.User+" $1", [][]byte{[]byte(exchange.clientFirst())}, c.opts.sessionOptions)
+	reply, err := c.execOn(ctx, established, "HELLO", statement, params)
 	if err != nil {
 		return Reply{}, "", c.helloError(err)
 	}
@@ -617,7 +633,11 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 		if (command == "HELLO" || command == "AUTH") && (reply.Code == CodeAuthFailed || reply.Code == CodeAuthRequired) {
 			phase = PhaseAuth
 		}
-		if closesConnection(reply, len(params) > 0) {
+		closes := closesConnection(reply, len(params) > 0)
+		if established.info.Supports("protocol_foundation") {
+			closes = reply.Code == CodeProtocol || reply.Code == CodeBadRequest || reply.Code == CodeKilled
+		}
+		if closes {
 			// The server closes the connection after this reply; requests
 			// pipelined behind it were not executed.
 			_ = established.shutdown(connectionErrorf(command, nil,
@@ -753,7 +773,7 @@ func (cn *conn) readLoop() {
 			_ = cn.shutdown(protocolErrorf("", "unsolicited response from server"))
 			return
 		}
-		if waiter.command == "WATCH" && reply.Kind == ReplySimple {
+		if waiter.command == "WATCH" && (reply.Kind == ReplySimple || reply.Kind == ReplyMap) {
 			cn.mu.Lock()
 			cn.watchStarted = true
 			cn.mu.Unlock()
@@ -867,6 +887,9 @@ func parseServerInfo(reply Reply) (*ServerInfo, error) {
 	// A bulk string after a login with a user, null without one.
 	if signature, ok := reply.Lookup("server_signature"); ok && signature.Kind == ReplyBulk {
 		info.ServerSignature = string(signature.Bulk)
+	}
+	if err := parseHelloExtensions(reply, info); err != nil {
+		return nil, err
 	}
 	return info, nil
 }

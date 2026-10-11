@@ -156,7 +156,7 @@ func TestWatchErrors(t *testing.T) {
 			}
 		})
 	}
-	for _, frames := range []string{">3\r\n" + respBulk("resync") + respBulk("bad") + respInt(1), changePush(1, respNull, respArray(respInt(1))), push(respBulk("unknown"), respBulk(watchEpoch), respInt(1))} {
+	for _, frames := range []string{">3\r\n" + respBulk("resync") + respBulk("bad") + respInt(1), changePush(1, respNull, respArray(respInt(1)))} {
 		_, w := fakeWatch(t, frames, worldColumns)
 		_, err := w.Next(t.Context())
 		if !errors.Is(err, ErrProtocol) {
