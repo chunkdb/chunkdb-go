@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"math"
@@ -413,6 +414,50 @@ func TestIntegrationTypedBlocks(t *testing.T) {
 	}
 }
 
+func TestIntegrationChunkNull(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, func(o *Options) { o.Table = "things" })
+	ctx := t.Context()
+	createTable(t, client, "things", typesSpec)
+	for _, columns := range [][]string{nil, {"id"}} {
+		chunk, err := client.GetChunk(ctx, "", 0, 0, columns...)
+		if err != nil || chunk != nil {
+			t.Fatalf("never-written chunk: %+v, %v", chunk, err)
+		}
+		if raw, err := client.GetChunkRaw(ctx, "", 0, 0, columns...); err != nil || raw != nil {
+			t.Fatalf("never-written raw chunk: %v, %v", raw, err)
+		}
+	}
+	checkUnpopulated := func() {
+		t.Helper()
+		area, err := client.GetArea(ctx, "", 0, 0, 0, 0)
+		if err != nil || len(area) != 0 {
+			t.Fatalf("empty area: %+v, %v", area, err)
+		}
+		page, err := client.ScanChunks(ctx, "", nil, 0)
+		if err != nil || len(page.Chunks) != 0 || page.More {
+			t.Fatalf("empty scan: %+v, %v", page, err)
+		}
+	}
+	checkUnpopulated()
+	if _, err := client.SetBlock(ctx, "", 0, 0, Record{"id": 1}); err != nil {
+		t.Fatal(err)
+	}
+	version, err := client.DeleteBlock(ctx, "", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk, err := client.GetChunk(ctx, "", 0, 0)
+	if err != nil || chunk == nil || chunk.Version != version || slices.Contains(chunk.Present, true) {
+		t.Fatalf("written empty chunk: %+v, %v", chunk, err)
+	}
+	raw, err := client.GetChunkRaw(ctx, "", 0, 0, "id")
+	if err != nil || len(raw) < 16 || binary.LittleEndian.Uint64(raw) != version {
+		t.Fatalf("written empty raw chunk: %v, %v", raw, err)
+	}
+	checkUnpopulated()
+}
+
 func TestIntegrationIfVersion(t *testing.T) {
 	server := startServer(t, serverConfig{})
 	client := connectIntegration(t, server, nil)
@@ -462,17 +507,25 @@ func TestIntegrationIfVersion(t *testing.T) {
 	if !errors.As(err, &mismatch) || mismatch.Current != written {
 		t.Fatalf("got %v, want a mismatch at version %d", err, written)
 	}
-	// An absent chunk has a version too, so a write can create it only while
-	// it is still absent.
+	// NULL has no version; create a fresh form with an ordinary write.
 	empty, err := client.GetChunk(ctx, "things", 7, 7)
-	if err != nil || slices.Contains(empty.Present, true) {
-		t.Fatalf("GetChunk of an absent chunk: %+v, %v", empty, err)
+	if err != nil || empty != nil {
+		t.Fatalf("never-written chunk: %+v, %v", empty, err)
 	}
+	if raw, err := client.GetChunkRaw(ctx, "things", 7, 7); err != nil || raw != nil {
+		t.Fatalf("never-written raw chunk: %v, %v", raw, err)
+	}
+	schema, err := client.Schema(ctx, "things")
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty = NewChunk(schema)
 	empty.SetBlock(0, 0, Record{"id": 1})
-	if _, err := client.SetChunk(ctx, "things", 7, 7, empty, IfVersion(empty.Version)); err != nil {
+	created, err := client.SetChunk(ctx, "things", 7, 7, empty)
+	if err != nil {
 		t.Fatalf("SetChunk creating a chunk: %v", err)
 	}
-	if _, err := client.SetChunk(ctx, "things", 7, 7, empty, IfVersion(empty.Version)); !errors.Is(err, ErrVersionMismatch) {
+	if _, err := client.SetChunk(ctx, "things", 7, 7, empty, IfVersion(created+1)); !errors.Is(err, ErrVersionMismatch) {
 		t.Fatalf("got %v, want a mismatch", err)
 	}
 }

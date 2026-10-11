@@ -441,7 +441,8 @@ func deleteBlock(ctx context.Context, s session, table string, x, y int64, claus
 
 // GetChunk reads chunk (cx, cy) of table ("" is the default table), decoded
 // with the client's cached schema ([DecodeChunk]): the named columns, or every
-// column. A chunk without blocks has no present block and its version.
+// column. A never-written chunk returns nil, nil. A written chunk with no
+// present blocks keeps its empty form and version until its disk artifacts and cached state are removed.
 func (c *Client) GetChunk(ctx context.Context, table string, cx, cy int64, columns ...string) (*Chunk, error) {
 	return getChunk(ctx, c, table, cx, cy, columns)
 }
@@ -468,6 +469,9 @@ func getChunk(ctx context.Context, s session, table string, cx, cy int64, column
 			}
 			return nil, err
 		}
+		if reply.Kind == ReplyNull {
+			return nil, nil
+		}
 		form, err := expectBulk(reply, command)
 		if err != nil {
 			return nil, err
@@ -487,6 +491,7 @@ func decodeOrStale(schema *Schema, form []byte, names []string) (*Chunk, error) 
 
 // GetChunkRaw reads chunk (cx, cy) of table ("" is the default table) as its
 // chunk form, the named columns or every column, without decoding it.
+// A never-written chunk returns nil, nil; a versioned empty form remains bytes.
 // [Client.SetChunkRaw] writes a form of every column back, to this or another
 // chunk.
 func (c *Client) GetChunkRaw(ctx context.Context, table string, cx, cy int64, columns ...string) ([]byte, error) {
@@ -505,6 +510,9 @@ func getChunkRaw(ctx context.Context, s session, table string, cx, cy int64, col
 	reply, err := s.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(columns), nil)
 	if err != nil {
 		return nil, err
+	}
+	if reply.Kind == ReplyNull {
+		return nil, nil
 	}
 	return expectBulk(reply, command)
 }
