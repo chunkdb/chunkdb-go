@@ -91,7 +91,14 @@ func TestIntegrationWatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer fresh.Close()
-			resync := nextExpectedWatch(t, fresh, "resync", fresh.Start().Revision, schema.Version).(*ResyncEvent)
+			// WATCH AFTER returns the requested position; resync carries the
+			// completed producer frontier, which can include reserved-clock gaps.
+			// No mutation occurs between this DESCRIBE and the resync assertion.
+			frontier, err := c.Describe(t.Context(), "watched")
+			if err != nil || frontier.Revision == nil || frontier.Epoch != start.Epoch || frontier.Version != schema.Version || *frontier.Revision < third {
+				t.Fatal("completed frontier for resync", frontier, err)
+			}
+			resync := nextExpectedWatch(t, fresh, "resync", *frontier.Revision, frontier.Version).(*ResyncEvent)
 			if resync.Position.Epoch != start.Epoch {
 				t.Fatal("resync epoch")
 			}

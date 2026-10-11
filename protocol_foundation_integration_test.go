@@ -132,7 +132,7 @@ func TestIntegrationFoundationFramingPipeline(t *testing.T) {
 			t.Fatalf("ordered reply %d: %v", i, err)
 		}
 		if i == 1 {
-			if r.Kind != ReplyError || r.Code != CodeSyntax {
+			if r.Kind != ReplyError || r.Code != CodeUnknownCommand {
 				t.Fatal(r)
 			}
 			var typed *Error
