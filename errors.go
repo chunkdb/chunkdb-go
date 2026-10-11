@@ -394,9 +394,6 @@ func replyError(phase Phase, command string, reply Reply) error {
 		if !ok {
 			reason, _, _ = strings.Cut(reply.Message, " ")
 		}
-		if reason == "" {
-			return protocolErrorf(command, "malformed %s reply: %q", reply.Code, reply.Message)
-		}
 		return &ConflictError{Reason: reason, Err: base}
 	}
 	if reply.Code != CodeVersionMismatch && reply.Code != CodeSchemaMismatch {

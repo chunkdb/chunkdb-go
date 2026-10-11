@@ -485,3 +485,108 @@ func TestFoundationRejectedParametersKeepConnection(t *testing.T) {
 		t.Fatal("rejection caused reconnect", server.commands())
 	}
 }
+
+func TestFoundationAuthenticatedOptionFrames(t *testing.T) {
+	login := fakeLogin{user: "bot", password: "secret"}
+	handler := login.handler(genericHandler)
+	server := newFakeServer(t, func(s *fakeServer, conn net.Conn, statement string) {
+		if strings.HasPrefix(statement, "HELLO") {
+			if statement != "HELLO 3 USER bot $1 WITH client_name = $2, default_tag = $3" {
+				t.Errorf("HELLO: %s", statement)
+			}
+			params := s.paramsOf(conn)
+			if len(params) != 3 || !strings.HasPrefix(string(params[0]), "n,,") || string(params[1]) != "worker" || string(params[2]) != "tag" {
+				t.Errorf("HELLO frames: %v", params)
+			}
+		}
+		handler(s, conn, statement)
+	})
+	c, err := Connect(t.Context(), Options{URI: server.uri("bot:secret"), SessionOptions: map[string]any{"client_name": "worker", "default_tag": []byte("tag")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Ping(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFoundationExplicitFeatureActivation(t *testing.T) {
+	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, statement string) {
+		switch statement {
+		case "ENABLE FEATURE feature_activation":
+			writeSimple(conn, "OK")
+		case "ENABLE FEATURE future_feature":
+			writeRaw(conn, "-ERR INVALID_ARGUMENT reason=unknown_feature feature=future_feature\r\n")
+		default:
+			t.Errorf("unexpected command: %s", statement)
+		}
+	}))
+	c := newTestClient(t, server, nil)
+	if err := c.EnableFeature(t.Context(), "feature_activation"); err != nil {
+		t.Fatal(err)
+	}
+	var typed *Error
+	if err := c.EnableFeature(t.Context(), "future_feature"); !errors.As(err, &typed) || typed.ServerKeys["feature"] != "future_feature" || typed.Metadata.Reason != "unknown_feature" {
+		t.Fatal(err)
+	}
+	if err := c.EnableFeature(t.Context(), "unsafe name"); !errors.Is(err, ErrProtocol) {
+		t.Fatal(err)
+	}
+}
+
+func TestFoundationTransactionPrivateReadMetadata(t *testing.T) {
+	server, state := newTxServer(t)
+	state.replies["GET BLOCK"] = []string{respArray(respInt(5), respInt(1), respArray(respInt(7))), respArray(respNull, respInt(1), respArray(respInt(9)))}
+	state.replies["GET AREA"] = []string{respArray(respInt(1), respArray())}
+	c := newTestClient(t, server, nil)
+	_, err := c.Transaction(t.Context(), func(tx *Tx) error {
+		snapshot, err := tx.GetBlockWithMetadata(t.Context(), "world", 0, 0, "id")
+		if err != nil {
+			return err
+		}
+		if snapshot.Version == nil || *snapshot.Version != 5 || snapshot.Record["id"] != uint64(7) {
+			t.Fatal(snapshot)
+		}
+		if err := tx.SetBlock(t.Context(), "world", 0, 0, Record{"id": 9}); err != nil {
+			return err
+		}
+		private, err := tx.GetBlockWithMetadata(t.Context(), "world", 0, 0, "id")
+		if err != nil {
+			return err
+		}
+		if private.Version != nil || private.SchemaVersion != 1 || private.Record["id"] != uint64(9) {
+			t.Fatal(private)
+		}
+		area, err := tx.GetAreaWithSchema(t.Context(), "world", 0, 0, 1, 1)
+		if err != nil {
+			return err
+		}
+		if area.SchemaVersion != 1 || area.Chunks == nil || len(area.Chunks) != 0 {
+			t.Fatal(area)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFoundationUnknownWidthKnownProjection(t *testing.T) {
+	schema, err := parseSchema(readOne(t, describeReply("world", 1, []string{fakeColumn(1, "id", "u8", false, false, respInt(0)), fakeColumn(2, "future", "new_type", false, false, respBulk("raw")), fakeColumn(3, "flag", "bool", false, false, respBool(false))})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected := schema.clone()
+	projected.Columns = []Column{schema.Columns[0], schema.Columns[2]}
+	chunk := NewChunk(projected)
+	chunk.SetBlock(0, 0, Record{"id": 7, "flag": true})
+	form, err := EncodeChunk(projected, chunk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeChunk(schema, form, "id", "flag")
+	if err != nil || decoded.Block(0, 0)["id"] != uint64(7) || decoded.Block(0, 0)["flag"] != true {
+		t.Fatal(decoded, err)
+	}
+}

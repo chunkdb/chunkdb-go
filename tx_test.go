@@ -347,13 +347,13 @@ func TestTransactionWithoutWritesHasNoVersion(t *testing.T) {
 		t.Fatalf("got %v, want a protocol error", err)
 	}
 
-	// A malformed CONFLICT reply is a protocol error.
+	// CONFLICT classification depends on its code, even without diagnostics.
 	if _, err := client.Do(t.Context(), "COMMIT"); err != nil {
 		t.Fatalf("COMMIT: %v", err)
 	}
 	state.commits = []string{"-ERR CONFLICT\r\n"}
-	if _, err := client.Do(t.Context(), "COMMIT"); !errors.Is(err, ErrProtocol) || errors.Is(err, ErrConflict) {
-		t.Fatalf("got %v, want a protocol error", err)
+	if _, err := client.Do(t.Context(), "COMMIT"); !errors.Is(err, ErrConflict) || errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want a conflict", err)
 	}
 }
 

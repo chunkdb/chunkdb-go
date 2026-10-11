@@ -98,3 +98,8 @@ Ordinary write durability depends on server and table settings.
 Use `Do` for other CQL statements, with parameters from `EncodeValue`.
 
 See [Durability](https://github.com/chunkdb/chunkdb/blob/main/docs/DURABILITY_CONTRACT.md) for configuration and crash guarantees.
+
+Storage features require explicit activation on existing server directories.
+`EnableFeature(ctx, name)` sends that request and requires ADMIN on `*`.
+Activation is idempotent and monotonic; it cannot disable a feature.
+Unknown names return `INVALID_ARGUMENT reason=unknown_feature`.
