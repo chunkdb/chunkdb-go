@@ -33,7 +33,7 @@ const (
 	// KindProtocol covers malformed or unexpected server replies and
 	// client-side validation of statements and values.
 	KindProtocol
-	// KindServer covers "-ERR <code> <message>" replies.
+	// KindServer covers server error replies.
 	KindServer
 	// KindAuth covers AUTH_FAILED (wrong user or password) and AUTH_REQUIRED
 	// (no user) replies. It is a specialization of KindServer and matches
@@ -70,8 +70,7 @@ var (
 
 // Server error codes, as reported in [Error.ServerCode].
 const (
-	// CodeProtocol: no HELLO 3 yet, another protocol version, or a second
-	// HELLO.
+	// CodeProtocol: missing, unsupported, or repeated protocol negotiation.
 	CodeProtocol = "PROTOCOL"
 	// CodeAuthRequired: the server has users and the client logged in
 	// without one.
@@ -125,9 +124,8 @@ type Error struct {
 	// Command names the statement, for example "SET BLOCK" or "HELLO".
 	Command string
 	Message string
-	// ServerCode and ServerMessage carry the parts of a "-ERR <code>
-	// <message>" reply. They are empty unless Kind is [KindServer] or
-	// [KindAuth].
+	// ServerCode and ServerMessage carry the server's error code and explanation.
+	// They are empty unless Kind is [KindServer] or [KindAuth].
 	ServerCode    string
 	ServerMessage string
 	Err           error

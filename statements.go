@@ -11,15 +11,13 @@ import (
 	"strings"
 )
 
-// Do sends one CQL statement and its parameter frames, and returns the
-// decoded reply. A parameter is the binary form of a value ([EncodeValue]);
-// nil is NULL. Statements are single lines: one containing CR or LF is refused
-// before anything is sent. An error reply is returned as an error: an
-// [*Error] or a typed permission, version, schema, or conflict error.
-// BACKUP is available through Do and uses paths on the server filesystem.
+// Do sends one CQL statement with encoded parameters and returns its decoded reply.
+// Use [EncodeValue] for parameters; nil means NULL.
+// Statements containing CR or LF are rejected before sending.
+// Server rejections return [Error] or a specialized permission, version, schema, or conflict error.
 //
-// A CREATE TABLE, ALTER TABLE or DROP TABLE sent through Do, including inside
-// MIGRATE, drops the client's cached schema of that table.
+// BACKUP paths refer to the server's filesystem.
+// CREATE, ALTER, and DROP TABLE invalidate the table's cached schema, including inside MIGRATE.
 func (c *Client) Do(ctx context.Context, statement string, params ...[]byte) (Reply, error) {
 	if table, ok := tableStatementTarget(statement); ok {
 		defer c.forgetSchema(table)

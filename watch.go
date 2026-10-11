@@ -12,7 +12,8 @@ import (
 // Area is an inclusive rectangle of chunk coordinates.
 type Area struct{ CX0, CY0, CX1, CY1 int64 }
 
-// Position identifies a frontier in a table's change stream.
+// Position identifies a point in a table's change stream.
+// Epoch identifies the table's lifetime; Revision orders committed changes within it.
 type Position struct {
 	Epoch    string
 	Revision uint64
@@ -192,7 +193,7 @@ func (p *Pool) Watch(ctx context.Context, table string, opts WatchOptions) (*Wat
 	return c.Watch(ctx, table, opts)
 }
 
-// Start is the position reported by WATCH's initial +OK.
+// Start returns the position established when the subscription opens.
 func (w *Watch) Start() Position { return w.start }
 
 // Next waits for an event. Cancellation while waiting leaves the stream open;
@@ -242,13 +243,14 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 	}
 }
 
-// Close sends UNWATCH, discards queued pushes through its +OK and closes the
-// dedicated connections. Recoverable ACK rejections received while closing are
-// discarded. Close cancels an in-flight Ack; if its write is interrupted, the
-// connection closes without UNWATCH and both calls report the write or
-// connection error, rather than ErrTimeout caused by Close. Caller cancellation
-// and command deadlines still report ErrTimeout. The client's CommandTimeout
-// bounds draining (the default applies when it was disabled). Close is idempotent.
+// Close ends the subscription, drains queued events, and closes its connections.
+// It discards recoverable ACK rejections received while closing.
+// Close cancels an in-flight [Watch.Ack]; an interrupted write closes the connection.
+// Both calls then report the write or connection error.
+//
+// Caller cancellation and command deadlines still report [ErrTimeout].
+// CommandTimeout bounds draining; five seconds applies when that timeout is disabled.
+// Close is idempotent.
 func (w *Watch) Close() error {
 	w.closeOnce.Do(func() {
 		close(w.closing)
@@ -474,14 +476,16 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 	return metadata.Describe(lookupCtx, w.table)
 }
 
-// Ack acknowledges applied work on a slot watch. It completes after writing the
-// request, not after persistence: success has no server reply. An asynchronous
-// rejection is returned by Next; INVALID_ARGUMENT leaves the stream open.
-// The client rejects revisions above the last ChangeEvent returned by Next (or
-// Start before any change); schema and resync events do not advance this bound.
-// The server validates decreasing revisions because writing does not confirm
-// acceptance. Close flushes accepted acknowledgements via UNWATCH unless it
-// interrupts an in-flight write; see Close for cancellation and error handling.
+// Ack acknowledges applied work on a slot watch.
+// It returns after writing the request, before persistence; success has no reply.
+// [Watch.Next] reports asynchronous rejections; INVALID_ARGUMENT leaves the stream open.
+//
+// The client rejects revisions beyond the last ChangeEvent returned by Next, or Start before the first change.
+// Schema and resync events do not advance that bound.
+// The server validates decreasing revisions because writing does not confirm acceptance.
+//
+// [Watch.Close] persists accepted acknowledgements unless it interrupts an in-flight write.
+// See Close for cancellation and error handling.
 func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 	if err := ctx.Err(); err != nil {
 		return timeoutErrorf("ACK", err, "%s", err)

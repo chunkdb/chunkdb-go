@@ -33,15 +33,17 @@ func (e *MigrationError) Error() string {
 
 func (e *MigrationError) Unwrap() error { return e.Err }
 
-// Migrate runs steps in order, stopping at the first error. Run the same list
-// at every application start: the server skips names already applied with the
-// same statement text and reports CONFLICT for a changed statement. Leading
-// and trailing spaces/tabs are removed; interior spacing and case are kept.
-// Each step is durable independently; this is not a transaction. After a
-// transport failure its outcome may be unknown: retry the same named step.
-// A recovery-required server error requires a server restart before retrying.
-// Inner statements require their normal rights; migrations require a
-// single-process read-write server and cannot run inside a transaction.
+// Migrate runs steps in order and stops at the first error.
+// Repeat the same list at startup; completed names with unchanged text are skipped.
+// Changed text returns CONFLICT; leading and trailing spaces and tabs are trimmed.
+// Interior spacing and case remain significant.
+//
+// Each step is independently durable; earlier successes remain after later failures.
+// Retry identical names and text after transport failure because the outcome can be unknown.
+// Recovery-required errors need a server restart first.
+//
+// Inner statements require their normal rights.
+// Migrations require one read-write server process and cannot run inside a transaction.
 func (c *Client) Migrate(ctx context.Context, steps []Migration) ([]MigrationResult, error) {
 	results := make([]MigrationResult, 0, len(steps))
 	for i, step := range steps {

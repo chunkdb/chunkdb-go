@@ -24,24 +24,24 @@ const maxReplyDepth = 32
 type ReplyKind int
 
 const (
-	// ReplySimple is "+<text>", for example +OK and +PONG.
+	// ReplySimple holds a simple string.
 	ReplySimple ReplyKind = iota + 1
-	// ReplyError is "-ERR <code> <message>". [Client.Do] returns it as an
+	// ReplyError holds a server error. [Client.Do] returns it as an
 	// error, never as a Reply.
 	ReplyError
-	// ReplyInteger is ":<n>"; read it with [Reply.Int64] or [Reply.Uint64].
+	// ReplyInteger holds an integer; read it with [Reply.Int64] or [Reply.Uint64].
 	ReplyInteger
-	// ReplyDouble is ",<n>", including inf, -inf and nan.
+	// ReplyDouble holds a floating-point value, including infinities and NaN.
 	ReplyDouble
-	// ReplyBoolean is "#t" or "#f".
+	// ReplyBoolean holds a boolean.
 	ReplyBoolean
-	// ReplyNull is "_": NULL, or an absent block.
+	// ReplyNull means NULL or an absent block.
 	ReplyNull
-	// ReplyBulk is "$<length>" followed by that many bytes.
+	// ReplyBulk holds a byte string.
 	ReplyBulk
-	// ReplyArray is "*<n>" followed by n replies.
+	// ReplyArray holds a list of replies.
 	ReplyArray
-	// ReplyMap is "%<n>" followed by n key/value pairs.
+	// ReplyMap holds key/value pairs.
 	ReplyMap
 	// ReplyPush carries an unsolicited WATCH event.
 	ReplyPush

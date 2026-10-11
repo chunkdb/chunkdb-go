@@ -1,11 +1,11 @@
-# Values
+# Choose column values
 
-Values travel as binary parameters, checked against the table's schema before sending.
+A schema defines each column's type; the client checks values before sending them.
 
 | Column | Write | Read |
 |---|---|---|
-| `uN` | Any integer type in range | `uint64` |
-| `iN` | Any integer type in range | `int64` |
+| `uN` | Integer in range | `uint64` |
+| `iN` | Integer in range | `int64` |
 | `bool` | `bool` | `bool` |
 | `f32`, `f64` | `float32` or `float64` | `float32`, `float64` |
 | `bits(N)` | `chunkdb.Bits` | `chunkdb.Bits` |
@@ -13,22 +13,55 @@ Values travel as binary parameters, checked against the table's schema before se
 | `bytes(max)` | `[]byte` | `[]byte` |
 | NULL | `nil` for a nullable column | `nil` |
 
-Integers retain their full signed or unsigned range; floating-point values support infinities and NaN.
+Integers retain their full range; floating-point values support infinities and NaN.
 Text limits count UTF-8 bytes; bytes values need not be UTF-8.
-The server's `var_max_chunk_bytes` limit counts variable values and twelve bytes of overhead per value.
-An out-of-range, oversized or wrong-type input returns an error matching `ErrProtocol` before the request is sent.
+Wrong types, oversized values, and out-of-range inputs return `ErrProtocol` before sending a request.
 
+## Bits and raw parameters
+
+Use `ctx` and a connected `client` from [Connections](CONNECTIONS.md).
+Run the [world example](../examples/world/main.go) first to create `world_go`.
+Imports are in the [checked examples](../example_test.go).
+
+<!-- go-example: ExampleParseBits -->
 ```go
 bits, err := chunkdb.ParseBits("1010")
-if err != nil { return err }
+if err != nil {
+	log.Fatal(err)
+}
 fmt.Println(bits.Bit(0), bits.Bit(1))
 parameter, err := chunkdb.EncodeValue(chunkdb.TypeText(16), "river")
-if err != nil { return err }
-if _, err := client.Do(ctx, "SET BLOCK 0 0 IN world_go label=$1", parameter); err != nil { return err }
+if err != nil {
+	log.Fatal(err)
+}
+if _, err := client.Do(ctx, "SET BLOCK 0 0 IN world_go label=$1", parameter); err != nil {
+	log.Fatal(err)
+}
+block, err := client.GetBlock(ctx, "world_go", 0, 0, "label")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(block["label"])
 ```
 
-This block runs inside a function returning `error`, with `ctx` and a connected `client`; first create `world_go` with the [world example](../examples/world/main.go).
-`ParseBits` uses lowest-bit-first order: the first digit is bit zero.
-`Do` accepts raw parameter bytes from `EncodeValue`; a nil parameter is NULL.
-Statements are single lines; CR and LF are permitted in parameter values.
-The client caps one bulk reply at `MaxBulkBytes` (160 MiB); the server also supplies request and area limits through `ServerInfo`.
+```output
+true false
+river
+```
+
+`ParseBits` reads the first digit as bit zero.
+`Do` accepts encoded parameter bytes; a nil parameter means NULL.
+Statements use one line; parameter values can contain CR and LF.
+
+## Limits
+
+| Value | Limit |
+|---|---|
+| `uN` | N is 1–64 bits. |
+| `iN` | N is 2–64 bits. |
+| `bits(N)` | N is 1–65535 bits. |
+| Text and bytes per chunk | `var_max_chunk_bytes`, counting 12 overhead bytes per value. |
+| One bulk reply | `MaxBulkBytes`: 160 MiB. |
+
+Read server request and area limits through `ServerInfo()`.
+See [Data](DATA.md) for reading values from blocks and chunks.

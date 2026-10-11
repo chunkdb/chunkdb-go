@@ -21,8 +21,8 @@ const formHeaderBytes = 16
 // Block i of the chunk, at local coordinates (lx, ly), is i = ly*Width + lx
 // ([Schema.Locate] finds them for a block coordinate).
 type Chunk struct {
-	// Version is the chunk version the form was read at. A write ignores it;
-	// pass [IfVersion] to make a write conditional.
+	// Version identifies the chunk state when read; compare it for equality.
+	// A write ignores this field; pass [IfVersion] for a conditional write.
 	Version uint64
 	// SchemaVersion is the table's schema version the form was encoded for.
 	// [EncodeChunk] writes the version of the schema it encodes with instead.

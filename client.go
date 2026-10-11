@@ -169,11 +169,10 @@ func NewClient(opts Options) (*Client, error) {
 	}, nil
 }
 
-// Connect builds a client and opens its connection. Every connection starts
-// with the HELLO 3 handshake, which logs in the user with SCRAM-SHA-256. A
-// wrong user or password, or a missing user, fails with [ErrAuth]; a server
-// that cannot prove it holds the user's verifier with [ErrConnection]; and a
-// server of an older chunkdb protocol with [ErrProtocol].
+// Connect builds a client and opens its connection using SCRAM-SHA-256 authentication.
+// A wrong or missing user or password returns [ErrAuth].
+// Failure to verify the server's authentication proof returns [ErrConnection].
+// An unsupported server protocol returns [ErrProtocol].
 func Connect(ctx context.Context, opts Options) (*Client, error) {
 	client, err := NewClient(opts)
 	if err != nil {
@@ -204,7 +203,7 @@ func (c *Client) DefaultTable() string {
 	return cmp.Or(c.opts.table, DefaultTableName)
 }
 
-// ServerInfo returns the server's HELLO reply for the most recent connection,
+// ServerInfo returns server details and limits from the most recent connection,
 // or nil before the first successful connection. The result is a copy.
 func (c *Client) ServerInfo() *ServerInfo {
 	c.helloMu.Lock()
