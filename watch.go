@@ -388,7 +388,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		}
 		e := &ChangeEvent{Position: pos, CommitTimeMs: ms, User: user, SchemaVersion: version, Blocks: make([]BlockChange, 0, len(a[6].Array))}
 		for _, item := range a[6].Array {
-			if item.Kind != ReplyArray || len(item.Array) != 4 {
+			if item.Kind != ReplyArray || len(item.Array) < 4 {
 				return bad()
 			}
 			b := item.Array
@@ -419,7 +419,7 @@ func decodeCoordinate(r Reply) (Coordinate, error) {
 	if n, ok := r.Int64(); ok {
 		return n, nil
 	}
-	if r.Kind == ReplyArray && len(r.Array) == 2 {
+	if r.Kind == ReplyArray && len(r.Array) >= 2 {
 		chunk, ok := r.Array[0].Int64()
 		offset, okOffset := r.Array[1].Uint64()
 		if ok && okOffset && offset <= 1<<32-1 {
@@ -432,7 +432,7 @@ func decodeWatchRow(columns []Column, r Reply) (Record, error) {
 	if r.Kind == ReplyNull {
 		return nil, nil
 	}
-	if r.Kind != ReplyArray || len(r.Array) != len(columns) {
+	if r.Kind != ReplyArray || len(r.Array) < len(columns) {
 		return nil, protocolErrorf("WATCH", "row does not match schema columns")
 	}
 	out := make(Record, len(columns))

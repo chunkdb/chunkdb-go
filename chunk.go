@@ -126,6 +126,13 @@ func DecodeChunk(schema *Schema, form []byte, columns ...string) (*Chunk, error)
 	if err != nil {
 		return nil, err
 	}
+	for _, index := range indexes {
+		col := schema.Columns[index]
+		if col.Type.Kind == ColumnUnknown {
+			return nil, protocolErrorf("", "cannot decode legacy chunk form with unknown column type %s; use raw chunk APIs or known-column reads", col.Type.RawType)
+		}
+	}
+
 	bad := func(format string, args ...any) (*Chunk, error) {
 		return nil, protocolErrorf("", "chunk form of table "+schema.Table+": "+format, args...)
 	}
@@ -318,6 +325,12 @@ func writeFixed(t ColumnType, section []byte, off, width int, value any) {
 // it takes the column's default, else zero or empty, and is an error in a
 // REQUIRED column without a default.
 func EncodeChunk(schema *Schema, chunk *Chunk) ([]byte, error) {
+	for _, col := range schema.Columns {
+		if col.Type.Kind == ColumnUnknown {
+			return nil, protocolErrorf("", "cannot decode or encode legacy chunk form with unknown column type %s; use raw chunk APIs or known-column reads", col.Type.RawType)
+		}
+	}
+
 	if chunk == nil {
 		return nil, requestErrorf("", "the chunk is nil")
 	}

@@ -192,7 +192,7 @@ func parseColumn(item Reply) (Column, error) {
 	}
 	t, err := ParseColumnType(string(typeName.Bulk))
 	if err != nil {
-		return bad("type " + string(typeName.Bulk))
+		t = ColumnType{Kind: ColumnUnknown, RawType: string(typeName.Bulk)}
 	}
 	column.Type = t
 	null, ok := item.Lookup("null")
@@ -217,7 +217,7 @@ func parseColumn(item Reply) (Column, error) {
 
 func parsePair(reply Reply, key string) (int, int, error) {
 	pair, ok := reply.Lookup(key)
-	if !ok || pair.Kind != ReplyArray || len(pair.Array) != 2 {
+	if !ok || pair.Kind != ReplyArray || len(pair.Array) < 2 {
 		return 0, 0, protocolErrorf("DESCRIBE", "malformed DESCRIBE reply: %s", key)
 	}
 	width, okWidth := pair.Array[0].Int64()

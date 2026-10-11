@@ -720,6 +720,17 @@ func (cn *conn) readLoop() {
 		watch := cn.watch
 		streaming := cn.watchStarted
 		cn.mu.Unlock()
+		if reply.Kind == ReplyPush {
+			if len(reply.Array) == 0 || reply.Array[0].Kind != ReplyBulk {
+				_ = cn.shutdown(protocolErrorf("", "push has no string kind"))
+				return
+			}
+			switch string(reply.Array[0].Bulk) {
+			case "schema", "change", "progress", "resync", "chunks", "catalog":
+			default:
+				continue // Fully decoded unknown pushes consume no ordinary response.
+			}
+		}
 		if watch == nil && reply.Kind == ReplyPush {
 			_ = cn.shutdown(protocolErrorf("", "push outside a watch"))
 			return

@@ -32,6 +32,8 @@ const (
 	ColumnText
 	// ColumnBytes is bytes(max): at most max bytes.
 	ColumnBytes
+	// ColumnUnknown is a future type retained as raw bytes in row replies.
+	ColumnUnknown
 )
 
 // ColumnType is a column's type. Size is N for uN, iN and bits(N), the
@@ -39,6 +41,8 @@ const (
 type ColumnType struct {
 	Kind ColumnKind
 	Size int
+	// RawType retains an unknown DESCRIBE type name.
+	RawType string
 }
 
 // TypeUint is uN.
@@ -118,6 +122,9 @@ func ParseColumnType(text string) (ColumnType, error) {
 
 // String formats the type as CQL writes it.
 func (t ColumnType) String() string {
+	if t.Kind == ColumnUnknown {
+		return t.RawType
+	}
 	switch t.Kind {
 	case ColumnUnsigned:
 		return "u" + strconv.Itoa(t.Size)
@@ -455,7 +462,7 @@ func decodeValue(t ColumnType, reply Reply) (any, error) {
 			return mismatch()
 		}
 		return string(reply.Bulk), nil
-	case ColumnBytes:
+	case ColumnBytes, ColumnUnknown:
 		if reply.Kind != ReplyBulk {
 			return mismatch()
 		}

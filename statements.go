@@ -321,7 +321,7 @@ func getBlock(ctx context.Context, s session, table string, x, y int64, columns 
 		if reply.Kind == ReplyNull {
 			return nil, nil
 		}
-		if reply.Kind != ReplyArray || len(reply.Array) != len(indexes) {
+		if reply.Kind != ReplyArray || len(reply.Array) < len(indexes) {
 			return nil, &staleSchemaError{err: protocolErrorf(command, "expected %d values", len(indexes))}
 		}
 		record := make(Record, len(indexes))
@@ -637,7 +637,7 @@ func getArea(ctx context.Context, s session, table, area string, columns []strin
 		}
 		chunks := make([]AreaChunk, 0, len(reply.Array))
 		for _, item := range reply.Array {
-			if item.Kind != ReplyArray || len(item.Array) != 3 {
+			if item.Kind != ReplyArray || len(item.Array) < 3 {
 				return nil, protocolErrorf(command, "expected [cx, cy, chunk] entries")
 			}
 			cx, okX := item.Array[0].Int64()
@@ -688,7 +688,7 @@ func (c *Client) ScanChunks(ctx context.Context, table string, after *ChunkCoord
 	}
 	page := ScanPage{Chunks: make([]ChunkCoord, 0, len(chunks.Array)), More: more.Bool}
 	for _, item := range chunks.Array {
-		if item.Kind != ReplyArray || len(item.Array) != 2 {
+		if item.Kind != ReplyArray || len(item.Array) < 2 {
 			return ScanPage{}, protocolErrorf(command, "expected [cx, cy] entries")
 		}
 		cx, okX := item.Array[0].Int64()
