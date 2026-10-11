@@ -65,8 +65,7 @@ var (
 	// ErrPermissionDenied matches a statement refused because the user lacks
 	// the right it needs. The error is a [*PermissionDeniedError].
 	ErrPermissionDenied = errors.New("chunkdb: permission denied")
-	// ErrConflict matches CONFLICT: a failed transaction ([*ConflictError]),
-	// or a migration name already used for different statement text ([*Error]).
+	// ErrConflict matches CONFLICT: a failed transaction ([*ConflictError]).
 	ErrConflict = errors.New("chunkdb: transaction conflict")
 )
 
@@ -95,8 +94,7 @@ const (
 	// CodeSchemaMismatch: SET CHUNK of a form encoded for another schema
 	// version than the table's; nothing changed. See [SchemaMismatchError].
 	CodeSchemaMismatch = "SCHEMA_MISMATCH"
-	// CodeConflict: a transaction conflict (see [ConflictError]), or a
-	// migration name already used for different statement text.
+	// CodeConflict: a transaction conflict (see [ConflictError]).
 	CodeConflict = "CONFLICT"
 	// CodeNoTable: the table does not exist.
 	CodeNoTable = "NO_TABLE"
@@ -105,8 +103,7 @@ const (
 	// CodeBadRequest: the request could not be framed; the server closes the
 	// connection, and so does the client.
 	CodeBadRequest = "BAD_REQUEST"
-	// CodeBusy: the server has no room for the connection, or the slot is
-	// already being watched.
+	// CodeBusy: the server has no room for the connection.
 	CodeBusy = "BUSY"
 	// CodeSlotLost: a durable slot exceeded its retention limit.
 	CodeSlotLost = "SLOT_LOST"
@@ -153,17 +150,19 @@ type ErrorMetadata struct {
 }
 
 const (
-	CodeConditionFailed   = "CONDITION_FAILED"
-	CodeDiskFull          = "DISK_FULL"
-	CodeRateLimited       = "RATE_LIMITED"
-	CodeOutcomeUnknown    = "OUTCOME_UNKNOWN"
+	CodeConditionFailed = "CONDITION_FAILED"
+	CodeDiskFull        = "DISK_FULL"
+	CodeRateLimited     = "RATE_LIMITED"
+	CodeOutcomeUnknown  = "OUTCOME_UNKNOWN"
+	// CodeMigrationMismatch: a recorded migration name has different statement text.
 	CodeMigrationMismatch = "MIGRATION_MISMATCH"
-	CodeSlotBusy          = "SLOT_BUSY"
-	CodeCheckFailed       = "CHECK_FAILED"
-	CodeCancelled         = "CANCELLED"
-	CodeTimeout           = "TIMEOUT"
-	CodeKilled            = "KILLED"
-	CodeUnknownCommand    = "UNKNOWN_COMMAND"
+	// CodeSlotBusy: a durable slot already has an active watcher.
+	CodeSlotBusy       = "SLOT_BUSY"
+	CodeCheckFailed    = "CHECK_FAILED"
+	CodeCancelled      = "CANCELLED"
+	CodeTimeout        = "TIMEOUT"
+	CodeKilled         = "KILLED"
+	CodeUnknownCommand = "UNKNOWN_COMMAND"
 )
 
 // Error is the error type returned by every operation in this package.
@@ -367,7 +366,7 @@ func serverError(phase Phase, command, code, message string) *Error {
 // [*VersionMismatchError] for VERSION_MISMATCH, a [*SchemaMismatchError] for
 // SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, a
 // [*ConflictError] for transaction CONFLICT, an [*Error] otherwise (including
-// migration CONFLICT).
+// errors returned by MIGRATE).
 func replyError(phase Phase, command string, reply Reply) error {
 	keys := reply.Keys
 	if keys == nil {

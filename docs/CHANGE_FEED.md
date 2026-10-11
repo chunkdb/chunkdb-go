@@ -18,19 +18,26 @@ if err != nil {
 	log.Fatal(err)
 }
 defer watch.Close()
-if _, err := client.SetBlock(ctx, "world_go", 0, 0,
-	chunkdb.Record{"tile": 6}); err != nil {
-	log.Fatal(err)
-}
-event, err := watch.Next(ctx)
+version, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 6})
 if err != nil {
 	log.Fatal(err)
 }
-change, ok := event.(*chunkdb.ChangeEvent)
-if !ok {
-	log.Fatalf("expected a change, got %T", event)
+for {
+	event, err := watch.Next(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	switch event.(type) {
+	case *chunkdb.ProgressEvent, *chunkdb.SchemaEvent:
+		continue
+	}
+	change, ok := event.(*chunkdb.ChangeEvent)
+	if !ok || change.Position.Epoch != watch.Start().Epoch || change.Position.Revision != version || len(change.Blocks) != 1 {
+		log.Fatalf("expected the written block change, got %#v", event)
+	}
+	fmt.Println("tile:", change.Blocks[0].After["tile"])
+	break
 }
-fmt.Println("tile:", change.Blocks[0].After["tile"])
 if err := watch.Close(); err != nil {
 	log.Fatal(err)
 }
@@ -58,7 +65,10 @@ Close drains within CommandTimeout, using five seconds when that timeout is disa
 
 See [Change feed](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md) for resynchronization and slot recovery.
 
-ProgressEvent reports a completed position when filters omit changes.
+ProgressEvent reports a completed position when filters omit changes or while idle.
+It may arrive before a mutation or between schema and mutation events.
+Use one bounded context for the whole expected-event wait; handle resync explicitly.
+The example waits for its own write and leaves reserved catalog events as unexpected future input.
 Persist that position before acknowledging it.
 Unknown push kinds are fully decoded and ignored without consuming an ordinary reply or advancing acknowledgements.
 Known event prefixes accept trailing extensions while validating their known fields.

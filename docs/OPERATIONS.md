@@ -29,7 +29,7 @@ notes_label skipped
 ```
 
 - Repeating a recorded name with identical text skips that step.
-- Different text returns `ErrConflict`; case and interior spacing matter.
+- Different text returns `CodeMigrationMismatch`, a fatal error; case and interior spacing matter.
 - The client trims leading and trailing spaces and tabs.
 - Each step is independently durable; earlier successes remain after a later failure.
 - `MigrationError` identifies the failed Name and zero-based Index, and wraps its cause.

@@ -31,7 +31,7 @@ connected
 | Setting | Behavior |
 |---|---|
 | `chunk://`, `chunks://` | Plain TCP or TLS; port defaults to 4242. |
-| URI path | Selects the default table; `Options.Table` overrides it. |
+| URI path | Selects a table for empty table arguments; `Options.Table` overrides it. |
 | Empty table argument | Uses `Options.Table` or the URI path; requires an explicit argument if neither selects a table. |
 | Explicit Host, Port, User, Password | Nonempty values override URI values. |
 | No credentials | Requires a server started with `--auth none`. |

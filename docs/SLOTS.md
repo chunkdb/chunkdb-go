@@ -14,8 +14,8 @@ if err != nil {
 	log.Fatal(err)
 }
 defer watch.Close()
-if _, err := client.SetBlock(ctx, "world_go", 0, 0,
-	chunkdb.Record{"tile": 7}); err != nil {
+version, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 7})
+if err != nil {
 	log.Fatal(err)
 }
 for {
@@ -23,12 +23,13 @@ for {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if _, ok := event.(*chunkdb.SchemaEvent); ok {
+	switch event.(type) {
+	case *chunkdb.ProgressEvent, *chunkdb.SchemaEvent:
 		continue
 	}
 	change, ok := event.(*chunkdb.ChangeEvent)
-	if !ok {
-		log.Fatalf("rebuild consumer state after %T", event)
+	if !ok || change.Position.Epoch != watch.Start().Epoch || change.Position.Revision != version || len(change.Blocks) != 1 {
+		log.Fatalf("expected the written change; rebuild after resync: %#v", event)
 	}
 	fmt.Println("apply:", change.Blocks[0].After["tile"])
 	if err := watch.Ack(ctx, change.Position.Revision); err != nil {
@@ -63,7 +64,7 @@ After a crash, skip already applied revisions; an ACK alone cannot prevent dupli
 
 AFTER selects a later starting point without acknowledging it.
 Slots replay durable archived changes, including in relaxed durability mode.
-`Slots(ctx, "")` lists visible tables; empty table arguments elsewhere select the default table.
+`Slots(ctx, "")` lists visible tables; empty table arguments elsewhere require Options.Table or a URI table path.
 A lost slot returns `CodeSlotLost`.
 Rebuild your consumer state, drop the lost slot, and create it again before resuming.
 
@@ -79,6 +80,8 @@ Taking over another user's connection additionally requires ADMIN on `*`.
 WatchOptions.AckTimeout takes positive whole milliseconds; zero disables that watch deadline.
 The deadline starts with the first unacknowledged change or chunks mutation and is not refreshed by later mutations or progress.
 
+The example tolerates periodic progress and schema events while waiting for its exact write revision.
+It uses the same bounded ctx for the whole wait and treats resync or reserved catalog events as unexpected.
 Next must return a progress event before Ack can cover its revision.
 Schema, resync and unknown events never raise that bound.
 Takeover resumes from the persisted ACK, so unacknowledged events remain replayable.

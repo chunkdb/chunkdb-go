@@ -4,7 +4,7 @@ import (
 	"context"
 )
 
-// ProgressEvent reports the completed frontier after filtered-out changes.
+// ProgressEvent reports the completed frontier after filtered-out changes or while idle.
 // Returning it from Next makes that position eligible for acknowledgement.
 type ProgressEvent struct{ Position Position }
 
