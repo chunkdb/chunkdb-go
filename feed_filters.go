@@ -78,5 +78,5 @@ func (c *Client) CreateSlotWithOptions(ctx context.Context, table, name string, 
 
 // CreateSlotWithOptions runs Client.CreateSlotWithOptions on a leased client.
 func (p *Pool) CreateSlotWithOptions(ctx context.Context, table, name string, opts SlotOptions) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.CreateSlotWithOptions(ctx, table, name, opts) })
+	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.CreateSlotWithOptions(ctx, table, name, opts) })
 }

@@ -10,9 +10,8 @@ const (
 	defaultHost = "127.0.0.1"
 	// DefaultPort is the chunkdb server port used when a URI omits one.
 	DefaultPort = 4242
-	// DefaultTableName is the table a client works on when neither
-	// [Options.Table] nor the URI path names one.
-	// Selecting this name does not create a table.
+	// DefaultTableName is a conventional table name retained for compatibility.
+	// Clients never select it implicitly.
 	DefaultTableName = "default"
 )
 
@@ -67,7 +66,8 @@ type Options struct {
 
 	// Table is the client's default table: the one a method uses when its
 	// table argument is "". Empty means the URI path
-	// (chunk://host:4242/terrain), then [DefaultTableName]. Every statement
+	// (chunk://host:4242/terrain). Without either, table methods require
+	// an explicit table argument. Every statement
 	// names its table on the wire.
 	Table string
 }

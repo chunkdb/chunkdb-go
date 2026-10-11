@@ -263,7 +263,7 @@ func (w *Watch) Next(ctx context.Context) (Event, error) {
 			_ = w.conn.shutdown(err)
 		} else {
 			switch event.(type) {
-			case *ChangeEvent, *ProgressEvent, *ChunksEvent, *CatalogEvent:
+			case *ChangeEvent, *ProgressEvent, *ChunksEvent:
 				w.ackMu.Lock()
 				position := event.GetPosition()
 				if position.Epoch == w.delivered.Epoch && position.Revision > w.delivered.Revision {
@@ -522,7 +522,7 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 // It returns after writing the request, before persistence; success has no reply.
 // [Watch.Next] reports asynchronous rejections; INVALID_ARGUMENT leaves the stream open.
 //
-// The client rejects revisions beyond the last change, chunks, catalog or progress event returned by Next, or Start before the first change.
+// The client rejects revisions beyond the last change, chunks or progress event returned by Next, or Start before the first change.
 // Schema and resync events do not advance that bound.
 // The server validates decreasing revisions because writing does not confirm acceptance.
 //
@@ -552,7 +552,7 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 	valid := revision <= w.delivered.Revision
 	w.ackMu.Unlock()
 	if !valid {
-		return requestErrorf("ACK", "revision must not exceed the last returned change, chunks, catalog, progress or start position")
+		return requestErrorf("ACK", "revision must not exceed the last returned change, chunks, progress or start position")
 	}
 	statement := "ACK " + strconv.FormatUint(revision, 10)
 	if err := checkLimits(w.conn.info, "ACK", statement, nil); err != nil {

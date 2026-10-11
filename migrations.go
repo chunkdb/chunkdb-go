@@ -35,7 +35,7 @@ func (e *MigrationError) Unwrap() error { return e.Err }
 
 // Migrate runs steps in order and stops at the first error.
 // Repeat the same list at startup; completed names with unchanged text are skipped.
-// Changed text returns CONFLICT; leading and trailing spaces and tabs are trimmed.
+// Changed text returns MIGRATION_MISMATCH; leading and trailing spaces and tabs are trimmed.
 // Interior spacing and case remain significant.
 //
 // Each step is independently durable; earlier successes remain after later failures.

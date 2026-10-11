@@ -25,9 +25,10 @@ type Column struct {
 // Schema is a table as DESCRIBE reports it.
 type Schema struct {
 	Table string
-	// Epoch identifies the table lifetime; Revision is its completed commit frontier.
+	// Epoch identifies the table lifetime. Revision is its completed commit
+	// frontier, or nil when a read-only open cannot establish that frontier.
 	Epoch    string
-	Revision uint64
+	Revision *uint64
 	// Dims is the number of coordinate axes.
 	Dims int
 	// ChunkColumns describe rows attached to chunks.
@@ -82,6 +83,10 @@ func (s *Schema) clone() *Schema {
 		return nil
 	}
 	out := *s
+	if s.Revision != nil {
+		revision := *s.Revision
+		out.Revision = &revision
+	}
 	out.ChunkColumns = cloneColumns(s.ChunkColumns)
 	out.Columns = make([]Column, len(s.Columns))
 	for i, column := range s.Columns {
@@ -142,11 +147,14 @@ func parseSchema(reply Reply) (*Schema, error) {
 			}
 			schema.Epoch = string(value.Bulk)
 		case "revision":
+			if value.Kind == ReplyNull {
+				break
+			}
 			n, valid := value.Uint64()
 			if !valid {
 				return bad(key)
 			}
-			schema.Revision = n
+			schema.Revision = &n
 		case "dims":
 			n, valid := value.Int64()
 			if !valid || (n != 2 && n != 3) {

@@ -77,8 +77,17 @@ Dropping a projected column makes the slot lost instead of broadening its projec
 WatchOptions.Takeover requires a slot and revokes its previous owner with `KILLED reason=slot_takeover`.
 Taking over another user's connection additionally requires ADMIN on `*`.
 WatchOptions.AckTimeout takes positive whole milliseconds; zero disables that watch deadline.
-The deadline starts with the first unacknowledged change and is not refreshed by later changes or progress.
+The deadline starts with the first unacknowledged change or chunks mutation and is not refreshed by later mutations or progress.
 
 Next must return a progress event before Ack can cover its revision.
 Schema, resync and unknown events never raise that bound.
 Takeover resumes from the persisted ACK, so unacknowledged events remain replayable.
+
+Slots reports typed Filters and LostReason metadata.
+Filters.Columns aligns current display names with stable ColumnIDs; a dropped column keeps its ID and has a nil name.
+A rename changes the display name without changing that persisted identity.
+Area stores lower coordinates followed by upper coordinates, with its length determined by dimensions.
+
+Unknown loss reasons remain diagnostic strings.
+A nil Filters value identifies a legacy response without the added metadata; nil projection lists within Filters mean all columns.
+Fields preserves raw map fields for additional diagnostics.

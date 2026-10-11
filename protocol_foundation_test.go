@@ -296,7 +296,7 @@ func TestFoundationDescribeMetadata(t *testing.T) {
 	r := readOne(t, describeReply("world", 1, []string{fakeColumn(1, "id", "u8", false, false, respInt(0))}))
 	r.Map = append(r.Map, MapEntry{readOne(t, respBulk("epoch")), readOne(t, respBulk(watchEpoch))}, MapEntry{readOne(t, respBulk("revision")), readOne(t, "(18446744073709551615\r\n")}, MapEntry{readOne(t, respBulk("dims")), readOne(t, respInt(2))}, MapEntry{readOne(t, respBulk("chunk_columns")), readOne(t, respArray(fakeColumn(2, "meta", "future", false, false, respBulk("value"))))})
 	schema, err := parseSchema(r)
-	if err != nil || schema.Epoch != watchEpoch || schema.Revision != math.MaxUint64 || schema.Dims != 2 || string(schema.ChunkColumns[0].Default.([]byte)) != "value" {
+	if err != nil || schema.Epoch != watchEpoch || (schema.Revision == nil || *schema.Revision != math.MaxUint64) || schema.Dims != 2 || string(schema.ChunkColumns[0].Default.([]byte)) != "value" {
 		t.Fatal(schema, err)
 	}
 	clone := schema.clone()
@@ -304,7 +304,7 @@ func TestFoundationDescribeMetadata(t *testing.T) {
 	if string(schema.ChunkColumns[0].Default.([]byte)) != "value" {
 		t.Fatal("chunk default aliases schema")
 	}
-	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns"} {
+	for _, key := range []string{"epoch", "dims", "chunk_columns"} {
 		bad := cloneReply(r)
 		for i := range bad.Map {
 			if string(bad.Map[i].Key.Bulk) == key {

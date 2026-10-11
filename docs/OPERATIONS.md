@@ -103,3 +103,8 @@ Storage features require explicit activation on existing server directories.
 `EnableFeature(ctx, name)` sends that request and requires ADMIN on `*`.
 Activation is idempotent and monotonic; it cannot disable a feature.
 Unknown names return `INVALID_ARGUMENT reason=unknown_feature`.
+
+`Status(ctx)` reports enabled directory and table storage features and raw Compat, ReadOnlyCompat and Incompat masks.
+It requires ADMIN on `*` and exposes ActivationPending from the protected activation state.
+Unknown names and fields remain available; these storage features are separate from HELLO capabilities.
+A recovery error is returned when an unhealthy server cannot provide a truthful snapshot.

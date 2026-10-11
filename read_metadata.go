@@ -17,8 +17,8 @@ func (o ReadOptions) clauses() string {
 }
 
 // BlockRead holds a row and its requested metadata. Record is nil for an
-// absent block. Version is nil for a never-written or transaction-private
-// modified chunk; an absent block in a committed chunk still has its version.
+// absent block. Version is nil for a chunk without any retained commit or a transaction-private
+// modified chunk; an absent block with a retained commit still has its version.
 type BlockRead struct {
 	Record        Record
 	Version       *uint64
@@ -95,7 +95,7 @@ func (tx *Tx) GetBlockWithMetadata(ctx context.Context, table string, x, y int64
 
 // GetBlockWithOptions runs Client.GetBlockWithOptions on a leased client.
 func (p *Pool) GetBlockWithOptions(ctx context.Context, table string, x, y int64, opts ReadOptions, columns ...string) (BlockRead, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (BlockRead, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (BlockRead, error) {
 		return c.GetBlockWithOptions(ctx, table, x, y, opts, columns...)
 	})
 }
@@ -119,7 +119,7 @@ func (tx *Tx) GetAreaWithSchema(ctx context.Context, table string, cx0, cy0, cx1
 
 // GetAreaWithSchema runs Client.GetAreaWithSchema on a leased client.
 func (p *Pool) GetAreaWithSchema(ctx context.Context, table string, cx0, cy0, cx1, cy1 int64, columns ...string) (AreaRead, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (AreaRead, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (AreaRead, error) {
 		return c.GetAreaWithSchema(ctx, table, cx0, cy0, cx1, cy1, columns...)
 	})
 }

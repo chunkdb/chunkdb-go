@@ -32,11 +32,12 @@ connected
 |---|---|
 | `chunk://`, `chunks://` | Plain TCP or TLS; port defaults to 4242. |
 | URI path | Selects the default table; `Options.Table` overrides it. |
-| Empty table argument | Uses `Options.Table`, the URI path, then the name `default`. |
+| Empty table argument | Uses `Options.Table` or the URI path; requires an explicit argument if neither selects a table. |
 | Explicit Host, Port, User, Password | Nonempty values override URI values. |
 | No credentials | Requires a server started with `--auth none`. |
 
 Selecting a table does not create it; a fresh server has no tables.
+Without a selected table, table methods return a local error before sending a data request.
 URI-escape reserved password characters, or supply unescaped credentials through `Options`.
 Every connection authenticates separately with SCRAM-SHA-256.
 Use TLS over an untrusted network because authentication does not encrypt subsequent data.

@@ -67,3 +67,8 @@ ChangeEvent exposes nullable Tag and Txn, plus ChunkChanges for chunk-column row
 ChunksEvent carries raw forms or nil deletion forms; CatalogEvent decodes the reserved catalog envelope.
 Decoding these envelopes does not advertise WATCH CATALOG or other unavailable features.
 Txn is a nullable exact uint64; empty tags remain distinct from nil tags.
+
+A fully written ChunksEvent returned by Next is ACK-eligible like a ChangeEvent.
+Queued events are not yet application-delivered and cannot raise the ACK ceiling.
+Change and chunks mutations start the oldest unacknowledged mutation deadline; progress never starts or refreshes it.
+Reserved catalog, schema, resync and unknown events never raise that ceiling.

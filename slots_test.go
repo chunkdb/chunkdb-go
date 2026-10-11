@@ -39,6 +39,12 @@ func TestSlotsStatementsAndTypes(t *testing.T) {
 	}
 	for _, table := range []string{"", "world"} {
 		got, err := c.Slots(t.Context(), table)
+		if len(got) == 1 {
+			if len(got[0].Fields) != 6 {
+				t.Fatal("missing raw slot fields")
+			}
+			got[0].Fields = nil
+		}
 		if err != nil || !reflect.DeepEqual(got, []Slot{{Table: "world", Name: "consumer", Epoch: watchEpoch, Acked: math.MaxUint64, RetainedBytes: math.MaxUint64, Lost: true}}) {
 			t.Fatal(got, err)
 		}

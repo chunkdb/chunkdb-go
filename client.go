@@ -207,9 +207,9 @@ func (c *Client) URI() URI {
 }
 
 // DefaultTable reports the table a method uses when its table argument is "":
-// [Options.Table], else the URI path, else [DefaultTableName].
+// [Options.Table], else the URI path. Empty means no table was selected.
 func (c *Client) DefaultTable() string {
-	return cmp.Or(c.opts.table, DefaultTableName)
+	return c.opts.table
 }
 
 // ServerInfo returns server details and limits from the most recent connection,

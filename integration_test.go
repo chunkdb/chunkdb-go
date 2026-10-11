@@ -341,22 +341,22 @@ func TestIntegrationServerInfo(t *testing.T) {
 	if err := client.Ping(t.Context()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
-	if client.DefaultTable() != "default" {
+	if client.DefaultTable() != "" {
 		t.Fatalf("got default table %q", client.DefaultTable())
 	}
-	// A connection's fallback table name does not create a table.
+	// A connection without table selection never chooses a named default.
 	tables, err := client.Tables(t.Context())
 	if err != nil || len(tables) != 0 {
 		t.Fatalf("fresh Tables: %v, %v", tables, err)
 	}
-	if _, err := client.Describe(t.Context(), ""); !isServerCode(err, CodeNoTable) {
-		t.Fatalf("fresh Describe: %v, want NO_TABLE", err)
+	if _, err := client.Describe(t.Context(), ""); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("fresh Describe: %v, want local table-selection error", err)
 	}
 	createTable(t, client, "default", TableSpec{
 		Columns:    []ColumnDef{{Name: "bits", Type: TypeBits(16)}},
 		ChunkWidth: 16, ChunkHeight: 16,
 	})
-	schema, err := client.Describe(t.Context(), "")
+	schema, err := client.Describe(t.Context(), "default")
 	if err != nil || schema.Table != "default" || len(schema.Columns) == 0 || schema.Columns[0].ID == 0 {
 		t.Fatalf("Describe: %+v, %v", schema, err)
 	}

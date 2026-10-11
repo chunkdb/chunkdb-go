@@ -83,7 +83,10 @@ func annotate(command string, err error) error {
 // tableName resolves a table argument: "" is the default table.
 func (c *Client) tableName(command, table string) (string, error) {
 	if table == "" {
-		return c.DefaultTable(), nil
+		table = c.DefaultTable()
+	}
+	if table == "" {
+		return "", requestErrorf(command, "select a table explicitly or through Options.Table or the URI path")
 	}
 	if err := checkNames(command, "table", table); err != nil {
 		return "", err

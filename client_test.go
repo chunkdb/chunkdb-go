@@ -502,7 +502,7 @@ func TestClientDefaultTable(t *testing.T) {
 		configure func(*Options)
 		want      string
 	}{
-		"default":      {nil, "default"},
+		"unselected":   {nil, ""},
 		"uri path":     {func(o *Options) { o.URI = strings.TrimSuffix(o.URI, "/") + "/terrain" }, "terrain"},
 		"option wins":  {func(o *Options) { o.URI += "terrain"; o.Table = "world" }, "world"},
 		"option alone": {func(o *Options) { o.Table = "world" }, "world"},
@@ -512,6 +512,12 @@ func TestClientDefaultTable(t *testing.T) {
 			client := newTestClient(t, server, testCase.configure)
 			if got := client.DefaultTable(); got != testCase.want {
 				t.Fatalf("got %q, want %q", got, testCase.want)
+			}
+			if testCase.want == "" {
+				if _, err := client.DeleteBlock(t.Context(), "", 0, 0); !errors.Is(err, ErrProtocol) {
+					t.Fatal(err)
+				}
+				return
 			}
 			if _, err := client.DeleteBlock(t.Context(), "", 0, 0); err != nil {
 				t.Fatalf("DeleteBlock: %v", err)

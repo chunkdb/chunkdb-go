@@ -63,6 +63,7 @@ func NewPool(opts PoolOptions) (*Pool, error) {
 		return nil, err
 	}
 	opts.SessionOptions = resolved.sessionOptions
+	opts.Table = resolved.table
 
 	acquireTimeout := opts.AcquireTimeout
 	if acquireTimeout == 0 {
@@ -296,77 +297,77 @@ func (p *Pool) Ping(ctx context.Context) error {
 
 // GetBlock runs [Client.GetBlock] on a leased client.
 func (p *Pool) GetBlock(ctx context.Context, table string, x, y int64, columns ...string) (Record, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (Record, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (Record, error) {
 		return c.GetBlock(ctx, table, x, y, columns...)
 	})
 }
 
 // SetBlock runs [Client.SetBlock] on a leased client.
 func (p *Pool) SetBlock(ctx context.Context, table string, x, y int64, values Record, opts ...WriteOption) (uint64, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (uint64, error) {
 		return c.SetBlock(ctx, table, x, y, values, opts...)
 	})
 }
 
 // DeleteBlock runs [Client.DeleteBlock] on a leased client.
 func (p *Pool) DeleteBlock(ctx context.Context, table string, x, y int64, opts ...WriteOption) (uint64, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (uint64, error) {
 		return c.DeleteBlock(ctx, table, x, y, opts...)
 	})
 }
 
 // GetChunk runs [Client.GetChunk] on a leased client.
 func (p *Pool) GetChunk(ctx context.Context, table string, cx, cy int64, columns ...string) (*Chunk, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (*Chunk, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (*Chunk, error) {
 		return c.GetChunk(ctx, table, cx, cy, columns...)
 	})
 }
 
 // GetChunkRaw runs [Client.GetChunkRaw] on a leased client.
 func (p *Pool) GetChunkRaw(ctx context.Context, table string, cx, cy int64, columns ...string) ([]byte, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]byte, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) ([]byte, error) {
 		return c.GetChunkRaw(ctx, table, cx, cy, columns...)
 	})
 }
 
 // SetChunk runs [Client.SetChunk] on a leased client.
 func (p *Pool) SetChunk(ctx context.Context, table string, cx, cy int64, chunk *Chunk, opts ...WriteOption) (uint64, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (uint64, error) {
 		return c.SetChunk(ctx, table, cx, cy, chunk, opts...)
 	})
 }
 
 // SetChunkRaw runs [Client.SetChunkRaw] on a leased client.
 func (p *Pool) SetChunkRaw(ctx context.Context, table string, cx, cy int64, form []byte, opts ...WriteOption) (uint64, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (uint64, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (uint64, error) {
 		return c.SetChunkRaw(ctx, table, cx, cy, form, opts...)
 	})
 }
 
 // GetArea runs [Client.GetArea] on a leased client.
 func (p *Pool) GetArea(ctx context.Context, table string, cx0, cy0, cx1, cy1 int64, columns ...string) ([]AreaChunk, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]AreaChunk, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) ([]AreaChunk, error) {
 		return c.GetArea(ctx, table, cx0, cy0, cx1, cy1, columns...)
 	})
 }
 
 // GetAreaAround runs [Client.GetAreaAround] on a leased client.
 func (p *Pool) GetAreaAround(ctx context.Context, table string, cx, cy, radius int64, columns ...string) ([]AreaChunk, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]AreaChunk, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) ([]AreaChunk, error) {
 		return c.GetAreaAround(ctx, table, cx, cy, radius, columns...)
 	})
 }
 
 // ScanChunks runs [Client.ScanChunks] on a leased client.
 func (p *Pool) ScanChunks(ctx context.Context, table string, after *ChunkCoord, limit int) (ScanPage, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (ScanPage, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (ScanPage, error) {
 		return c.ScanChunks(ctx, table, after, limit)
 	})
 }
 
 // Describe runs [Client.Describe] on a leased client.
 func (p *Pool) Describe(ctx context.Context, table string) (*Schema, error) {
-	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (*Schema, error) { return c.Describe(ctx, table) })
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (*Schema, error) { return c.Describe(ctx, table) })
 }
 
 // Tables runs [Client.Tables] on a leased client.
@@ -382,4 +383,18 @@ func (p *Pool) FlushWAL(ctx context.Context) error {
 // Metrics runs [Client.Metrics] on a leased client.
 func (p *Pool) Metrics(ctx context.Context) (string, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) (string, error) { return c.Metrics(ctx) })
+}
+
+// withPooledTableClient rejects an absent table selection before dialing.
+func withPooledTableClient[T any](ctx context.Context, p *Pool, table string, fn func(context.Context, *Client) (T, error)) (T, error) {
+	if table == "" && p.clientOpts.Table == "" {
+		var zero T
+		return zero, requestErrorf("", "select a table explicitly or through Options.Table or the URI path")
+	}
+	return withPooledClient(ctx, p, fn)
+}
+
+func (p *Pool) withTableClient(ctx context.Context, table string, fn func(context.Context, *Client) error) error {
+	_, err := withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (struct{}, error) { return struct{}{}, fn(ctx, c) })
+	return err
 }
