@@ -3,6 +3,7 @@
 Connect using the same URI as the [world example](../examples/world/main.go).
 `chunk://` selects a plain listener and `chunks://` selects TLS; both default to port 4242.
 The URI path selects the client's default table; `Options.Table` overrides it.
+Without either, the client selects the name `default`; selecting it does not create a table. A fresh server has no tables.
 Nonempty explicit Host, Port, User and Password fields override URI values.
 Every connection authenticates separately; use URI-escaped credentials or Options fields for unescaped values.
 

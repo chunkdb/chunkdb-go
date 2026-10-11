@@ -156,6 +156,10 @@ type TableOptions struct {
 	// VarMaxChunkBytes is the most bytes of text and bytes values one chunk
 	// holds, counting 12 bytes per value.
 	VarMaxChunkBytes uint64
+	// FeedBufferBytes is the table's in-memory change-feed byte budget.
+	FeedBufferBytes uint64
+	// SlotMaxBytes is the table's durable-slot retained byte budget.
+	SlotMaxBytes uint64
 }
 
 // ColumnDef is a column of [TableSpec] or [Client.AddColumn].

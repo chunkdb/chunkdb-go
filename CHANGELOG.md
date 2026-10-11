@@ -22,6 +22,7 @@ uses protocol 3 (CQL); see the engine's
 - Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
+- Set and describe per-table `FeedBufferBytes` and `SlotMaxBytes`; fixtures and examples follow an initially empty server catalog. (#73).
 - A runnable `examples/world` creates a typed table, fills and reads an area, and observes an update through WATCH; the integration suite runs it twice to check its repeatable named migration
 - Client/Pool `Migrate` apply named schema steps in order with `applied`/`skipped` results, partial results and a wrapping `MigrationError` identifying the first failed step; migration `CONFLICT` preserves the server error without transaction retry semantics
 - Durable slots: Client/Pool `CreateSlot`, `DropSlot`, typed `Slots`, `WatchOptions.Slot`, and cancellable write-only `Watch.Ack`; slot ACK rejections are recoverable through `Next`, with `CodeSlotLost` for expired history

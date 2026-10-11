@@ -158,6 +158,10 @@ func parseSchema(reply Reply) (*Schema, error) {
 			schema.Options.WalGroupCommitUpdates = number
 		case "var_max_chunk_bytes":
 			schema.Options.VarMaxChunkBytes = number
+		case "feed_buffer_bytes":
+			schema.Options.FeedBufferBytes = number
+		case "slot_max_bytes":
+			schema.Options.SlotMaxBytes = number
 		}
 	}
 	return schema, nil

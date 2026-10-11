@@ -65,6 +65,7 @@ if err := client.DropTable(ctx, "scratch"); err != nil { return err }
 
 `Tables` lists tables, `Describe` refreshes a schema and `Schema` uses the client's cache.
 Chunk and large-chunk geometry is fixed at creation.
+`TableSpec.Options.FeedBufferBytes` and `SlotMaxBytes` set positive per-table byte budgets for the in-memory feed and durable-slot retention. Omitted (zero) fields use the server's configured defaults: normally 64 MiB and 1 GiB. `Describe` reports the effective values in `Schema.Options`; `SetTableOption` changes them using `"feed_buffer_bytes"` or `"slot_max_bytes"`.
 `RenameColumn`, `DropColumn`, `AlterColumnType` and `SetTableOption` change schema or runtime options; the server validates each operation.
 A narrowing conversion uses `ConvertNone`, `ConvertClamp`, `ConvertDefault` or `ConvertTruncate` as appropriate to the type.
 The client invalidates schema caches after its own table statements, including those inside `Migrate`, and refreshes when a typed write detects stale schema.
