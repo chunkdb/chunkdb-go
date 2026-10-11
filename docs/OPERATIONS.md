@@ -1,10 +1,8 @@
 # Set up and back up application data
 
 Use named migrations to repeat schema setup safely.
-Each migration records a name and statement after applying it.
 
 Use `ctx` and an administrator `client` from [Connections](CONNECTIONS.md).
-
 
 <!-- go-example: ExampleClient_Migrate -->
 ```go
@@ -49,6 +47,9 @@ notes_label skipped
 
 ## Online backup
 
+Backup is disabled unless you start the server with `--backup-dir <path>`.
+Use a client with MANAGES USERS, or a server with authentication disabled.
+
 <!-- go-example: ExampleClient_Do_backup -->
 ```go
 backupName := "go-docs-" + time.Now().UTC().Format("20060102T150405.000000000Z")
@@ -63,8 +64,7 @@ fmt.Println("backup complete:", backup.Kind == chunkdb.ReplyMap)
 backup complete: true
 ```
 
-BACKUP stores files under the server's `--backup-dir`; the destination must be absent or empty.
-It requires MANAGES USERS unless authentication is disabled.
+The backup destination must be absent or empty.
 Only one backup runs at a time; another receives `CodeBusy`.
 The reply describes each table's cut; different tables need not share one simultaneous cut.
 

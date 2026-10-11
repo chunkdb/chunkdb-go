@@ -64,7 +64,7 @@ After a crash, skip already applied revisions; an ACK alone cannot prevent dupli
 AFTER selects a later starting point without acknowledging it.
 Slots replay durable archived changes, including in relaxed durability mode.
 `Slots(ctx, "")` lists visible tables; empty table arguments elsewhere select the default table.
-A lost slot returns `CodeSlotLost`; rebuild its state before continuing.
+A lost slot returns `CodeSlotLost`.
+Rebuild your consumer state, drop the lost slot, and create it again before resuming.
 
-
-See [Change feed](CHANGE_FEED.md) for events and [server recovery](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.md) for lost slots.
+See [Change feed](CHANGE_FEED.md) for events and [server recovery](https://github.com/chunkdb/chunkdb/blob/main/docs/FEED_RESUME.md) for lost slots.
