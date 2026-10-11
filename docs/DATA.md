@@ -1,73 +1,99 @@
-# Data API
+# Read and write blocks
 
-These examples go inside a function returning `error`, with `ctx` and an administrator `client` from `ConnectURI`.
-Run the [world example](../examples/world/main.go) first to create `world_go` with `tile u8` and `label text(16)`.
-Block coordinates are `int64`; area and scan coordinates count chunks.
+A block holds typed column values at one grid coordinate.
+A chunk groups a fixed rectangle of blocks.
+An area selects a rectangle of chunks.
 
-## Blocks and conditional writes
+Use `ctx` and a connected `client` from [Connections](CONNECTIONS.md).
+Run the [world example](../examples/world/main.go) first to create `world_go`.
 
+<!-- go-example: ExampleClient_SetBlock -->
 ```go
 version, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 3, "label": "road"})
-if err != nil { return err }
+if err != nil {
+	log.Fatal(err)
+}
 block, err := client.GetBlock(ctx, "world_go", 0, 0)
-if err != nil { return err }
+if err != nil {
+	log.Fatal(err)
+}
 fmt.Println(block["tile"], block["label"])
 _, err = client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 4}, chunkdb.IfVersion(version))
-if err != nil { return err }
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println("conditional write: applied")
 ```
 
-`GetBlock` returns a nil record for an absent block; a nil field means NULL.
-A block write changes only the supplied columns; new blocks take defaults, NULL or zero/empty as their schema permits.
-`IfVersion` checks the entire chunk, including changes to other blocks; rejection returns `*VersionMismatchError`.
-`DeleteBlock` removes a block and returns the new chunk version.
+```output
+3 road
+conditional write: applied
+```
 
-## Chunks, areas and scans
+- `GetBlock` returns a nil record for an absent block; a nil field means NULL.
+- `SetBlock` changes supplied columns; new blocks use schema defaults, NULL, or zero values.
+- A version identifies a chunk's state for conditional writes; compare it for equality.
+- `IfVersion` checks the whole chunk, including other blocks; rejection returns `VersionMismatchError`.
+- `DeleteBlock` removes a block and returns the new chunk version.
 
+## Chunks and areas
+
+<!-- go-example: ExampleClient_GetChunk -->
 ```go
 schema, err := client.Schema(ctx, "world_go")
-if err != nil { return err }
+if err != nil {
+	log.Fatal(err)
+}
 chunk := chunkdb.NewChunk(schema)
 chunk.SetBlock(0, 0, chunkdb.Record{"tile": 5, "label": "lake"})
-if _, err := client.SetChunk(ctx, "world_go", 2, 0, chunk); err != nil { return err }
-read, err := client.GetChunk(ctx, "world_go", 2, 0)
-if err != nil { return err }
-if read != nil { fmt.Println(read.Block(0, 0)["label"]) }
-area, err := client.GetArea(ctx, "world_go", 0, 0, 2, 1)
-if err != nil { return err }
-fmt.Println("chunks:", len(area))
-for coord, err := range client.AllChunks(ctx, "world_go", 0) {
-    if err != nil { return err }
-    fmt.Println(coord.CX, coord.CY)
+if _, err := client.SetChunk(ctx, "world_go", 2, 0, chunk); err != nil {
+	log.Fatal(err)
 }
+read, err := client.GetChunk(ctx, "world_go", 2, 0)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(read.Block(0, 0)["label"])
+area, err := client.GetArea(ctx, "world_go", 2, 0, 2, 0)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println("chunks:", len(area))
 ```
 
-`GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk. Build a fresh form with `NewChunk(schema)` and perform an ordinary first write; NULL supplies no version for `IfVersion`. A written chunk with all blocks deleted retains its empty form and version until its disk artifacts and cached state are removed.
-
-`SetChunk` replaces the entire chunk; `Chunk.Present` distinguishes absent blocks.
-`Schema.Locate(x, y)` maps absolute blocks to chunk and local coordinates, including negative addresses.
-`GetArea` uses inclusive chunk bounds and returns only chunks with present blocks; `GetAreaAround` selects a radius.
-`ScanChunks` returns a page in ascending CX then CY order; use its last coordinate as `after` while `More` is true.
-`AllChunks` handles paging; zero uses the server's maximum scan limit.
-`GetChunkRaw`/`SetChunkRaw` transfer chunk forms, and `DecodeChunk`/`EncodeChunk` convert them.
-Area limits come from `client.ServerInfo()`; multi-request scans are not a snapshot.
-
-## Tables and schema
-
-```go
-err := client.CreateTable(ctx, "scratch", chunkdb.TableSpec{
-    Columns: []chunkdb.ColumnDef{{Name: "v", Type: chunkdb.TypeUint(8), Required: true}},
-    ChunkWidth: 2, ChunkHeight: 2,
-})
-if err != nil { return err }
-if err := client.AddColumn(ctx, "scratch", chunkdb.ColumnDef{Name: "label", Type: chunkdb.TypeText(16), Null: true}); err != nil { return err }
-if err := client.DropTable(ctx, "scratch"); err != nil { return err }
+```output
+lake
+chunks: 1
 ```
 
-`Tables` lists tables, `Describe` refreshes a schema and `Schema` uses the client's cache.
-Chunk and large-chunk geometry is fixed at creation.
-`TableSpec.Options.FeedBufferBytes` and `SlotMaxBytes` set positive per-table byte budgets for the in-memory feed and durable-slot retention. Omitted (zero) fields use the server's configured defaults: normally 64 MiB and 1 GiB. `Describe` reports the effective values in `Schema.Options`; `SetTableOption` changes them using `"feed_buffer_bytes"` or `"slot_max_bytes"`.
-`RenameColumn`, `DropColumn`, `AlterColumnType` and `SetTableOption` change schema or runtime options; the server validates each operation.
-A narrowing conversion uses `ConvertNone`, `ConvertClamp`, `ConvertDefault` or `ConvertTruncate` as appropriate to the type.
-The client invalidates schema caches after its own table statements, including those inside `Migrate`, and refreshes when a typed write detects stale schema.
-`SetChunk` re-encodes once on schema mismatch; `SetChunkRaw` returns `*SchemaMismatchError`.
-Use [named migrations](OPERATIONS.md) for repeatable application startup.
+- `SetChunk` replaces the whole chunk; `Chunk.Present` identifies present blocks.
+- `GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk.
+- Create its first form with `NewChunk(schema)` and an unconditional write.
+- An empty written chunk can retain its version until stored artifacts and cached state are removed.
+- `Schema.Locate` maps block coordinates to chunk and local coordinates, including negative addresses.
+- `GetArea` uses inclusive chunk bounds and returns chunks with present blocks.
+- `GetAreaAround` selects chunks within a radius.
+
+## Scans and schemas
+
+| Method | Result or behavior |
+|---|---|
+| `ScanChunks` | One page ordered by CX, then CY; pass the last coordinate as `after`. |
+| `AllChunks` | Iterates pages; zero uses the server's maximum page size. |
+| `GetChunkRaw`, `SetChunkRaw` | Transfer encoded chunk forms; use `DecodeChunk` and `EncodeChunk` to convert. |
+| `Tables`, `Describe`, `Schema` | List tables, refresh a schema, or use the cached schema. |
+| `CreateTable`, `DropTable` | Create an explicit table or remove it. |
+| `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` | Change columns; narrowing conversions require a supported `Conversion`. |
+| `SetTableOption` | Change runtime options; chunk geometry stays fixed. |
+
+Scans across several requests do not share a snapshot.
+The client refreshes schemas after its own table changes and when a typed write detects stale column sizes.
+`SetChunk` re-encodes once after a schema mismatch; `SetChunkRaw` returns `SchemaMismatchError`.
+
+Coordinates use `int64`; block methods count blocks, while chunk, area, and scan methods count chunks.
+Read request limits through `client.ServerInfo()`.
+`TableOptions.FeedBufferBytes` and `SlotMaxBytes` set positive per-table byte budgets.
+Zero uses server defaults, normally 64 MiB and 1 GiB; `Describe` reports effective values.
+
+Use [Migrations](OPERATIONS.md) for repeatable schema setup.
+See the [package reference](https://pkg.go.dev/github.com/chunkdb/chunkdb-go/v2) for method arguments.

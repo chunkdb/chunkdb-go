@@ -12,6 +12,7 @@ const (
 	DefaultPort = 4242
 	// DefaultTableName is the table a client works on when neither
 	// [Options.Table] nor the URI path names one.
+	// Selecting this name does not create a table.
 	DefaultTableName = "default"
 )
 
@@ -27,10 +28,9 @@ type Options struct {
 
 	Host string
 	Port int
-	// User and Password log in with SCRAM-SHA-256 when a connection opens;
-	// the password never crosses the network. Without a user the client
-	// sends HELLO 3 alone, which only a server started with --auth none
-	// accepts.
+	// User and Password authenticate each connection with SCRAM-SHA-256.
+	// The password never crosses the network.
+	// Omitting User requires a server started with --auth none.
 	User     string
 	Password string
 	// VerifierIterations is the PBKDF2 iteration count of the verifiers
@@ -69,8 +69,7 @@ type Options struct {
 	Table string
 }
 
-// ServerInfo is the server's reply to the HELLO 3 handshake that opens every
-// connection.
+// ServerInfo holds server details and limits established when a connection opens.
 type ServerInfo struct {
 	// Protocol is the protocol version, always 3.
 	Protocol      int

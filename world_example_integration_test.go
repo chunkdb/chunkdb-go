@@ -11,6 +11,18 @@ import (
 )
 
 func TestIntegrationWorldExample(t *testing.T) {
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, after, found := strings.Cut(string(readme), "```output\n")
+	if !found {
+		t.Fatal("README has no world example output")
+	}
+	expected, _, found := strings.Cut(after, "```")
+	if !found {
+		t.Fatal("README world example output has no closing fence")
+	}
 	s := startServer(t, serverConfig{workers: 4})
 	for _, status := range []string{"applied", "skipped"} {
 		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
@@ -22,10 +34,9 @@ func TestIntegrationWorldExample(t *testing.T) {
 			t.Fatalf("world example: %v\n%s", err, output)
 		}
 		t.Logf("world example (%s):\n%s", status, output)
-		for _, want := range []string{"schema: " + status, "area: 4 chunks, 16 blocks written", "block (0,0): tile=1 label=grass", "change (0,0): tile=2 label=water"} {
-			if !strings.Contains(string(output), want) {
-				t.Fatalf("world example missing %q:\n%s", want, output)
-			}
+		want := strings.Replace(expected, "schema: applied", "schema: "+status, 1)
+		if string(output) != want {
+			t.Fatalf("world example output = %q, want README output %q", output, want)
 		}
 	}
 	c := connectIntegration(t, s, nil)

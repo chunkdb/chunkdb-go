@@ -32,27 +32,18 @@ func TxRetries(n int) TxOption {
 	return func(o *txOptions) { o.retries = max(0, n) }
 }
 
-// Transaction runs fn as one transaction and returns the version every chunk
-// it wrote now has, or 0 when it wrote nothing.
+// Transaction runs fn atomically and returns the shared version of written chunks, or zero when nothing changes.
+// Reads use one table snapshot and include the transaction's own writes.
+// All writes apply together when fn returns nil and commit succeeds.
 //
-// It sends BEGIN, runs fn, and sends COMMIT when fn returns nil. The
-// statements of fn's [Tx] read one snapshot of one table and see their own
-// writes; the writes apply together at COMMIT or not at all.
+// A conflict applies no writes and retries fn up to [DefaultTxRetries] times after the first attempt.
+// [TxRetries] changes this limit; exhausted attempts return [ConflictError].
+// Keep external effects outside fn because it can run again, and return statement errors.
+// Other callback errors roll back without retrying; transport failures can leave the outcome unknown.
 //
-// When the server ends the transaction with CONFLICT, at COMMIT or at a
-// statement inside it, nothing was written: Transaction pauses a few
-// milliseconds and runs fn again, up to [DefaultTxRetries] times ([TxRetries]
-// sets the limit), then returns the [*ConflictError]. fn should therefore have
-// no effects other than its statements, and should return the conflict error
-// (or nil) when a statement reports one. When fn returns any other error,
-// Transaction rolls back and returns that error without running fn again.
-// Other statement errors leave the transaction open.
-//
-// The transaction holds the client's connection for its whole duration: it
-// waits for requests already in flight and takes every pipeline slot, so other
-// requests of the client wait until it ends and never run inside it. Use a
-// [Pool] to keep other work going meanwhile. A call of the client's own
-// methods from fn waits until its context is done; use the [Tx].
+// Transaction holds the connection until it ends; other requests on that Client wait.
+// Use only [Tx] methods inside fn; calling the originating Client can wait until its context expires.
+// Use [Pool] to keep other work running.
 func (c *Client) Transaction(ctx context.Context, fn func(tx *Tx) error, opts ...TxOption) (uint64, error) {
 	options := txOptions{retries: DefaultTxRetries}
 	for _, opt := range opts {
@@ -127,22 +118,18 @@ func (c *Client) runTransaction(ctx context.Context, fn func(tx *Tx) error) (uin
 	return tx.commit(ctx)
 }
 
-// Tx is a transaction in progress, passed to the function of
-// [Client.Transaction] or [Pool.Transaction].
+// Tx is a transaction passed to [Client.Transaction] or [Pool.Transaction].
+// Its methods take the same table and data arguments as Client methods.
+// An empty table argument selects the client's default table.
+// The first data statement selects one table; another table is refused without ending the transaction.
 //
-// Its methods are those of [Client] with the same arguments: every statement
-// names its table, "" is the client's default table, and values are typed by
-// the cached schema, which the transaction fetches on its own connection when
-// needed. A transaction covers one table, the one its first statement names;
-// the server refuses a statement on another table and the transaction stays
-// open. Reads see the table as of the transaction's first statement plus the
-// transaction's own writes; [Chunk.Version] is the chunk's version as of that
-// snapshot. Writes return no version: they apply at COMMIT, and
-// [Client.Transaction] returns the version they then have. [IfVersion] is not
-// offered: COMMIT checks every chunk the transaction read or wrote.
+// Reads see the first statement's snapshot plus the transaction's own writes.
+// [Chunk.Version] identifies the chunk state in that snapshot.
+// Writes return no version until commit; [Client.Transaction] returns their shared version.
+// [IfVersion] is unavailable because commit checks every chunk read or written.
 //
-// A Tx is safe for concurrent use; its statements run one at a time. It must
-// not be used after the function returns.
+// A Tx supports concurrent use; its statements run one at a time.
+// Stop using it when fn returns.
 type Tx struct {
 	client *Client
 	// conn is the connection BEGIN was sent on. Every statement goes to it
