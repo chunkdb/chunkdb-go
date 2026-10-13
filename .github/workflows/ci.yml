@@ -52,11 +52,28 @@ jobs:
       - name: Check out chunkdb-go
         uses: actions/checkout@v5
 
-      - name: Check out chunkdb main
+      - name: Select chunkdb branch
+        id: chunkdb-ref
+        shell: bash
+        run: |
+          branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          ref=main
+          if git ls-remote --exit-code --heads https://github.com/chunkdb/chunkdb.git "refs/heads/$branch" > /dev/null; then
+            ref="$branch"
+          else
+            lookup_status=$?
+            if [ "$lookup_status" -ne 2 ]; then
+              echo "Could not look up chunkdb branch $branch" >&2
+              exit "$lookup_status"
+            fi
+          fi
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out chunkdb
         uses: actions/checkout@v5
         with:
           repository: chunkdb/chunkdb
-          ref: main
+          ref: ${{ steps.chunkdb-ref.outputs.ref }}
           path: chunkdb
 
       - name: Set up Go
