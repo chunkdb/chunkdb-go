@@ -110,12 +110,28 @@ func nullableTag(r Reply) ([]byte, error) {
 	return append([]byte{}, r.Bulk...), nil
 }
 
-func (w *Watch) eventSchema(ctx context.Context, version uint64) (*Schema, error) {
-	if schema := w.schemaDetails[version]; schema != nil {
-		return schema, nil
+func (w *Watch) cacheSchema(schema *Schema) {
+	if w.schemas == nil {
+		w.schemas = make(map[watchSchemaKey][]Column)
 	}
-	if columns, ok := w.schemas[version]; ok {
-		return &Schema{Version: version, Dims: 2, Columns: columns}, nil
+	if w.schemaDetails == nil {
+		w.schemaDetails = make(map[watchSchemaKey]*Schema)
+	}
+	key := watchSchemaKey{schema.Epoch, schema.Version}
+	w.schemaDetails[key] = schema
+	w.schemas[key] = schema.Columns
+}
+
+func (w *Watch) eventSchema(ctx context.Context, epoch string, version uint64) (*Schema, error) {
+	// Empty-epoch DESCRIBE is the legacy representation, without epoch proof.
+	// Prefer the actual event epoch whenever the server supplied ownership.
+	for _, key := range []watchSchemaKey{{epoch, version}, {"", version}} {
+		if schema := w.schemaDetails[key]; schema != nil {
+			return schema, nil
+		}
+		if columns, ok := w.schemas[key]; ok {
+			return &Schema{Epoch: key.epoch, Version: version, Dims: 2, Columns: columns}, nil
+		}
 	}
 	schema, err := w.describe(ctx)
 	if err != nil {
@@ -124,11 +140,10 @@ func (w *Watch) eventSchema(ctx context.Context, version uint64) (*Schema, error
 	if schema.Version != version {
 		return nil, protocolErrorf("WATCH", "schema version %d unavailable (DESCRIBE returned %d); resume or rebuild state", version, schema.Version)
 	}
-	if w.schemaDetails == nil {
-		w.schemaDetails = make(map[uint64]*Schema)
+	if schema.Epoch != "" && schema.Epoch != epoch {
+		return nil, protocolErrorf("WATCH", "schema epoch %s unavailable (DESCRIBE returned %s); resume or rebuild state", epoch, schema.Epoch)
 	}
-	w.schemaDetails[version] = schema
-	w.schemas[version] = schema.Columns
+	w.cacheSchema(schema)
 	return schema, nil
 }
 
@@ -165,11 +180,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		if err != nil {
 			return nil, err
 		}
-		if w.schemaDetails == nil {
-			w.schemaDetails = make(map[uint64]*Schema)
-		}
-		w.schemas[version] = columns
-		w.schemaDetails[version] = &Schema{Version: version, Dims: int(dims), Columns: columns, ChunkColumns: chunkColumns}
+		w.cacheSchema(&Schema{Epoch: pos.Epoch, Version: version, Dims: int(dims), Columns: columns, ChunkColumns: chunkColumns})
 		return &SchemaEvent{Position: pos, Version: version, Dims: int(dims), Columns: cloneColumns(columns), ChunkColumns: cloneColumns(chunkColumns)}, nil
 	}
 	if kind == "schema" || (kind == "change" && len(a) == 7) || (kind == "resync" && len(a) == 3) {
@@ -226,7 +237,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		if !ok || a[6].Kind != ReplyArray {
 			return bad()
 		}
-		schema, err := w.eventSchema(ctx, version)
+		schema, err := w.eventSchema(ctx, pos.Epoch, version)
 		if err != nil {
 			return nil, err
 		}

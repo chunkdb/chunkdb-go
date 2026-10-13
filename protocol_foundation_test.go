@@ -323,7 +323,7 @@ func foundationSchemaPush(dims int64) string {
 
 func TestFoundationFeedPrefixes(t *testing.T) {
 	for _, dims := range []int64{2, 3} {
-		w := &Watch{schemas: make(map[uint64][]Column)}
+		w := &Watch{}
 		schemaEvent, err := w.decode(t.Context(), readOne(t, foundationSchemaPush(dims)))
 		if err != nil {
 			t.Fatal(err)
@@ -364,7 +364,7 @@ func TestFoundationFeedPrefixes(t *testing.T) {
 			}
 		}
 	}
-	w := &Watch{schemas: make(map[uint64][]Column)}
+	w := &Watch{}
 	catalog, err := w.decode(t.Context(), readOne(t, push(respBulk("catalog"), respBulk(watchEpoch), respInt(14), respInt(125), respNull, respArray(respMap("kind", respBulk("table"), "action", respBulk("create"), "name", respBulk("world"), "table", respNull, "data", respMap("future", respNull), "extra", respNull)), "(18446744073709551615\r\n", respNull)))
 	if err != nil || *catalog.(*CatalogEvent).Txn != math.MaxUint64 {
 		t.Fatal(catalog, err)

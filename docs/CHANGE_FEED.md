@@ -60,6 +60,8 @@ Use [Slots](SLOTS.md) to resume a durable consumer.
 
 Idle Next waits use the context without a command timeout; cancelling that wait keeps the watch open.
 Lookup or decoding failures end the stream, including unavailable schemas with `ErrProtocol`.
+When DESCRIBE provides an epoch, cached layouts are bound to that epoch and schema version.
+A mismatched fallback description ends decoding with `ErrProtocol`; resume or rebuild state.
 User is nil for anonymous writes; `ChunkOffset` represents coordinates outside int64.
 Close drains within CommandTimeout, using five seconds when that timeout is disabled.
 

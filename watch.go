@@ -91,6 +91,11 @@ type ResyncEvent struct {
 
 func (e *ResyncEvent) GetPosition() Position { return e.Position }
 
+type watchSchemaKey struct {
+	epoch   string
+	version uint64
+}
+
 // Watch owns a dedicated logged-in connection. Next calls are serialized;
 // Close can interrupt a pending Next. Closing the originating Client or Pool
 // does not close a Watch: callers must close each watch themselves.
@@ -102,8 +107,8 @@ type Watch struct {
 	conn           *conn
 	table          string
 	start          Position
-	schemas        map[uint64][]Column
-	schemaDetails  map[uint64]*Schema
+	schemas        map[watchSchemaKey][]Column
+	schemaDetails  map[watchSchemaKey]*Schema
 	pushes         chan Reply
 	closing, done  chan struct{}
 	nextGate       chan struct{}
@@ -162,7 +167,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		statement += " AFTER " + p.Epoch + " " + strconv.FormatUint(p.Revision, 10)
 	}
 	dedicated := c.copyOptions()
-	w := &Watch{client: dedicated, table: name, schemas: make(map[uint64][]Column), schemaDetails: make(map[uint64]*Schema), pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
+	w := &Watch{client: dedicated, table: name, pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
 	w.slot = opts.Slot
 	w.controlGate = make(chan struct{}, 1)
 	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
@@ -172,8 +177,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 	if err != nil {
 		return nil, err
 	}
-	w.schemas[schema.Version] = schema.Columns
-	w.schemaDetails[schema.Version] = schema
+	w.cacheSchema(schema)
 	cn, err := dedicated.connection(ctx)
 	if err != nil {
 		_ = dedicated.Close()
@@ -393,7 +397,7 @@ func (w *Watch) decodeLegacy(ctx context.Context, r Reply) (Event, error) {
 			ids[col.ID] = true
 			columns = append(columns, col)
 		}
-		w.schemas[version] = columns
+		w.cacheSchema(&Schema{Epoch: pos.Epoch, Version: version, Dims: 2, Columns: columns})
 		// Keep cache ownership separate from mutable event values.
 		eventColumns := (&Schema{Columns: columns}).clone().Columns
 		return &SchemaEvent{Position: pos, Version: version, Columns: eventColumns}, nil
@@ -416,18 +420,11 @@ func (w *Watch) decodeLegacy(ctx context.Context, r Reply) (Event, error) {
 		if !ok {
 			return bad()
 		}
-		columns, ok := w.schemas[version]
-		if !ok {
-			schema, err := w.describe(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if schema.Version != version {
-				return nil, protocolErrorf("WATCH", "schema version %d unavailable (DESCRIBE returned %d); resume or rebuild state", version, schema.Version)
-			}
-			columns = schema.Columns
-			w.schemas[version] = columns
+		schema, err := w.eventSchema(ctx, pos.Epoch, version)
+		if err != nil {
+			return nil, err
 		}
+		columns := schema.Columns
 		e := &ChangeEvent{Position: pos, CommitTimeMs: ms, User: user, SchemaVersion: version, Blocks: make([]BlockChange, 0, len(a[6].Array))}
 		for _, item := range a[6].Array {
 			if item.Kind != ReplyArray || len(item.Array) < 4 {

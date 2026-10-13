@@ -136,7 +136,7 @@ func TestFoundationChunksApplicationDeliveryAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &Watch{client: c, slot: "consumer", start: Position{watchEpoch, 10}, delivered: Position{watchEpoch, 10}, schemas: map[uint64][]Column{1: {{ID: 1, Name: "id", Type: TypeUint(8)}}}, pushes: make(chan Reply, 5), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1), controlGate: make(chan struct{}, 1)}
+	w := &Watch{client: c, slot: "consumer", start: Position{watchEpoch, 10}, delivered: Position{watchEpoch, 10}, schemas: map[watchSchemaKey][]Column{{watchEpoch, 1}: {{ID: 1, Name: "id", Type: TypeUint(8)}}}, pushes: make(chan Reply, 5), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1), controlGate: make(chan struct{}, 1)}
 	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 	defer w.ackCancel()
 	w.conn = &conn{client: c, netConn: left, writer: bufio.NewWriter(left)}

@@ -42,6 +42,7 @@ uses protocol 3 (CQL); see the engine's
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ### Fixed
+- Bind WATCH layouts to their described epoch and schema version so table replacement cannot reuse another table's cached columns. (#69).
 - Return nil without an error for never-written typed and raw chunk reads, including pools and transactions; retain versioned empty forms. (#73).
 - Connection errors identify refused addresses and give server, URI scheme, TLS trust and timeout guidance while preserving error types and wrapped causes
 - Typed permission and schema mismatch errors retain server guidance without including it in right or table fields
