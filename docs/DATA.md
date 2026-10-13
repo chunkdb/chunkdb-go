@@ -80,7 +80,7 @@ chunks: 1
 |---|---|
 | `ScanChunks` | One page ordered by CX, then CY; pass the last coordinate as `after`. |
 | `AllChunks` | Iterates pages; zero uses the server's maximum page size. |
-| `GetChunkRaw`, `SetChunkRaw` | Transfer encoded chunk forms; use `DecodeChunk` and `EncodeChunk` to convert. |
+| `GetChunkRaw`, `SetChunkRaw` | Retain encoded forms and write forms whose column types the client knows. |
 | `Tables`, `Describe`, `Schema` | List tables, refresh a schema, or use the cached schema. |
 | `CreateTable`, `DropTable` | Create an explicit table or remove it. |
 | `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` | Change columns; narrowing conversions require a supported `Conversion`. |
@@ -89,6 +89,9 @@ chunks: 1
 Scans across several requests do not share a snapshot.
 The client refreshes schemas after its own table changes and when a typed write detects stale column sizes.
 `SetChunk` re-encodes once after a schema mismatch; `SetChunkRaw` returns `SchemaMismatchError`.
+Raw reads retain forms with unknown column types.
+Raw writes need known column widths for the size check and refuse unknown types or oversized forms before sending.
+Use a client that knows every column type to write those forms.
 
 Coordinates use `int64`; block methods count blocks, while chunk, area, and scan methods count chunks.
 Read request limits through `client.ServerInfo()`.

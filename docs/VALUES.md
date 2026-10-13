@@ -65,3 +65,8 @@ Statements use one line; parameter values can contain CR and LF.
 
 Read server request and area limits through `ServerInfo()`.
 See [Data](DATA.md) for reading values from blocks and chunks.
+
+Unknown column types retain raw bytes in row replies while known neighbors remain typed.
+`GetChunkRaw` retains packed forms without decoding their columns.
+`SetChunkRaw` requires known column types to check its size before sending; unknown types return an error naming the column and type.
+Text and bytes columns are supported with their shared `var_max_chunk_bytes` budget.

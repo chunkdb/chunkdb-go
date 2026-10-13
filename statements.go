@@ -508,7 +508,7 @@ func decodeOrStale(schema *Schema, form []byte, names []string) (*Chunk, error) 
 // chunk form, the named columns or every column, without decoding it.
 // A never-written chunk returns nil, nil; a versioned empty form remains bytes.
 // [Client.SetChunkRaw] writes a form of every column back, to this or another
-// chunk.
+// chunk, when the client knows all column types.
 func (c *Client) GetChunkRaw(ctx context.Context, table string, cx, cy int64, columns ...string) ([]byte, error) {
 	return getChunkRaw(ctx, c, table, cx, cy, columns)
 }
@@ -574,6 +574,9 @@ func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk 
 // reads it, and returns the chunk's new version. The chunk version in the form
 // is not read; a form of another schema version than the table's fails with a
 // [*SchemaMismatchError].
+// The client needs every column's type to check the form's maximum size before
+// sending. Unknown types and oversized forms fail locally; raw reads can still
+// retain forms containing unknown types.
 func (c *Client) SetChunkRaw(ctx context.Context, table string, cx, cy int64, form []byte, opts ...WriteOption) (uint64, error) {
 	reply, err := setChunkRaw(ctx, c, table, cx, cy, form, ifVersionClause(opts))
 	if err != nil {
@@ -591,7 +594,16 @@ func setChunkRaw(ctx context.Context, s session, table string, cx, cy int64, for
 	if form == nil {
 		return Reply{}, requestErrorf(command, "the chunk form is nil")
 	}
-	return setChunkForm(ctx, s, name, cx, cy, form, clause)
+	return withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
+		limit, err := chunkFormLimit(schema)
+		if err != nil {
+			return Reply{}, err
+		}
+		if uint64(len(form)) > limit {
+			return Reply{}, requestErrorf(command, "chunk form for table %s takes at most %d bytes, got %d", name, limit, len(form))
+		}
+		return setChunkForm(ctx, s, name, cx, cy, form, clause)
+	})
 }
 
 func setChunkForm(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string) (Reply, error) {
