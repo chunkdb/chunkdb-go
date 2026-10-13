@@ -57,9 +57,15 @@ jobs:
         shell: bash
         run: |
           branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          requested_ref="refs/heads/$branch"
           ref=main
-          if git ls-remote --exit-code --heads https://github.com/chunkdb/chunkdb.git "refs/heads/$branch" > /dev/null; then
-            ref="$branch"
+          if remote_refs=$(git ls-remote --exit-code --heads https://github.com/chunkdb/chunkdb.git "$requested_ref"); then
+            while IFS=$'\t' read -r remote_oid remote_ref; do
+              if [ "$remote_ref" = "$requested_ref" ]; then
+                ref="$branch"
+                break
+              fi
+            done <<< "$remote_refs"
           else
             lookup_status=$?
             if [ "$lookup_status" -ne 2 ]; then
