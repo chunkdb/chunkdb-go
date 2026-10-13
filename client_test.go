@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -205,7 +206,7 @@ func TestClientServerInfo(t *testing.T) {
 		MaxAreaChunks: 256, MaxResponseBytes: 64 << 20, MaxScanLimit: 1024,
 	}
 	info := client.ServerInfo()
-	if info == nil || *info != want {
+	if info == nil || !reflect.DeepEqual(*info, want) {
 		t.Fatalf("got %+v, want %+v", info, want)
 	}
 	// The result is a copy.
@@ -501,7 +502,7 @@ func TestClientDefaultTable(t *testing.T) {
 		configure func(*Options)
 		want      string
 	}{
-		"default":      {nil, "default"},
+		"unselected":   {nil, ""},
 		"uri path":     {func(o *Options) { o.URI = strings.TrimSuffix(o.URI, "/") + "/terrain" }, "terrain"},
 		"option wins":  {func(o *Options) { o.URI += "terrain"; o.Table = "world" }, "world"},
 		"option alone": {func(o *Options) { o.Table = "world" }, "world"},
@@ -511,6 +512,12 @@ func TestClientDefaultTable(t *testing.T) {
 			client := newTestClient(t, server, testCase.configure)
 			if got := client.DefaultTable(); got != testCase.want {
 				t.Fatalf("got %q, want %q", got, testCase.want)
+			}
+			if testCase.want == "" {
+				if _, err := client.DeleteBlock(t.Context(), "", 0, 0); !errors.Is(err, ErrProtocol) {
+					t.Fatal(err)
+				}
+				return
 			}
 			if _, err := client.DeleteBlock(t.Context(), "", 0, 0); err != nil {
 				t.Fatalf("DeleteBlock: %v", err)

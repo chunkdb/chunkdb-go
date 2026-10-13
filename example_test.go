@@ -112,19 +112,26 @@ func ExampleClient_Watch() {
 		log.Fatal(err)
 	}
 	defer watch.Close()
-	if _, err := client.SetBlock(ctx, "world_go", 0, 0,
-		chunkdb.Record{"tile": 6}); err != nil {
-		log.Fatal(err)
-	}
-	event, err := watch.Next(ctx)
+	version, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 6})
 	if err != nil {
 		log.Fatal(err)
 	}
-	change, ok := event.(*chunkdb.ChangeEvent)
-	if !ok {
-		log.Fatalf("expected a change, got %T", event)
+	for {
+		event, err := watch.Next(ctx)
+		if err != nil {
+			log.Fatal(err)
+		}
+		switch event.(type) {
+		case *chunkdb.ProgressEvent, *chunkdb.SchemaEvent:
+			continue
+		}
+		change, ok := event.(*chunkdb.ChangeEvent)
+		if !ok || change.Position.Epoch != watch.Start().Epoch || change.Position.Revision != version || len(change.Blocks) != 1 {
+			log.Fatalf("expected the written block change, got %#v", event)
+		}
+		fmt.Println("tile:", change.Blocks[0].After["tile"])
+		break
 	}
-	fmt.Println("tile:", change.Blocks[0].After["tile"])
 	if err := watch.Close(); err != nil {
 		log.Fatal(err)
 	}
@@ -144,8 +151,8 @@ func ExampleClient_CreateSlot() {
 		log.Fatal(err)
 	}
 	defer watch.Close()
-	if _, err := client.SetBlock(ctx, "world_go", 0, 0,
-		chunkdb.Record{"tile": 7}); err != nil {
+	version, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 7})
+	if err != nil {
 		log.Fatal(err)
 	}
 	for {
@@ -153,12 +160,13 @@ func ExampleClient_CreateSlot() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if _, ok := event.(*chunkdb.SchemaEvent); ok {
+		switch event.(type) {
+		case *chunkdb.ProgressEvent, *chunkdb.SchemaEvent:
 			continue
 		}
 		change, ok := event.(*chunkdb.ChangeEvent)
-		if !ok {
-			log.Fatalf("rebuild consumer state after %T", event)
+		if !ok || change.Position.Epoch != watch.Start().Epoch || change.Position.Revision != version || len(change.Blocks) != 1 {
+			log.Fatalf("expected the written change; rebuild after resync: %#v", event)
 		}
 		fmt.Println("apply:", change.Blocks[0].After["tile"])
 		if err := watch.Ack(ctx, change.Position.Revision); err != nil {

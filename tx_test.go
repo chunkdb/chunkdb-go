@@ -197,7 +197,7 @@ func TestTransactionRollsBackOnACallbackError(t *testing.T) {
 	}
 }
 
-func TestTransactionDoesNotRetryMigrationConflict(t *testing.T) {
+func TestTransactionDoesNotRetryMigrationMismatch(t *testing.T) {
 	for _, priorTransactionConflict := range []bool{false, true} {
 		t.Run(strconv.FormatBool(priorTransactionConflict), func(t *testing.T) {
 			server, state := newTxServer(t)
@@ -205,7 +205,7 @@ func TestTransactionDoesNotRetryMigrationConflict(t *testing.T) {
 				state.replies["GET BLOCK"] = []string{conflictReply}
 			}
 			client := newTestClient(t, server, nil)
-			migrationServer := newFakeServer(t, respondWith("-ERR CONFLICT migration 'create_world' has a different statement\r\n"))
+			migrationServer := newFakeServer(t, respondWith("-ERR MIGRATION_MISMATCH migration 'create_world' has a different statement\r\n"))
 			migrator := newTestClient(t, migrationServer, nil)
 			attempts := 0
 			_, err := client.Transaction(t.Context(), func(tx *Tx) error {
@@ -219,8 +219,9 @@ func TestTransactionDoesNotRetryMigrationConflict(t *testing.T) {
 				return fmt.Errorf("application startup: %w", err)
 			})
 			var migration *MigrationError
+			var mismatch *Error
 			var transaction *ConflictError
-			if attempts != 1 || !errors.Is(err, ErrConflict) || !errors.As(err, &migration) || errors.As(err, &transaction) {
+			if attempts != 1 || !isServerCode(err, CodeMigrationMismatch) || errors.Is(err, ErrConflict) || !errors.As(err, &mismatch) || mismatch.RetryClass != RetryFatal || !errors.As(err, &migration) || errors.As(err, &transaction) {
 				t.Fatal(attempts, err)
 			}
 			want := []string{"BEGIN", "ROLLBACK"}
@@ -347,13 +348,13 @@ func TestTransactionWithoutWritesHasNoVersion(t *testing.T) {
 		t.Fatalf("got %v, want a protocol error", err)
 	}
 
-	// A malformed CONFLICT reply is a protocol error.
+	// CONFLICT classification depends on its code, even without diagnostics.
 	if _, err := client.Do(t.Context(), "COMMIT"); err != nil {
 		t.Fatalf("COMMIT: %v", err)
 	}
 	state.commits = []string{"-ERR CONFLICT\r\n"}
-	if _, err := client.Do(t.Context(), "COMMIT"); !errors.Is(err, ErrProtocol) || errors.Is(err, ErrConflict) {
-		t.Fatalf("got %v, want a protocol error", err)
+	if _, err := client.Do(t.Context(), "COMMIT"); !errors.Is(err, ErrConflict) || errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want a conflict", err)
 	}
 }
 

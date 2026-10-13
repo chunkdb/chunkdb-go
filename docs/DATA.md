@@ -80,7 +80,7 @@ chunks: 1
 |---|---|
 | `ScanChunks` | One page ordered by CX, then CY; pass the last coordinate as `after`. |
 | `AllChunks` | Iterates pages; zero uses the server's maximum page size. |
-| `GetChunkRaw`, `SetChunkRaw` | Transfer encoded chunk forms; use `DecodeChunk` and `EncodeChunk` to convert. |
+| `GetChunkRaw`, `SetChunkRaw` | Retain encoded forms and write forms whose column types the client knows. |
 | `Tables`, `Describe`, `Schema` | List tables, refresh a schema, or use the cached schema. |
 | `CreateTable`, `DropTable` | Create an explicit table or remove it. |
 | `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` | Change columns; narrowing conversions require a supported `Conversion`. |
@@ -89,6 +89,9 @@ chunks: 1
 Scans across several requests do not share a snapshot.
 The client refreshes schemas after its own table changes and when a typed write detects stale column sizes.
 `SetChunk` re-encodes once after a schema mismatch; `SetChunkRaw` returns `SchemaMismatchError`.
+Raw reads retain forms with unknown column types.
+Raw writes need known column widths for the size check and refuse unknown types or oversized forms before sending.
+Use a client that knows every column type to write those forms.
 
 Coordinates use `int64`; block methods count blocks, while chunk, area, and scan methods count chunks.
 Read request limits through `client.ServerInfo()`.
@@ -97,3 +100,22 @@ Zero uses server defaults, normally 64 MiB and 1 GiB; `Describe` reports effecti
 
 Use [Migrations](OPERATIONS.md) for repeatable schema setup.
 See the [package reference](https://pkg.go.dev/github.com/chunkdb/chunkdb-go/v2) for method arguments.
+
+## Read metadata
+
+`GetBlockWithMetadata` returns a BlockRead with Record, nullable Version and SchemaVersion.
+`GetBlockWithOptions` selects individual metadata fields with ReadOptions.WithVersion and WithSchema.
+An absent block with a retained commit retains its version.
+A never-written chunk, collected empty chunk without a retained commit, or transaction-private modified chunk has a nil Version.
+The schema version remains available for absent rows.
+
+`GetAreaWithSchema` returns AreaRead.Chunks and SchemaVersion, including for an empty area.
+Client, Tx and Pool expose these helpers.
+Rows and requested metadata share the server's read boundary; area reads retain their existing consistency across chunks.
+DESCRIBE supplies Schema.Epoch, Revision, Dims and ChunkColumns independently of Schema.Version.
+Revision is a nullable completed frontier: read-only opens return nil because the writer frontier is unknown.
+A numeric zero is a known frontier; never substitute zero for nil.
+
+Unknown column types retain their type name and decode row/default values as raw bytes.
+Known neighboring columns remain typed.
+Typed legacy chunk forms with unknown-width columns fail explicitly; use raw forms or a projection of known columns.

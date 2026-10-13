@@ -15,6 +15,61 @@ const varEntryHeaderBytes = 12
 // chunk form.
 const formHeaderBytes = 16
 
+// chunkFormLimit matches the server's full legacy form parameter bound.
+// Variable columns use their shared byte budget rather than a fixed width.
+func chunkFormLimit(schema *Schema) (uint64, error) {
+	const command = "SET CHUNK"
+	if schema.Dims != 0 && schema.Dims != 2 {
+		return 0, requestErrorf(command, "raw chunk writes support 2 dimensions, got %d", schema.Dims)
+	}
+	if schema.ChunkWidth <= 0 || schema.ChunkHeight <= 0 {
+		return 0, requestErrorf(command, "invalid chunk geometry for table %s", schema.Table)
+	}
+	width, height := uint64(schema.ChunkWidth), uint64(schema.ChunkHeight)
+	overflow := func() (uint64, error) {
+		return 0, requestErrorf(command, "chunk form size overflows uint64 for table %s", schema.Table)
+	}
+	if width > math.MaxUint64/height {
+		return overflow()
+	}
+	count := width * height
+	bytesForBits := func(bits uint64) uint64 {
+		return bits/8 + min(bits%8, 1)
+	}
+	presence := bytesForBits(count)
+	limit := uint64(formHeaderBytes) + presence
+	for _, column := range schema.Columns {
+		if column.Type.Kind == ColumnUnknown {
+			return 0, requestErrorf(command, "cannot write raw chunk: column %s has unknown type %s", column.Name, column.Type.RawType)
+		}
+		if err := column.Type.validate(); err != nil {
+			return 0, annotate(command, err)
+		}
+		bits, fixed := column.Type.fixedWidth()
+		if !fixed {
+			continue
+		}
+		if count > math.MaxUint64/uint64(bits) {
+			return overflow()
+		}
+		section := bytesForBits(count * uint64(bits))
+		if column.Null {
+			if section > math.MaxUint64-presence {
+				return overflow()
+			}
+			section += presence
+		}
+		if section > math.MaxUint64-limit {
+			return overflow()
+		}
+		limit += section
+	}
+	if schema.Options.VarMaxChunkBytes > math.MaxUint64-limit {
+		return overflow()
+	}
+	return limit + schema.Options.VarMaxChunkBytes, nil
+}
+
 // Chunk is a decoded chunk form: its version, the schema version it was
 // encoded for, which blocks are present, and the values of its columns.
 //
@@ -126,6 +181,13 @@ func DecodeChunk(schema *Schema, form []byte, columns ...string) (*Chunk, error)
 	if err != nil {
 		return nil, err
 	}
+	for _, index := range indexes {
+		col := schema.Columns[index]
+		if col.Type.Kind == ColumnUnknown {
+			return nil, protocolErrorf("", "cannot decode legacy chunk form with unknown column type %s; use raw chunk APIs or known-column reads", col.Type.RawType)
+		}
+	}
+
 	bad := func(format string, args ...any) (*Chunk, error) {
 		return nil, protocolErrorf("", "chunk form of table "+schema.Table+": "+format, args...)
 	}
@@ -318,6 +380,12 @@ func writeFixed(t ColumnType, section []byte, off, width int, value any) {
 // it takes the column's default, else zero or empty, and is an error in a
 // REQUIRED column without a default.
 func EncodeChunk(schema *Schema, chunk *Chunk) ([]byte, error) {
+	for _, col := range schema.Columns {
+		if col.Type.Kind == ColumnUnknown {
+			return nil, protocolErrorf("", "cannot decode or encode legacy chunk form with unknown column type %s; use raw chunk APIs or known-column reads", col.Type.RawType)
+		}
+	}
+
 	if chunk == nil {
 		return nil, requestErrorf("", "the chunk is nil")
 	}

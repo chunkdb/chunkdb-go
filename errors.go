@@ -3,6 +3,8 @@ package chunkdb
 import (
 	"errors"
 	"fmt"
+	"maps"
+	neturl "net/url"
 	"strconv"
 	"strings"
 )
@@ -63,8 +65,7 @@ var (
 	// ErrPermissionDenied matches a statement refused because the user lacks
 	// the right it needs. The error is a [*PermissionDeniedError].
 	ErrPermissionDenied = errors.New("chunkdb: permission denied")
-	// ErrConflict matches CONFLICT: a failed transaction ([*ConflictError]),
-	// or a migration name already used for different statement text ([*Error]).
+	// ErrConflict matches CONFLICT: a failed transaction ([*ConflictError]).
 	ErrConflict = errors.New("chunkdb: transaction conflict")
 )
 
@@ -93,8 +94,7 @@ const (
 	// CodeSchemaMismatch: SET CHUNK of a form encoded for another schema
 	// version than the table's; nothing changed. See [SchemaMismatchError].
 	CodeSchemaMismatch = "SCHEMA_MISMATCH"
-	// CodeConflict: a transaction conflict (see [ConflictError]), or a
-	// migration name already used for different statement text.
+	// CodeConflict: a transaction conflict (see [ConflictError]).
 	CodeConflict = "CONFLICT"
 	// CodeNoTable: the table does not exist.
 	CodeNoTable = "NO_TABLE"
@@ -103,8 +103,7 @@ const (
 	// CodeBadRequest: the request could not be framed; the server closes the
 	// connection, and so does the client.
 	CodeBadRequest = "BAD_REQUEST"
-	// CodeBusy: the server has no room for the connection, or the slot is
-	// already being watched.
+	// CodeBusy: the server has no room for the connection.
 	CodeBusy = "BUSY"
 	// CodeSlotLost: a durable slot exceeded its retention limit.
 	CodeSlotLost = "SLOT_LOST"
@@ -113,6 +112,57 @@ const (
 	// A migration recovery error requires a server restart before retrying
 	// the same named step; its outcome may also be unknown.
 	CodeInternal = "INTERNAL"
+)
+
+// RetryClass describes the action appropriate for a server rejection.
+// It depends only on the error code, never its message.
+type RetryClass string
+
+const (
+	RetryFatal          RetryClass = "fatal"
+	RetryReread         RetryClass = "reread"
+	RetryRerun          RetryClass = "rerun"
+	RetryBackoff        RetryClass = "backoff"
+	RetryUnknownOutcome RetryClass = "unknown_outcome"
+)
+
+// RetryClassForCode classifies known and future server error codes.
+func RetryClassForCode(code string) RetryClass {
+	switch code {
+	case CodeVersionMismatch, CodeConditionFailed, CodeSchemaMismatch:
+		return RetryReread
+	case CodeConflict:
+		return RetryRerun
+	case CodeBusy, CodeDiskFull, CodeRateLimited:
+		return RetryBackoff
+	case CodeOutcomeUnknown:
+		return RetryUnknownOutcome
+	default:
+		return RetryFatal
+	}
+}
+
+// ErrorMetadata exposes known keys without discarding unknown diagnostic keys.
+// Numeric pointers are nil when missing or outside the uint64 domain.
+type ErrorMetadata struct {
+	Reason, Table, Column, Epoch, Stage                             string
+	Current, Expected, Actual, Revision, ConnectionID, RetryAfterMS *uint64
+}
+
+const (
+	CodeConditionFailed = "CONDITION_FAILED"
+	CodeDiskFull        = "DISK_FULL"
+	CodeRateLimited     = "RATE_LIMITED"
+	CodeOutcomeUnknown  = "OUTCOME_UNKNOWN"
+	// CodeMigrationMismatch: a recorded migration name has different statement text.
+	CodeMigrationMismatch = "MIGRATION_MISMATCH"
+	// CodeSlotBusy: a durable slot already has an active watcher.
+	CodeSlotBusy       = "SLOT_BUSY"
+	CodeCheckFailed    = "CHECK_FAILED"
+	CodeCancelled      = "CANCELLED"
+	CodeTimeout        = "TIMEOUT"
+	CodeKilled         = "KILLED"
+	CodeUnknownCommand = "UNKNOWN_COMMAND"
 )
 
 // Error is the error type returned by every operation in this package.
@@ -128,7 +178,11 @@ type Error struct {
 	// They are empty unless Kind is [KindServer] or [KindAuth].
 	ServerCode    string
 	ServerMessage string
-	Err           error
+	// ServerKeys retains all structured keys, including unknown ones.
+	ServerKeys map[string]string
+	RetryClass RetryClass
+	Metadata   ErrorMetadata
+	Err        error
 }
 
 func (e *Error) Error() string {
@@ -304,6 +358,7 @@ func serverError(phase Phase, command, code, message string) *Error {
 		Message:       text,
 		ServerCode:    code,
 		ServerMessage: message,
+		RetryClass:    RetryClassForCode(code),
 	}
 }
 
@@ -311,32 +366,42 @@ func serverError(phase Phase, command, code, message string) *Error {
 // [*VersionMismatchError] for VERSION_MISMATCH, a [*SchemaMismatchError] for
 // SCHEMA_MISMATCH, a [*PermissionDeniedError] for PERMISSION_DENIED, a
 // [*ConflictError] for transaction CONFLICT, an [*Error] otherwise (including
-// migration CONFLICT).
+// errors returned by MIGRATE).
 func replyError(phase Phase, command string, reply Reply) error {
+	keys := reply.Keys
+	if keys == nil {
+		keys, reply.Message = parseErrorKeys(reply.Message)
+	}
 	base := serverError(phase, command, reply.Code, reply.Message)
+	base.ServerKeys = maps.Clone(keys)
+	base.Metadata = errorMetadata(keys)
 	if reply.Code == CodePermissionDenied {
 		// "<right> on <table>", or "MANAGES USERS".
 		details, _, _ := strings.Cut(reply.Message, "; ")
 		right, table, _ := strings.Cut(details, " on ")
+		if value, ok := keys["right"]; ok {
+			right = value
+		}
+		if value, ok := keys["table"]; ok {
+			table = value
+		}
 		return &PermissionDeniedError{Right: right, Table: table, Err: base}
 	}
 	if reply.Code == CodeConflict && command != "MIGRATE" {
 		// "<reason> <message>".
-		reason, _, _ := strings.Cut(reply.Message, " ")
-		if reason == "" {
-			return protocolErrorf(command, "malformed %s reply: %q", reply.Code, reply.Message)
+		reason, ok := keys["reason"]
+		if !ok {
+			reason, _, _ = strings.Cut(reply.Message, " ")
 		}
 		return &ConflictError{Reason: reason, Err: base}
 	}
 	if reply.Code != CodeVersionMismatch && reply.Code != CodeSchemaMismatch {
 		return base
 	}
-	// "current=<v>", then for SCHEMA_MISMATCH an explanation.
-	first, _, _ := strings.Cut(reply.Message, " ")
-	text, found := strings.CutPrefix(first, "current=")
+	text, found := keys["current"]
 	current, err := strconv.ParseUint(text, 10, 64)
 	if !found || err != nil {
-		return protocolErrorf(command, "malformed %s reply: %q", reply.Code, reply.Message)
+		return protocolErrorf(command, "malformed %s current metadata", reply.Code)
 	}
 	if reply.Code == CodeSchemaMismatch {
 		return &SchemaMismatchError{Current: current, Err: base}
@@ -368,4 +433,32 @@ func closedError(command string) *Error {
 func isServerCode(err error, code string) bool {
 	var typed *Error
 	return errors.As(err, &typed) && typed.ServerCode == code
+}
+
+// parseErrorKeys stops at the first non-key token, retaining free text verbatim.
+func parseErrorKeys(message string) (map[string]string, string) {
+	keys := make(map[string]string)
+	for message != "" {
+		token, rest, _ := strings.Cut(message, " ")
+		key, value, found := strings.Cut(token, "=")
+		if !found || key == "" {
+			break
+		}
+		if decoded, err := neturl.PathUnescape(value); err == nil {
+			value = decoded
+		}
+		keys[key] = value
+		message = strings.TrimLeft(rest, " ")
+	}
+	return keys, message
+}
+
+func errorMetadata(keys map[string]string) ErrorMetadata {
+	m := ErrorMetadata{Reason: keys["reason"], Table: keys["table"], Column: keys["column"], Epoch: keys["epoch"], Stage: keys["stage"]}
+	for key, dest := range map[string]**uint64{"current": &m.Current, "expected": &m.Expected, "actual": &m.Actual, "revision": &m.Revision, "connection_id": &m.ConnectionID, "retry_after_ms": &m.RetryAfterMS} {
+		if value, err := strconv.ParseUint(keys[key], 10, 64); err == nil {
+			*dest = &value
+		}
+	}
+	return m
 }

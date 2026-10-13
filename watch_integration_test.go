@@ -1,9 +1,11 @@
 package chunkdb
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestIntegrationWatch(t *testing.T) {
@@ -37,12 +39,12 @@ func TestIntegrationWatch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			e := nextWatch(t, w).(*ChangeEvent)
+			e := nextExpectedWatch(t, w, "change", first, 1).(*ChangeEvent)
 			if e.Position.Revision != first || e.Position.Epoch != start.Epoch || e.User == nil || *e.User != testAdmin || len(e.Blocks) != 1 || e.Blocks[0].Before != nil || e.Blocks[0].After["v"] != uint64(1) {
 				t.Fatal(e)
 			}
 			last := e.Position
-			e = nextWatch(t, w).(*ChangeEvent)
+			e = nextExpectedWatch(t, w, "change", second, 1, last).(*ChangeEvent)
 			if e.Position.Revision != second || e.Blocks[0].Before["v"] != uint64(1) || e.Blocks[0].After["v"] != uint64(2) {
 				t.Fatal(e)
 			}
@@ -52,7 +54,7 @@ func TestIntegrationWatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer resumed.Close()
-			if nextWatch(t, resumed).(*ChangeEvent).Position.Revision != second {
+			if nextExpectedWatch(t, resumed, "change", second, 1, last).(*ChangeEvent).Position.Revision != second {
 				t.Fatal("resume lost retained change")
 			}
 			if err := resumed.Close(); err != nil {
@@ -61,14 +63,19 @@ func TestIntegrationWatch(t *testing.T) {
 			if err := c.AddColumn(t.Context(), "watched", ColumnDef{Name: "label", Type: TypeText(16), Null: true}); err != nil {
 				t.Fatal(err)
 			}
-			schema := nextWatch(t, w).(*SchemaEvent)
+			described, err := c.Describe(t.Context(), "watched")
+			if err != nil || described.Revision == nil {
+				t.Fatal(described, err)
+			}
+			schema := nextExpectedWatch(t, w, "schema", *described.Revision, described.Version, Position{start.Epoch, second}).(*SchemaEvent)
 			if len(schema.Columns) != 2 || schema.Columns[1].Name != "label" {
 				t.Fatal(schema)
 			}
-			if _, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": 3, "label": "new"}); err != nil {
+			third, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": 3, "label": "new"})
+			if err != nil {
 				t.Fatal(err)
 			}
-			e = nextWatch(t, w).(*ChangeEvent)
+			e = nextExpectedWatch(t, w, "change", third, schema.Version, Position{start.Epoch, second}).(*ChangeEvent)
 			if e.SchemaVersion != schema.Version || !reflect.DeepEqual(e.Blocks[0].Before, Record{"v": uint64(2), "label": nil}) || e.Blocks[0].After["label"] != "new" {
 				t.Fatal(e)
 			}
@@ -84,14 +91,34 @@ func TestIntegrationWatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer fresh.Close()
-			if nextWatch(t, fresh).(*ResyncEvent).Position.Epoch != start.Epoch {
+			// WATCH AFTER returns the requested position; resync carries the
+			// completed producer frontier, which can include reserved-clock gaps.
+			// No mutation occurs between this DESCRIBE and the resync assertion.
+			frontier, err := c.Describe(t.Context(), "watched")
+			if err != nil || frontier.Revision == nil || frontier.Epoch != start.Epoch || frontier.Version != schema.Version || *frontier.Revision < third {
+				t.Fatal("completed frontier for resync", frontier, err)
+			}
+			resync := nextExpectedWatch(t, fresh, "resync", *frontier.Revision, frontier.Version).(*ResyncEvent)
+			if resync.Position.Epoch != start.Epoch {
 				t.Fatal("resync epoch")
 			}
 			if err := c.DropTable(t.Context(), "watched"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := fresh.Next(t.Context()); !isServerCode(err, CodeNoTable) {
-				t.Fatal(err)
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			for {
+				event, err := fresh.Next(ctx)
+				if err != nil {
+					if !isServerCode(err, CodeNoTable) {
+						t.Fatal("waiting for NO_TABLE after drop", err)
+					}
+					break
+				}
+				progress, ok := event.(*ProgressEvent)
+				if !ok || progress.Position.Epoch != start.Epoch || progress.Position.Revision != resync.Position.Revision {
+					t.Fatalf("unexpected event while waiting for NO_TABLE: %#v", event)
+				}
 			}
 		})
 	}
@@ -113,20 +140,22 @@ func TestIntegrationPoolWatch(t *testing.T) {
 	if err := pool.Ping(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.SetBlock(t.Context(), "watched", 0, 0, Record{"v": -3}); err != nil {
+	first, err := pool.SetBlock(t.Context(), "watched", 0, 0, Record{"v": -3})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if nextWatch(t, w).(*ChangeEvent).Blocks[0].After["v"] != int64(-3) {
+	if nextExpectedWatch(t, w, "change", first, 1).(*ChangeEvent).Blocks[0].After["v"] != int64(-3) {
 		t.Fatal("pool change")
 	}
 	if err := pool.Close(); err != nil {
 		t.Fatal(err)
 	}
 	// The stream owns its connections independently of the originating pool.
-	if _, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": -4}); err != nil {
+	second, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": -4})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if nextWatch(t, w).(*ChangeEvent).Blocks[0].After["v"] != int64(-4) {
+	if nextExpectedWatch(t, w, "change", second, 1, Position{w.Start().Epoch, first}).(*ChangeEvent).Blocks[0].After["v"] != int64(-4) {
 		t.Fatal("closed pool interrupted watch")
 	}
 	if _, err := pool.Watch(t.Context(), "watched", WatchOptions{}); !errors.Is(err, ErrClosed) {
@@ -143,10 +172,11 @@ func TestIntegrationWatchLinger(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	if _, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": 1}); err != nil {
+	firstRevision, err := c.SetBlock(t.Context(), "watched", 0, 0, Record{"v": 1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	first, ok := nextWatch(t, w).(*ChangeEvent)
+	first, ok := nextExpectedWatch(t, w, "change", firstRevision, 1).(*ChangeEvent)
 	if !ok {
 		t.Fatal("first write did not produce a change")
 	}
@@ -162,7 +192,7 @@ func TestIntegrationWatchLinger(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resumed.Close()
-	event := nextWatch(t, resumed)
+	event := nextExpectedWatch(t, resumed, "change", version, 1, first.Position)
 	change, ok := event.(*ChangeEvent)
 	if !ok || change.Position.Revision != version || change.Blocks[0].Before["v"] != uint64(1) || change.Blocks[0].After["v"] != uint64(2) {
 		t.Fatalf("default linger lost the disconnected write: %#v", event)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"math"
+	"math/big"
 	"strconv"
 	"strings"
 )
@@ -45,6 +46,8 @@ const (
 	ReplyMap
 	// ReplyPush carries an unsolicited WATCH event.
 	ReplyPush
+	// ReplyBigNumber holds an exact integer of arbitrary size.
+	ReplyBigNumber
 )
 
 // Reply is one decoded server reply. Only the fields belonging to Kind are
@@ -56,6 +59,10 @@ type Reply struct {
 	// Code and Message are the parts of a [ReplyError].
 	Code    string
 	Message string
+	// Keys contains percent-decoded structured error metadata.
+	Keys map[string]string
+	// BigNumber holds the value of a ReplyBigNumber.
+	BigNumber *big.Int
 	// Double is the value of a [ReplyDouble].
 	Double float64
 	// Bool is the value of a [ReplyBoolean].
@@ -81,6 +88,12 @@ type MapEntry struct {
 
 // Int64 returns the value of a [ReplyInteger] and whether it fits an int64.
 func (r Reply) Int64() (int64, bool) {
+	if r.Kind == ReplyBigNumber {
+		if r.BigNumber == nil || !r.BigNumber.IsInt64() {
+			return 0, false
+		}
+		return r.BigNumber.Int64(), true
+	}
 	if r.Kind != ReplyInteger {
 		return 0, false
 	}
@@ -100,10 +113,31 @@ func (r Reply) Int64() (int64, bool) {
 // Uint64 returns the value of a [ReplyInteger] and whether it fits a uint64.
 // Values of uN columns above the int64 range are read this way.
 func (r Reply) Uint64() (uint64, bool) {
+	if r.Kind == ReplyBigNumber {
+		if r.BigNumber == nil || !r.BigNumber.IsUint64() {
+			return 0, false
+		}
+		return r.BigNumber.Uint64(), true
+	}
 	if r.Kind != ReplyInteger || (r.negative && r.magnitude != 0) {
 		return 0, false
 	}
 	return r.magnitude, true
+}
+
+// BigInt returns a copy of either integer representation, without narrowing.
+func (r Reply) BigInt() (*big.Int, bool) {
+	if r.Kind == ReplyBigNumber && r.BigNumber != nil {
+		return new(big.Int).Set(r.BigNumber), true
+	}
+	if r.Kind != ReplyInteger {
+		return nil, false
+	}
+	n := new(big.Int).SetUint64(r.magnitude)
+	if r.negative {
+		n.Neg(n)
+	}
+	return n, true
 }
 
 // Lookup returns the value of a [ReplyMap] whose key is the bulk or simple
@@ -129,6 +163,9 @@ func integerReply(negative bool, magnitude uint64) Reply {
 func encodeRequest(command, statement string, params [][]byte) ([]byte, error) {
 	if strings.ContainsAny(statement, "\r\n") {
 		return nil, requestErrorf(command, "a statement is one line: it must not contain CR or LF")
+	}
+	if count := parameterOccurrences(statement); count != len(params) {
+		return nil, requestErrorf(command, "statement has %d parameter occurrences, got %d frames", count, len(params))
 	}
 	size := len(statement) + 2
 	for _, param := range params {
@@ -175,10 +212,26 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 
 	case '-':
 		code, message := splitErrorLine(line)
-		return Reply{Kind: ReplyError, Code: code, Message: message}, nil
+		keys, message := parseErrorKeys(message)
+		return Reply{Kind: ReplyError, Code: code, Message: message, Keys: keys}, nil
 
 	case ':':
 		return parseInteger(line)
+	case '(':
+		digits := strings.TrimPrefix(line, "-")
+		if digits == "" {
+			return Reply{}, protocolErrorf("", "invalid big number: %q", line)
+		}
+		for _, c := range digits {
+			if c < '0' || c > '9' {
+				return Reply{}, protocolErrorf("", "invalid big number: %q", line)
+			}
+		}
+		number, ok := new(big.Int).SetString(line, 10)
+		if !ok {
+			return Reply{}, protocolErrorf("", "invalid big number: %q", line)
+		}
+		return Reply{Kind: ReplyBigNumber, BigNumber: number}, nil
 
 	case ',':
 		value, err := parseDouble(line)
@@ -333,4 +386,31 @@ func readReplyLine(r *bufio.Reader) (string, error) {
 	}
 	line := strings.TrimSuffix(string(buf), "\n")
 	return strings.TrimSuffix(line, "\r"), nil
+}
+
+// parameterOccurrences counts frames without depending on statement grammar.
+func parameterOccurrences(statement string) int {
+	count := 0
+	for i := 0; i < len(statement); i++ {
+		if quote := statement[i]; quote == '\'' || quote == '"' {
+			for i++; i < len(statement); i++ {
+				if statement[i] != quote {
+					continue
+				}
+				if i+1 < len(statement) && statement[i+1] == quote {
+					i++
+					continue
+				}
+				break
+			}
+			continue
+		}
+		if statement[i] == '$' && i+1 < len(statement) && statement[i+1] >= '0' && statement[i+1] <= '9' {
+			count++
+			for i+1 < len(statement) && statement[i+1] >= '0' && statement[i+1] <= '9' {
+				i++
+			}
+		}
+	}
+	return count
 }

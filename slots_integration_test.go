@@ -6,18 +6,6 @@ import (
 	"time"
 )
 
-func nextSlotChange(t *testing.T, w *Watch) *ChangeEvent {
-	t.Helper()
-	for {
-		e := nextWatch(t, w)
-		if change, ok := e.(*ChangeEvent); ok {
-			return change
-		}
-		if _, ok := e.(*SchemaEvent); !ok {
-			t.Fatalf("unexpected event %#v", e)
-		}
-	}
-}
 func TestIntegrationSlotsResume(t *testing.T) {
 	for _, secure := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plain", true: "tls"}[secure], func(t *testing.T) {
@@ -43,14 +31,14 @@ func TestIntegrationSlotsResume(t *testing.T) {
 			if w.Start() != (Position{listed[0].Epoch, listed[0].Acked}) {
 				t.Fatal(w.Start(), listed)
 			}
-			if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !isServerCode(err, CodeBusy) {
+			if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !isServerCode(err, CodeSlotBusy) {
 				t.Fatal(err)
 			}
 			first, err := c.SetBlock(t.Context(), "slotted", 0, 0, Record{"v": 1})
 			if err != nil {
 				t.Fatal(err)
 			}
-			e := nextSlotChange(t, w)
+			e := nextExpectedWatch(t, w, "change", first, 1).(*ChangeEvent)
 			if e.Position.Revision != first || e.Blocks[0].After["v"] != uint64(1) {
 				t.Fatal(e)
 			}
@@ -87,12 +75,12 @@ func TestIntegrationSlotsResume(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer resumed.Close()
-			e = nextSlotChange(t, resumed)
+			e = nextExpectedWatch(t, resumed, "change", second, 1).(*ChangeEvent)
 			if e.Position.Revision != second || e.SchemaVersion != 1 || len(e.Blocks[0].Before) != 1 || e.Blocks[0].Before["v"] != uint64(1) || e.Blocks[0].After["v"] != uint64(2) {
 				t.Fatal(e)
 			}
 			saved := e.Position
-			e = nextSlotChange(t, resumed)
+			e = nextExpectedWatch(t, resumed, "change", third, 2, saved).(*ChangeEvent)
 			if e.Position.Revision != third || e.SchemaVersion != 2 || e.Blocks[0].After["label"] != "new" {
 				t.Fatal(e)
 			}
@@ -107,7 +95,7 @@ func TestIntegrationSlotsResume(t *testing.T) {
 			if after.Start() != saved {
 				t.Fatal(after.Start(), saved)
 			}
-			e = nextSlotChange(t, after)
+			e = nextExpectedWatch(t, after, "change", third, 2).(*ChangeEvent)
 			if e.Position.Revision != third {
 				t.Fatal(e)
 			}
