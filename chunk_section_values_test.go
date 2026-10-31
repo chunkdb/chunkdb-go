@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -90,8 +91,8 @@ func TestTypedSectionedMetadataAndCombinedVariableBudget(t *testing.T) {
 		t.Fatalf("metadata %+v / columns %+v", chunk.Metadata, chunk.Columns)
 	}
 	schema.Options.VarMaxChunkBytes = 25
-	if _, err := decodeSectionedChunk(schema, sectionFixture(sections)); err == nil {
-		t.Fatal("combined variable budget ignored")
+	if _, err := decodeSectionedChunk(schema, sectionFixture(sections)); err != nil {
+		t.Fatalf("stored values became unreadable after lowering the write quota: %v", err)
 	}
 	sections[4].body = metadataSection(false)
 	schema.Options.VarMaxChunkBytes = 14
@@ -122,6 +123,41 @@ func TestChunkLocalThreeDimensionalOrder(t *testing.T) {
 	cx, cy, cz, x, y, z := schema.Locate3D(-1, -3, -5)
 	if cx != -1 || cy != -2 || cz != -3 || x != 1 || y != 1 || z != 1 {
 		t.Fatalf("negative address: %d,%d,%d / %d,%d,%d", cx, cy, cz, x, y, z)
+	}
+}
+
+func TestSectionedReadUsesCombinedHardVariableLimit(t *testing.T) {
+	const hard = 64 * 1024 * 1024
+	schema := &Schema{Table: "t", Dims: 2, Version: 7, ChunkWidth: 1, ChunkHeight: 1,
+		Columns:      []Column{{ID: 1, Name: "n", Type: TypeUint(1)}, {ID: 2, Name: "data", Type: TypeBytes(hard)}},
+		ChunkColumns: []Column{{ID: 3, Name: "title", Type: TypeBytes(1), Null: true}}}
+	schema.Options.VarMaxChunkBytes = 25
+	spans := make([]byte, 28)
+	for i, field := range []uint32{1, 1, 1, 0, 1, 0, 0} {
+		binary.LittleEndian.PutUint32(spans[4*i:], field)
+	}
+	vars := make([]byte, hard-12)
+	binary.LittleEndian.PutUint32(vars, 2)
+	binary.LittleEndian.PutUint32(vars[8:], uint32(len(vars)-12))
+	row := make([]byte, 20)
+	binary.LittleEndian.PutUint32(row, 1)
+	binary.LittleEndian.PutUint32(row[4:], 3)
+	binary.LittleEndian.PutUint32(row[12:], 20)
+	sections := []chunkFormSection{{1, []byte{1}}, {2, []byte{0}}, {4, vars}, {5, row}, {6, spans}}
+	chunk, err := decodeSectionedChunk(schema, sectionFixture(sections))
+	if err != nil || len(chunk.Columns["data"][0].([]byte)) != hard-24 {
+		t.Fatalf("exact combined hard limit rejected: %v", err)
+	}
+	// A nullable empty value costs 12 bytes, and one byte makes the sum overflow.
+	row = append(row, 0)
+	binary.LittleEndian.PutUint32(row[16:], 1)
+	sections[3].body = row
+	if _, err := decodeSectionedChunk(schema, sectionFixture(sections)); err == nil || !strings.Contains(err.Error(), "hard byte limit") {
+		t.Fatalf("combined hard limit ignored: %v", err)
+	}
+	sections[2].body = make([]byte, hard+1)
+	if _, err := decodeSectionedChunk(schema, sectionFixture(sections)); err == nil || !strings.Contains(err.Error(), "hard byte limit") {
+		t.Fatalf("raw variable hard limit ignored: %v", err)
 	}
 }
 

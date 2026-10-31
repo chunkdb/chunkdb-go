@@ -7,6 +7,8 @@ import (
 	"unicode/utf8"
 )
 
+const maxSectionedVariableBytes = 64 * 1024 * 1024
+
 func sectionedGeometry(schema *Schema) (int, int, error) {
 	if schema == nil || (schema.Dims != 0 && schema.Dims != 2 && schema.Dims != 3) {
 		return 0, 0, protocolErrorf("", "invalid chunk dimensions")
@@ -149,6 +151,10 @@ func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chun
 	if len(metadata) != len(schema.ChunkColumns) {
 		return bad("chunk metadata differs from schema")
 	}
+	vars := form.section(sectionVariable)
+	if len(vars) > maxSectionedVariableBytes {
+		return bad("variable data exceeds its hard byte limit")
+	}
 	chunk := &Chunk{Version: form.header.version, SchemaVersion: form.header.schema, CommitTimeMS: form.header.commitTime,
 		Projected: form.header.flags&chunkFormProjected != 0, Private: form.header.flags&chunkFormPrivate != 0,
 		Width: schema.ChunkWidth, Height: schema.ChunkHeight, Depth: depth,
@@ -182,7 +188,6 @@ func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chun
 			}
 		}
 	}
-	vars := form.section(sectionVariable)
 	varBytes := uint64(len(vars))
 	var lastID, lastBlock uint32
 	first := true
@@ -240,8 +245,9 @@ func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chun
 			varBytes += 12 + uint64(len(entry.value))
 		}
 	}
-	if schema.Options.VarMaxChunkBytes != 0 && varBytes > schema.Options.VarMaxChunkBytes {
-		return bad("combined variable data exceeds the table byte limit")
+	// A lowered table quota does not invalidate already stored values.
+	if varBytes > maxSectionedVariableBytes {
+		return bad("combined variable data exceeds its hard byte limit")
 	}
 	for _, section := range form.sections {
 		if section.kind < sectionPresence || section.kind > sectionBlockSpans {
