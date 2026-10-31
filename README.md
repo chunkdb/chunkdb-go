@@ -1,5 +1,8 @@
 # chunkdb-go
 
+[![CI](https://github.com/chunkdb/chunkdb-go/actions/workflows/ci.yml/badge.svg)](https://github.com/chunkdb/chunkdb-go/actions/workflows/ci.yml)
+[![Go reference](https://pkg.go.dev/badge/github.com/chunkdb/chunkdb-go/v2.svg)](https://pkg.go.dev/github.com/chunkdb/chunkdb-go/v2)
+
 Go client for [chunkdb](https://github.com/chunkdb/chunkdb), a storage engine for typed grid data.
 You need Go 1.25 or newer; the client uses only the standard library.
 
