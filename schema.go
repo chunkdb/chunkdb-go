@@ -37,12 +37,15 @@ type Schema struct {
 	Version uint64
 	// Columns are in schema order.
 	Columns []Column
-	// ChunkWidth and ChunkHeight are the blocks of a chunk.
+	// ChunkWidth, ChunkHeight and ChunkDepth are the blocks on each axis.
+	// ChunkDepth is one for a two-dimensional table.
 	ChunkWidth  int
 	ChunkHeight int
-	// LargeWidth and LargeHeight are the chunks of a large chunk.
+	ChunkDepth  int
+	// LargeWidth, LargeHeight and LargeDepth are the chunks on each axis.
 	LargeWidth  int
 	LargeHeight int
+	LargeDepth  int
 	Options     TableOptions
 }
 
@@ -59,7 +62,30 @@ func (s *Schema) columnIndex(name string) int {
 }
 
 // BlockCount is the blocks of one chunk.
-func (s *Schema) BlockCount() int { return s.ChunkWidth * s.ChunkHeight }
+func (s *Schema) BlockCount() int {
+	depth := 1
+	if s.Dims == 3 {
+		depth = s.ChunkDepth
+	}
+	if s.ChunkWidth <= 0 || s.ChunkHeight <= 0 || depth <= 0 ||
+		s.ChunkWidth > 4096 || s.ChunkHeight > 4096 || depth > 4096 {
+		return 0
+	}
+	count := uint64(s.ChunkWidth) * uint64(s.ChunkHeight) * uint64(depth)
+	if count > 1048576 {
+		return 0
+	}
+	return int(count)
+}
+
+// Locate3D returns the chunk and local block coordinates, with floor
+// division for negative coordinates of a three-dimensional table.
+func (s *Schema) Locate3D(x, y, z int64) (cx, cy, cz int64, lx, ly, lz int) {
+	cx, lx = floorDivMod(x, int64(s.ChunkWidth))
+	cy, ly = floorDivMod(y, int64(s.ChunkHeight))
+	cz, lz = floorDivMod(z, int64(s.ChunkDepth))
+	return
+}
 
 // Locate returns the chunk holding block (x, y) and the block's local
 // coordinates in it, as [Chunk.Index] takes them.
@@ -192,6 +218,31 @@ func parseSchema(reply Reply) (*Schema, error) {
 	}
 	if schema.LargeWidth, schema.LargeHeight, err = parsePair(reply, "large"); err != nil {
 		return nil, err
+	}
+	schema.ChunkDepth, schema.LargeDepth = 1, 1
+	if schema.Dims == 3 {
+		for _, axis := range []struct {
+			key         string
+			destination *int
+		}{{"chunk", &schema.ChunkDepth}, {"large", &schema.LargeDepth}} {
+			axes, _ := reply.Lookup(axis.key)
+			if len(axes.Array) < 3 {
+				return bad(axis.key + " depth")
+			}
+			depth, valid := axes.Array[2].Int64()
+			if !valid || depth <= 0 || depth > 1<<31 {
+				return bad(axis.key + " depth")
+			}
+			*axis.destination = int(depth)
+		}
+	}
+	if schema.BlockCount() == 0 {
+		return bad("chunk geometry")
+	}
+	for _, side := range []int{schema.LargeWidth, schema.LargeHeight, schema.LargeDepth} {
+		if side <= 0 || side > 1000000 {
+			return bad("large geometry")
+		}
 	}
 
 	options, ok := reply.Lookup("options")

@@ -84,6 +84,18 @@ type Chunk struct {
 	SchemaVersion uint64
 	Width         int
 	Height        int
+	Depth         int
+	// CommitTimeMS is the producing commit's Unix time in milliseconds.
+	CommitTimeMS uint64
+	// Projected names a block-column projection; metadata is always complete.
+	Projected bool
+	// Private marks transaction-local state without a producing commit.
+	Private bool
+	// Metadata holds the values of the table's chunk columns.
+	Metadata Record
+	// UnknownSections retains opaque transport sections from a read.
+	// EncodeChunk refuses them instead of silently republishing unknown data.
+	UnknownSections map[uint16][]byte
 	// Present has one entry per block.
 	Present []bool
 	// Columns maps a column name to one value per block, in the Go types
@@ -102,18 +114,32 @@ func NewChunk(schema *Schema) *Chunk {
 		Present: make([]bool, count),
 		Columns: make(map[string][]any, len(schema.Columns)),
 	}
+	if schema.Dims == 3 {
+		chunk.Depth = schema.ChunkDepth
+	} else {
+		chunk.Depth = 1
+	}
 	for _, column := range schema.Columns {
 		chunk.Columns[column.Name] = make([]any, count)
 	}
 	return chunk
 }
 
+// Index3D returns x + Width*(y + Height*z), with x varying fastest.
+func (c *Chunk) Index3D(lx, ly, lz int) int { return lx + c.Width*(ly+c.Height*lz) }
+
 // Index returns the block index of local coordinates (lx, ly).
 func (c *Chunk) Index(lx, ly int) int { return ly*c.Width + lx }
 
 // Block returns the values of block (lx, ly), or nil when it is absent.
 func (c *Chunk) Block(lx, ly int) Record {
-	i := c.Index(lx, ly)
+	return c.blockAt(c.Index(lx, ly))
+}
+
+// Block3D returns one local block, or nil when absent.
+func (c *Chunk) Block3D(lx, ly, lz int) Record { return c.blockAt(c.Index3D(lx, ly, lz)) }
+
+func (c *Chunk) blockAt(i int) Record {
 	if !c.Present[i] {
 		return nil
 	}
@@ -127,7 +153,15 @@ func (c *Chunk) Block(lx, ly int) Record {
 // SetBlock makes block (lx, ly) present and sets the given columns. A column
 // that is not given keeps its value; see [EncodeChunk] for nil values.
 func (c *Chunk) SetBlock(lx, ly int, values Record) {
-	i := c.Index(lx, ly)
+	c.setBlockAt(c.Index(lx, ly), values)
+}
+
+// SetBlock3D creates or updates one local block.
+func (c *Chunk) SetBlock3D(lx, ly, lz int, values Record) {
+	c.setBlockAt(c.Index3D(lx, ly, lz), values)
+}
+
+func (c *Chunk) setBlockAt(i int, values Record) {
 	c.Present[i] = true
 	for name, value := range values {
 		column, ok := c.Columns[name]
@@ -141,7 +175,13 @@ func (c *Chunk) SetBlock(lx, ly int, values Record) {
 
 // DeleteBlock makes block (lx, ly) absent and clears its values.
 func (c *Chunk) DeleteBlock(lx, ly int) {
-	i := c.Index(lx, ly)
+	c.deleteBlockAt(c.Index(lx, ly))
+}
+
+// DeleteBlock3D clears one local block and all of its column values.
+func (c *Chunk) DeleteBlock3D(lx, ly, lz int) { c.deleteBlockAt(c.Index3D(lx, ly, lz)) }
+
+func (c *Chunk) deleteBlockAt(i int) {
 	c.Present[i] = false
 	for _, values := range c.Columns {
 		values[i] = nil

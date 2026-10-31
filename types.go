@@ -188,14 +188,19 @@ type ColumnDef struct {
 // TableSpec describes a new table for [Client.CreateTable].
 type TableSpec struct {
 	Columns []ColumnDef
+	// ChunkColumns describes one row of values attached to each chunk.
+	ChunkColumns []ColumnDef
 	// ChunkWidth and ChunkHeight are the blocks of a chunk; both are
 	// required.
 	ChunkWidth  int
 	ChunkHeight int
+	// ChunkDepth selects three dimensions when positive; zero selects two.
+	ChunkDepth int
 	// LargeWidth and LargeHeight are the chunks of a large chunk (one file
 	// group on disk); zero takes the server's default.
 	LargeWidth  int
 	LargeHeight int
+	LargeDepth  int
 	Options     TableOptions
 }
 
