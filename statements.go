@@ -94,11 +94,26 @@ func (c *Client) tableName(command, table string) (string, error) {
 	return table, nil
 }
 
-func ifVersionClause(opts []WriteOption) string {
-	if v := resolveWriteOptions(opts).ifVersion; v != nil {
-		return " IF VERSION " + strconv.FormatUint(*v, 10)
+func writeClause(command string, opts []WriteOption, chunk bool) (string, error) {
+	options := resolveWriteOptions(opts)
+	if options.ifAbsent {
+		if !chunk || options.ifVersion != nil {
+			return "", requestErrorf(command, "IF ABSENT needs a chunk write without IF VERSION")
+		}
+		return " IF ABSENT", nil
 	}
-	return ""
+	if options.ifVersion != nil {
+		return " IF VERSION " + strconv.FormatUint(*options.ifVersion, 10), nil
+	}
+	return "", nil
+}
+
+func coordinatePoint(x, y int64, z ...int64) string {
+	point := coord(x) + " " + coord(y)
+	for _, axis := range z {
+		point += " " + coord(axis)
+	}
+	return point
 }
 
 func columnsClause(names []string) string {
@@ -299,12 +314,12 @@ func (c *Client) GetBlock(ctx context.Context, table string, x, y int64, columns
 	return getBlock(ctx, c, table, x, y, columns)
 }
 
-func getBlock(ctx context.Context, s session, table string, x, y int64, columns []string) (Record, error) {
-	result, err := getBlockWithOptions(ctx, s, table, x, y, ReadOptions{}, columns)
+func getBlock(ctx context.Context, s session, table string, x, y int64, columns []string, z ...int64) (Record, error) {
+	result, err := getBlockWithOptions(ctx, s, table, x, y, ReadOptions{}, columns, z...)
 	return result.Record, err
 }
 
-func getBlockWithOptions(ctx context.Context, s session, table string, x, y int64, opts ReadOptions, columns []string) (BlockRead, error) {
+func getBlockWithOptions(ctx context.Context, s session, table string, x, y int64, opts ReadOptions, columns []string, z ...int64) (BlockRead, error) {
 	const command = "GET BLOCK"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -319,7 +334,7 @@ func getBlockWithOptions(ctx context.Context, s session, table string, x, y int6
 			return BlockRead{}, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := s.call(ctx, "GET BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+columnsClause(names)+opts.clauses(), nil)
+		reply, err := s.call(ctx, "GET BLOCK "+coordinatePoint(x, y, z...)+" FROM "+name+columnsClause(names)+opts.clauses(), nil)
 		if err != nil {
 			if isNoColumn(err) {
 				return BlockRead{}, &staleSchemaError{err: err}
@@ -369,7 +384,11 @@ func getBlockWithOptions(ctx context.Context, s session, table string, x, y int6
 // answer BAD_REQUEST and close the connection; that write fails, and the next
 // statement uses a fresh schema.
 func (c *Client) SetBlock(ctx context.Context, table string, x, y int64, values Record, opts ...WriteOption) (uint64, error) {
-	reply, err := setBlock(ctx, c, table, x, y, values, ifVersionClause(opts))
+	clause, err := writeClause("SET BLOCK", opts, false)
+	if err != nil {
+		return 0, err
+	}
+	reply, err := setBlock(ctx, c, table, x, y, values, clause)
 	if err != nil {
 		return 0, err
 	}
@@ -378,7 +397,7 @@ func (c *Client) SetBlock(ctx context.Context, table string, x, y int64, values 
 
 // setBlock sends SET BLOCK with the clause after the assignments, and returns
 // its reply.
-func setBlock(ctx context.Context, s session, table string, x, y int64, values Record, clause string) (Reply, error) {
+func setBlock(ctx context.Context, s session, table string, x, y int64, values Record, clause string, z ...int64) (Reply, error) {
 	const command = "SET BLOCK"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -393,7 +412,7 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 	}
 	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
 		var statement strings.Builder
-		statement.WriteString("SET BLOCK " + coord(x) + " " + coord(y) + " IN " + name + " ")
+		statement.WriteString("SET BLOCK " + coordinatePoint(x, y, z...) + " IN " + name + " ")
 		params := make([][]byte, 0, len(names))
 		for i, columnName := range names {
 			column, ok := schema.Column(columnName)
@@ -439,19 +458,23 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 // DeleteBlock deletes block (x, y) of table ("" is the default table) and
 // returns the chunk's version after it.
 func (c *Client) DeleteBlock(ctx context.Context, table string, x, y int64, opts ...WriteOption) (uint64, error) {
-	reply, err := deleteBlock(ctx, c, table, x, y, ifVersionClause(opts))
+	clause, err := writeClause("DELETE BLOCK", opts, false)
+	if err != nil {
+		return 0, err
+	}
+	reply, err := deleteBlock(ctx, c, table, x, y, clause)
 	if err != nil {
 		return 0, err
 	}
 	return versionOf(reply, "DELETE BLOCK")
 }
 
-func deleteBlock(ctx context.Context, s session, table string, x, y int64, clause string) (Reply, error) {
+func deleteBlock(ctx context.Context, s session, table string, x, y int64, clause string, z ...int64) (Reply, error) {
 	name, err := s.tableName("DELETE BLOCK", table)
 	if err != nil {
 		return Reply{}, err
 	}
-	return s.call(ctx, "DELETE BLOCK "+coord(x)+" "+coord(y)+" FROM "+name+clause, nil)
+	return s.call(ctx, "DELETE BLOCK "+coordinatePoint(x, y, z...)+" FROM "+name+clause, nil)
 }
 
 // GetChunk reads chunk (cx, cy) of table ("" is the default table), decoded
@@ -462,7 +485,7 @@ func (c *Client) GetChunk(ctx context.Context, table string, cx, cy int64, colum
 	return getChunk(ctx, c, table, cx, cy, columns)
 }
 
-func getChunk(ctx context.Context, s session, table string, cx, cy int64, columns []string) (*Chunk, error) {
+func getChunk(ctx context.Context, s session, table string, cx, cy int64, columns []string, z ...int64) (*Chunk, error) {
 	const command = "GET CHUNK"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -477,7 +500,7 @@ func getChunk(ctx context.Context, s session, table string, cx, cy int64, column
 			return nil, &staleSchemaError{err: err, local: true}
 		}
 		names := columnNames(schema, indexes)
-		reply, err := s.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(names), nil)
+		reply, err := s.call(ctx, "GET CHUNK "+coordinatePoint(cx, cy, z...)+" FROM "+name+columnsClause(names), nil)
 		if err != nil {
 			if isNoColumn(err) {
 				return nil, &staleSchemaError{err: err}
@@ -490,6 +513,13 @@ func getChunk(ctx context.Context, s session, table string, cx, cy int64, column
 		form, err := expectBulk(reply, command)
 		if err != nil {
 			return nil, err
+		}
+		if len(z) != 0 {
+			chunk, err := decodeSectionedChunk(schema, form, names...)
+			if isMalformed(err) {
+				return nil, &staleSchemaError{err: err}
+			}
+			return chunk, err
 		}
 		return decodeOrStale(schema, form, names)
 	})
@@ -513,7 +543,7 @@ func (c *Client) GetChunkRaw(ctx context.Context, table string, cx, cy int64, co
 	return getChunkRaw(ctx, c, table, cx, cy, columns)
 }
 
-func getChunkRaw(ctx context.Context, s session, table string, cx, cy int64, columns []string) ([]byte, error) {
+func getChunkRaw(ctx context.Context, s session, table string, cx, cy int64, columns []string, z ...int64) ([]byte, error) {
 	const command = "GET CHUNK"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -522,7 +552,7 @@ func getChunkRaw(ctx context.Context, s session, table string, cx, cy int64, col
 	if err := checkNames(command, "column", columns...); err != nil {
 		return nil, err
 	}
-	reply, err := s.call(ctx, "GET CHUNK "+coord(cx)+" "+coord(cy)+" FROM "+name+columnsClause(columns), nil)
+	reply, err := s.call(ctx, "GET CHUNK "+coordinatePoint(cx, cy, z...)+" FROM "+name+columnsClause(columns), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -542,25 +572,35 @@ func getChunkRaw(ctx context.Context, s session, table string, cx, cy int64, col
 // chunk again and sends it once more. A chunk whose columns no longer match the
 // table's then fails to encode.
 func (c *Client) SetChunk(ctx context.Context, table string, cx, cy int64, chunk *Chunk, opts ...WriteOption) (uint64, error) {
-	reply, err := setChunk(ctx, c, table, cx, cy, chunk, ifVersionClause(opts))
+	clause, err := writeClause("SET CHUNK", opts, true)
+	if err != nil {
+		return 0, err
+	}
+	reply, err := setChunk(ctx, c, table, cx, cy, chunk, clause)
 	if err != nil {
 		return 0, err
 	}
 	return versionOf(reply, "SET CHUNK")
 }
 
-func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk *Chunk, clause string) (Reply, error) {
+func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk *Chunk, clause string, z ...int64) (Reply, error) {
 	const command = "SET CHUNK"
 	name, err := s.tableName(command, table)
 	if err != nil {
 		return Reply{}, err
 	}
 	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
-		form, err := EncodeChunk(schema, chunk)
+		var form []byte
+		var err error
+		if len(z) != 0 {
+			form, err = encodeSectionedChunk(schema, chunk)
+		} else {
+			form, err = EncodeChunk(schema, chunk)
+		}
 		if err != nil {
 			return Reply{}, err
 		}
-		reply, err := setChunkForm(ctx, s, name, cx, cy, form, clause)
+		reply, err := setChunkForm(ctx, s, name, cx, cy, form, clause, z...)
 		if errors.Is(err, ErrSchemaMismatch) {
 			return Reply{}, &staleSchemaError{err: err}
 		}
@@ -578,14 +618,18 @@ func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk 
 // sending. Unknown types and oversized forms fail locally; raw reads can still
 // retain forms containing unknown types.
 func (c *Client) SetChunkRaw(ctx context.Context, table string, cx, cy int64, form []byte, opts ...WriteOption) (uint64, error) {
-	reply, err := setChunkRaw(ctx, c, table, cx, cy, form, ifVersionClause(opts))
+	clause, err := writeClause("SET CHUNK", opts, true)
+	if err != nil {
+		return 0, err
+	}
+	reply, err := setChunkRaw(ctx, c, table, cx, cy, form, clause)
 	if err != nil {
 		return 0, err
 	}
 	return versionOf(reply, "SET CHUNK")
 }
 
-func setChunkRaw(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string) (Reply, error) {
+func setChunkRaw(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string, z ...int64) (Reply, error) {
 	const command = "SET CHUNK"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -595,19 +639,30 @@ func setChunkRaw(ctx context.Context, s session, table string, cx, cy int64, for
 		return Reply{}, requestErrorf(command, "the chunk form is nil")
 	}
 	return withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
-		limit, err := chunkFormLimit(schema)
+		var limit uint64
+		var err error
+		if len(z) != 0 {
+			limit, err = sectionedChunkFormLimit(schema)
+		} else {
+			limit, err = chunkFormLimit(schema)
+		}
 		if err != nil {
 			return Reply{}, err
 		}
 		if uint64(len(form)) > limit {
 			return Reply{}, requestErrorf(command, "chunk form for table %s takes at most %d bytes, got %d", name, limit, len(form))
 		}
-		return setChunkForm(ctx, s, name, cx, cy, form, clause)
+		if len(z) != 0 {
+			if _, err := parseSectionedForm(form, limit, true); err != nil {
+				return Reply{}, err
+			}
+		}
+		return setChunkForm(ctx, s, name, cx, cy, form, clause, z...)
 	})
 }
 
-func setChunkForm(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string) (Reply, error) {
-	return s.call(ctx, "SET CHUNK "+coord(cx)+" "+coord(cy)+" IN "+table+" $1"+clause, [][]byte{form})
+func setChunkForm(ctx context.Context, s session, table string, cx, cy int64, form []byte, clause string, z ...int64) (Reply, error) {
+	return s.call(ctx, "SET CHUNK "+coordinatePoint(cx, cy, z...)+" IN "+table+" $1"+clause, [][]byte{form})
 }
 
 // GetArea reads the chunks from (cx0, cy0) to (cx1, cy1) of table ("" is the

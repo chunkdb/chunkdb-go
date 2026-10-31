@@ -70,7 +70,8 @@ Rebuild your consumer state, drop the lost slot, and create it again before resu
 
 See [Change feed](CHANGE_FEED.md) for events and [server recovery](https://github.com/chunkdb/chunkdb/blob/main/docs/FEED_RESUME.md) for lost slots.
 
-`CreateSlotWithOptions` persists Area, Columns, NoBefore and Chunks filters.
+`CreateSlotWithOptions` persists Area or Area3D, Columns, NoBefore and Chunks filters.
+Area3D uses explicit three-axis lower and upper corners; supplying both area forms is refused before sending.
 Omitted watch filters inherit the slot's filters; explicitly supplied filters must match.
 Changing filters requires a different slot, and IfNotExists also checks the existing filters.
 Dropping a projected column makes the slot lost instead of broadening its projection.
