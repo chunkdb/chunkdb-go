@@ -88,11 +88,12 @@ func TestIntegrationMigrationsConcurrentAndConflict(t *testing.T) {
 			conflicting := []Migration{steps[0], {"add_label", "ALTER  TABLE world ADD COLUMN label text(16) NULL"}, {"later", "CREATE TABLE later (v u8) CHUNK 2 x 2"}}
 			got, err := p.Migrate(t.Context(), conflicting)
 			var failed *MigrationError
-			if !reflect.DeepEqual(got, []MigrationResult{{"create_world", "skipped"}}) || !errors.Is(err, ErrConflict) || !errors.As(err, &failed) || failed.Name != "add_label" || failed.Index != 1 {
+			var mismatch *Error
+			if !reflect.DeepEqual(got, []MigrationResult{{"create_world", "skipped"}}) || !isServerCode(err, CodeMigrationMismatch) || errors.Is(err, ErrConflict) || !errors.As(err, &mismatch) || mismatch.RetryClass != RetryFatal || !errors.As(err, &failed) || failed.Name != "add_label" || failed.Index != 1 {
 				t.Fatal(got, err)
 			}
 			if _, err := c.Describe(t.Context(), "later"); !isServerCode(err, CodeNoTable) {
-				t.Fatal("step after conflict was run", err)
+				t.Fatal("step after migration mismatch was run", err)
 			}
 			if got, err := c.Migrate(t.Context(), steps); err != nil || !reflect.DeepEqual(got, []MigrationResult{{"create_world", "skipped"}, {"add_label", "skipped"}}) {
 				t.Fatal(got, err)

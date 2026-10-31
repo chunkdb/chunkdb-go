@@ -10,9 +10,8 @@ const (
 	defaultHost = "127.0.0.1"
 	// DefaultPort is the chunkdb server port used when a URI omits one.
 	DefaultPort = 4242
-	// DefaultTableName is the table a client works on when neither
-	// [Options.Table] nor the URI path names one.
-	// Selecting this name does not create a table.
+	// DefaultTableName is a conventional table name retained for compatibility.
+	// Clients never select it implicitly.
 	DefaultTableName = "default"
 )
 
@@ -21,6 +20,9 @@ const (
 // Explicit fields win over values taken from URI. A zero Host, Port, User or
 // Password falls back to URI and then to the package default.
 type Options struct {
+	// SessionOptions negotiates HELLO WITH keys. Unknown keys are reported as not applied.
+	SessionOptions map[string]any
+
 	// URI is a chunk:// or chunks:// endpoint, optionally carrying the user
 	// and password as its userinfo component
 	// (chunk://user:password@host:4242/) and the default table as its path.
@@ -64,13 +66,22 @@ type Options struct {
 
 	// Table is the client's default table: the one a method uses when its
 	// table argument is "". Empty means the URI path
-	// (chunk://host:4242/terrain), then [DefaultTableName]. Every statement
+	// (chunk://host:4242/terrain). Without either, table methods require
+	// an explicit table argument. Every statement
 	// names its table on the wire.
 	Table string
 }
 
 // ServerInfo holds server details and limits established when a connection opens.
 type ServerInfo struct {
+	ConnectionID uint64
+	Features     []string
+	// Options contains effective applied values; NotApplied maps other requested keys to reasons.
+	Options       map[string]Reply
+	NotApplied    map[string]string
+	IdleTimeoutMS uint64
+	Limits        ServerLimits
+
 	// Protocol is the protocol version, always 3.
 	Protocol      int
 	ServerVersion string

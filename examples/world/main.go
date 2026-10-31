@@ -59,19 +59,27 @@ func run() error {
 		return err
 	}
 	defer watch.Close()
-	if _, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 2, "label": "water"}); err != nil {
+	version, err := client.SetBlock(ctx, "world_go", 0, 0, chunkdb.Record{"tile": 2, "label": "water"})
+	if err != nil {
 		return err
 	}
 	watchCtx, stopWatching := context.WithTimeout(ctx, 5*time.Second)
 	defer stopWatching()
-	event, err := watch.Next(watchCtx)
-	if err != nil {
-		return err
+	for {
+		event, err := watch.Next(watchCtx)
+		if err != nil {
+			return fmt.Errorf("waiting for the world write at revision %d: %w", version, err)
+		}
+		switch event.(type) {
+		case *chunkdb.ProgressEvent, *chunkdb.SchemaEvent:
+			continue
+		}
+		change, ok := event.(*chunkdb.ChangeEvent)
+		if !ok || change.Position.Epoch != watch.Start().Epoch || change.Position.Revision != version || len(change.Blocks) != 1 {
+			return fmt.Errorf("expected the written block change, got %#v", event)
+		}
+		fmt.Printf("change (0,0): tile=%v label=%v\n", change.Blocks[0].After["tile"], change.Blocks[0].After["label"])
+		break
 	}
-	change, ok := event.(*chunkdb.ChangeEvent)
-	if !ok || len(change.Blocks) != 1 {
-		return fmt.Errorf("expected one block change, got %T", event)
-	}
-	fmt.Printf("change (0,0): tile=%v label=%v\n", change.Blocks[0].After["tile"], change.Blocks[0].After["label"])
 	return watch.Close()
 }

@@ -95,26 +95,8 @@ func (s *fakeServer) acceptLoop() {
 	}
 }
 
-// parameterCount is the highest $n of a statement, outside quotes.
-func parameterCount(statement string) int {
-	count := 0
-	quoted := false
-	for i := 0; i < len(statement); i++ {
-		switch {
-		case statement[i] == '\'':
-			quoted = !quoted
-		case statement[i] == '$' && !quoted:
-			end := i + 1
-			for end < len(statement) && statement[end] >= '0' && statement[end] <= '9' {
-				end++
-			}
-			if n, err := strconv.Atoi(statement[i+1 : end]); err == nil && n > count {
-				count = n
-			}
-		}
-	}
-	return count
-}
+// parameterCount follows the framing contract even for rejected statements.
+func parameterCount(statement string) int { return parameterOccurrences(statement) }
 
 func (s *fakeServer) serve(conn net.Conn) {
 	defer func() {

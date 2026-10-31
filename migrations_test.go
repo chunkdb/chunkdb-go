@@ -40,10 +40,10 @@ func TestMigrateStatementsAndPool(t *testing.T) {
 	}
 }
 
-func TestMigrateStopsAndPreservesConflict(t *testing.T) {
+func TestMigrateStopsAndPreservesMismatch(t *testing.T) {
 	s := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
 		if strings.Contains(command, "'changed'") {
-			writeServerError(conn, "ERR CONFLICT migration 'changed' has a different statement")
+			writeServerError(conn, "ERR MIGRATION_MISMATCH migration 'changed' has a different statement")
 		} else {
 			writeSimple(conn, "applied")
 		}
@@ -53,7 +53,7 @@ func TestMigrateStopsAndPreservesConflict(t *testing.T) {
 	var step *MigrationError
 	var underlying *Error
 	var transaction *ConflictError
-	if !reflect.DeepEqual(got, []MigrationResult{{"first", "applied"}}) || !errors.As(err, &step) || step.Index != 1 || step.Name != "changed" || !errors.Is(err, ErrConflict) || !errors.Is(err, ErrServer) || !errors.As(err, &underlying) || underlying.ServerCode != CodeConflict || errors.As(err, &transaction) {
+	if !reflect.DeepEqual(got, []MigrationResult{{"first", "applied"}}) || !errors.As(err, &step) || step.Index != 1 || step.Name != "changed" || errors.Is(err, ErrConflict) || !errors.Is(err, ErrServer) || !errors.As(err, &underlying) || underlying.ServerCode != CodeMigrationMismatch || underlying.RetryClass != RetryFatal || errors.As(err, &transaction) {
 		t.Fatal(got, err)
 	}
 	if len(s.commands()) != 3 || strings.Contains(s.lastCommand(t), "later") {

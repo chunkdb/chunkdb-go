@@ -14,7 +14,8 @@
 // A fresh server has no tables.
 // Run examples/world in the repository to create a table, write blocks, read an area, and watch a change.
 // [Client.CreateTable] creates tables directly; [Client.Migrate] provides repeatable named schema steps.
-// Table methods use [Options.Table], the URI path, then [DefaultTableName] when their table argument is empty.
+// An empty table argument uses [Options.Table] or the URI path.
+// Without either selection, pass a table name explicitly; [DefaultTableName] is only a conventional name.
 //
 // # Values and versions
 //

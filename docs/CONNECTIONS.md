@@ -31,12 +31,13 @@ connected
 | Setting | Behavior |
 |---|---|
 | `chunk://`, `chunks://` | Plain TCP or TLS; port defaults to 4242. |
-| URI path | Selects the default table; `Options.Table` overrides it. |
-| Empty table argument | Uses `Options.Table`, the URI path, then the name `default`. |
+| URI path | Selects a table for empty table arguments; `Options.Table` overrides it. |
+| Empty table argument | Uses `Options.Table` or the URI path; requires an explicit argument if neither selects a table. |
 | Explicit Host, Port, User, Password | Nonempty values override URI values. |
 | No credentials | Requires a server started with `--auth none`. |
 
 Selecting a table does not create it; a fresh server has no tables.
+Without a selected table, table methods return a local error before sending a data request.
 URI-escape reserved password characters, or supply unescaped credentials through `Options`.
 Every connection authenticates separately with SCRAM-SHA-256.
 Use TLS over an untrusted network because authentication does not encrypt subsequent data.
@@ -97,3 +98,24 @@ Use `errors.Is` for classification and `errors.As` for typed details.
 `Error` carries Phase, Command, ServerCode, and ServerMessage; specialized errors add structured fields.
 `MigrationError` wraps the failed step's cause.
 A table hidden by permissions returns `CodeNoTable`.
+
+## Session negotiation
+
+Set `Options.SessionOptions` to a map of HELLO options.
+Names are case-insensitive; duplicate normalized names are rejected.
+`client_name` takes UTF-8 text, `statement_timeout_ms` takes a nonnegative integer, and `default_tag` takes at most 256 bytes.
+The client copies the map and byte values before connecting.
+
+`ServerInfo` exposes ConnectionID, Features, Options, NotApplied, IdleTimeoutMS and Limits.
+Use `info.Supports("read_metadata")` to check a capability.
+A reported limit does not imply that its feature is available.
+Pending timeout and tag semantics appear in NotApplied with `implementation_pending`; unknown options use `unknown_option`.
+
+`Error.ServerKeys` preserves structured keys, including unknown keys and opaque malformed escapes.
+`Error.Metadata` exposes checked numeric fields; `Error.RetryClass` depends only on ServerCode.
+The classes are `reread`, `rerun`, `backoff`, `unknown_outcome`, and `fatal`.
+Unknown codes are fatal; never replay a write blindly after `OUTCOME_UNKNOWN`.
+
+`Do` requires one parameter frame per lexical `$digits` occurrence outside quoted text.
+Valid unique contiguous parameters still bind by numeric index, including when `$2` precedes `$1`.
+`Reply.BigInt` preserves RESP3 big numbers exactly; Int64 and Uint64 report whether the value fits.

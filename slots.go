@@ -7,9 +7,15 @@ type Slot struct {
 	Table, Name, Epoch string
 	Acked              uint64
 	RetainedBytes      uint64
-	// Lost means the retention limit was exceeded. Rebuild consumer state,
+	// Lost means retained history or a projected column became unavailable.
+	// Rebuild consumer state,
 	// drop the slot, and create it again before resuming.
 	Lost bool
+	// Filters is nil for legacy servers that do not report persisted filters.
+	Filters *SlotFilters
+	// LostReason preserves diagnostic strings, including future reasons.
+	LostReason *string
+	Fields     map[string]Reply
 }
 
 func slotName(command, name string) error {
@@ -88,19 +94,46 @@ func (c *Client) Slots(ctx context.Context, table string) ([]Slot, error) {
 		if t.Kind != ReplyBulk || !isName(string(t.Bulk)) || n.Kind != ReplyBulk || slotName(command, string(n.Bulk)) != nil || e.Kind != ReplyBulk || !validEpoch(string(e.Bulk)) || !ae || !be || l.Kind != ReplyBoolean {
 			return nil, protocolErrorf(command, "malformed slot fields")
 		}
-		slots = append(slots, Slot{Table: string(t.Bulk), Name: string(n.Bulk), Epoch: string(e.Bulk), Acked: acked, RetainedBytes: bytes, Lost: l.Bool})
+		slot := Slot{Table: string(t.Bulk), Name: string(n.Bulk), Epoch: string(e.Bulk), Acked: acked, RetainedBytes: bytes, Lost: l.Bool}
+		slot.Fields = make(map[string]Reply, len(item.Map))
+		for _, pair := range item.Map {
+			slot.Fields[string(pair.Key.Bulk)] = cloneReply(pair.Value)
+		}
+		filters, hasFilters := item.Lookup("filters")
+		reason, hasReason := item.Lookup("lost_reason")
+		if hasFilters {
+			slot.Filters, err = parseSlotFilters(filters)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if hasReason {
+			if reason.Kind == ReplyBulk {
+				text := string(reason.Bulk)
+				slot.LostReason = &text
+			} else if reason.Kind != ReplyNull {
+				return nil, protocolErrorf(command, "invalid lost_reason")
+			}
+			if (!slot.Lost && slot.LostReason != nil) || (slot.Lost && slot.LostReason == nil) {
+				return nil, protocolErrorf(command, "lost_reason contradicts lost")
+			}
+		}
+		if hasFilters != hasReason {
+			return nil, protocolErrorf(command, "incomplete slot metadata")
+		}
+		slots = append(slots, slot)
 	}
 	return slots, nil
 }
 
 // CreateSlot runs Client.CreateSlot on a leased client.
 func (p *Pool) CreateSlot(ctx context.Context, table, name string) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.CreateSlot(ctx, table, name) })
+	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.CreateSlot(ctx, table, name) })
 }
 
 // DropSlot runs Client.DropSlot on a leased client.
 func (p *Pool) DropSlot(ctx context.Context, table, name string) error {
-	return p.WithClient(ctx, func(ctx context.Context, c *Client) error { return c.DropSlot(ctx, table, name) })
+	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.DropSlot(ctx, table, name) })
 }
 
 // Slots runs Client.Slots on a leased client.
