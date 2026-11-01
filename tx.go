@@ -172,7 +172,7 @@ func (tx *Tx) run(fn func(tx *Tx) error) (err error) {
 // call sends one statement of the transaction on its connection. It refuses
 // statements after fn returned, and after a CONFLICT, which the server would
 // answer with the same CONFLICT.
-func (tx *Tx) call(ctx context.Context, statement string, params [][]byte) (Reply, error) {
+func (tx *Tx) call(ctx context.Context, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	command := commandOf(statement)
 	if tx.done {
 		return Reply{}, requestErrorf(command, "the transaction has ended")
@@ -183,7 +183,7 @@ func (tx *Tx) call(ctx context.Context, statement string, params [][]byte) (Repl
 	if err := checkLimits(tx.conn.info, command, statement, params); err != nil {
 		return Reply{}, err
 	}
-	reply, err := tx.client.execOn(ctx, tx.conn, command, statement, params)
+	reply, err := tx.client.execOn(ctx, tx.conn, command, statement, params, options...)
 	tx.ended(err)
 	return reply, err
 }

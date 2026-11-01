@@ -23,6 +23,7 @@ uses protocol 3 (CQL); see the engine's
 - Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
+- Add explicit area pages with schema metadata and exact cursors, negotiated reply budgets during parsing, and aggregate typed-area decode bounds ([chunkdb#136](https://github.com/chunkdb/chunkdb/issues/136)).
 - Add three-dimensional helpers, chunk metadata, checked chunk forms, partial block-column writes, and retained-deletion scans ([chunkdb#133](https://github.com/chunkdb/chunkdb/issues/133)).
 - Negotiate protocol capabilities and session options; preserve exact big numbers and structured errors; add read metadata, extensible feed events, persisted slot filters, takeover, ACK deadlines and explicit storage feature activation/status. Require explicit table selection and preserve unknown read-only frontiers as nullable metadata. (#69).
 - Set and describe per-table `FeedBufferBytes` and `SlotMaxBytes`; fixtures and examples follow an initially empty server catalog. (#73).

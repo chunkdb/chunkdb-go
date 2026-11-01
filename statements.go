@@ -27,14 +27,14 @@ func (c *Client) Do(ctx context.Context, statement string, params ...[]byte) (Re
 
 // call runs one statement: it reserves a pipeline slot, sends the statement
 // with its parameters, and returns the reply.
-func (c *Client) call(ctx context.Context, statement string, params [][]byte) (Reply, error) {
+func (c *Client) call(ctx context.Context, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	command := commandOf(statement)
 	release, err := c.acquireSlot(ctx, command)
 	if err != nil {
 		return Reply{}, err
 	}
 	defer release()
-	return c.exec(ctx, command, statement, params)
+	return c.exec(ctx, command, statement, params, options...)
 }
 
 // commandOf names a statement for errors: its verb, and the object for verbs
@@ -186,7 +186,8 @@ func (e *staleSchemaError) Unwrap() error { return e.err }
 // they encode and decode values with: a [Client], or a [Tx], which sends on
 // its transaction's connection and cannot ask DESCRIBE inside it.
 type session interface {
-	call(ctx context.Context, statement string, params [][]byte) (Reply, error)
+	areaInfo(ctx context.Context) (*ServerInfo, error)
+	call(ctx context.Context, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error)
 	tableName(command, table string) (string, error)
 	// schemaOf returns the schema of table, and whether it was fetched from
 	// the server for this call.
@@ -700,50 +701,56 @@ func getAreaWithSchema(ctx context.Context, s session, table, area string, withM
 		if withMetadata {
 			clause = " WITH SCHEMA"
 		}
-		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil)
+		var responseConnection *conn
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withMetadata, connection: &responseConnection})
 		if err != nil {
 			if isNoColumn(err) {
 				return AreaRead{}, &staleSchemaError{err: err}
 			}
 			return AreaRead{}, err
 		}
-		result := AreaRead{}
-		if withMetadata {
-			if reply.Kind != ReplyArray || len(reply.Array) < 2 {
-				return AreaRead{}, protocolErrorf(command, "invalid schema envelope")
+		return decodeAreaResponse(responseConnection, func() (AreaRead, error) {
+			result := AreaRead{}
+			if withMetadata {
+				if reply.Kind != ReplyArray || len(reply.Array) < 2 {
+					return AreaRead{}, protocolErrorf(command, "invalid schema envelope")
+				}
+				version, ok := reply.Array[0].Uint64()
+				if !ok {
+					return AreaRead{}, protocolErrorf(command, "invalid schema version")
+				}
+				result.SchemaVersion = version
+				if version != schema.Version {
+					return AreaRead{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
+				}
+				reply = reply.Array[1]
 			}
-			version, ok := reply.Array[0].Uint64()
-			if !ok {
-				return AreaRead{}, protocolErrorf(command, "invalid schema version")
+			if reply.Kind != ReplyArray {
+				return AreaRead{}, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
 			}
-			result.SchemaVersion = version
-			if version != schema.Version {
-				return AreaRead{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
-			}
-			reply = reply.Array[1]
-		}
-		if reply.Kind != ReplyArray {
-			return AreaRead{}, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
-		}
-		chunks := make([]AreaChunk, 0, len(reply.Array))
-		for _, item := range reply.Array {
-			if item.Kind != ReplyArray || len(item.Array) < 3 {
-				return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
-			}
-			cx, okX := item.Array[0].Int64()
-			cy, okY := item.Array[1].Int64()
-			form, err := expectBulk(item.Array[2], command)
-			if !okX || !okY || err != nil {
-				return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
-			}
-			chunk, err := decodeOrStale(schema, form, names)
-			if err != nil {
+			if err := checkAreaDecodedCells(schema, indexes, len(reply.Array)); err != nil {
 				return AreaRead{}, err
 			}
-			chunks = append(chunks, AreaChunk{CX: cx, CY: cy, Chunk: chunk})
-		}
-		result.Chunks = chunks
-		return result, nil
+			chunks := make([]AreaChunk, 0, len(reply.Array))
+			for _, item := range reply.Array {
+				if item.Kind != ReplyArray || len(item.Array) < 3 {
+					return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
+				}
+				cx, okX := item.Array[0].Int64()
+				cy, okY := item.Array[1].Int64()
+				form, err := expectBulk(item.Array[2], command)
+				if !okX || !okY || err != nil {
+					return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
+				}
+				chunk, err := decodeAreaChunk(schema, form, names)
+				if err != nil {
+					return AreaRead{}, err
+				}
+				chunks = append(chunks, AreaChunk{CX: cx, CY: cy, Chunk: chunk})
+			}
+			result.Chunks = chunks
+			return result, nil
+		})
 	})
 	return chunks, annotate(command, err)
 }

@@ -148,53 +148,56 @@ func getArea3D(ctx context.Context, s session, table, area string, withSchemaVer
 		if withSchemaVersion {
 			clause = " WITH SCHEMA"
 		}
-		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil)
+		var responseConnection *conn
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withSchemaVersion, connection: &responseConnection})
 		if err != nil {
 			if isNoColumn(err) {
 				return AreaRead3D{}, &staleSchemaError{err: err}
 			}
 			return AreaRead3D{}, err
 		}
-		var result AreaRead3D
-		if withSchemaVersion {
-			if reply.Kind != ReplyArray || len(reply.Array) < 2 {
-				return AreaRead3D{}, protocolErrorf(command, "invalid schema envelope")
+		return decodeAreaResponse(responseConnection, func() (AreaRead3D, error) {
+			var result AreaRead3D
+			if withSchemaVersion {
+				if reply.Kind != ReplyArray || len(reply.Array) < 2 {
+					return AreaRead3D{}, protocolErrorf(command, "invalid schema envelope")
+				}
+				version, ok := reply.Array[0].Uint64()
+				if !ok {
+					return AreaRead3D{}, protocolErrorf(command, "invalid schema version")
+				}
+				if version != schema.Version {
+					return AreaRead3D{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
+				}
+				result.SchemaVersion = version
+				reply = reply.Array[1]
 			}
-			version, ok := reply.Array[0].Uint64()
-			if !ok {
-				return AreaRead3D{}, protocolErrorf(command, "invalid schema version")
+			if reply.Kind != ReplyArray {
+				return AreaRead3D{}, protocolErrorf(command, "expected an array of chunks")
 			}
-			if version != schema.Version {
-				return AreaRead3D{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
-			}
-			result.SchemaVersion = version
-			reply = reply.Array[1]
-		}
-		if reply.Kind != ReplyArray {
-			return AreaRead3D{}, protocolErrorf(command, "expected an array of chunks")
-		}
-		result.Chunks = make([]AreaChunk3D, 0, len(reply.Array))
-		for _, item := range reply.Array {
-			if item.Kind != ReplyArray || len(item.Array) < 4 {
-				return AreaRead3D{}, protocolErrorf(command, "expected [cx, cy, cz, chunk] entries")
-			}
-			x, okX := item.Array[0].Int64()
-			y, okY := item.Array[1].Int64()
-			z, okZ := item.Array[2].Int64()
-			form, err := expectBulk(item.Array[3], command)
-			if !okX || !okY || !okZ || err != nil {
-				return AreaRead3D{}, protocolErrorf(command, "expected [cx, cy, cz, chunk] entries")
-			}
-			chunk, err := decodeSectionedChunk(schema, form, names...)
-			if isMalformed(err) {
-				return AreaRead3D{}, &staleSchemaError{err: err}
-			}
-			if err != nil {
+			if err := checkAreaDecodedCells(schema, indexes, len(reply.Array)); err != nil {
 				return AreaRead3D{}, err
 			}
-			result.Chunks = append(result.Chunks, AreaChunk3D{CX: x, CY: y, CZ: z, Chunk: chunk})
-		}
-		return result, nil
+			result.Chunks = make([]AreaChunk3D, 0, len(reply.Array))
+			for _, item := range reply.Array {
+				if item.Kind != ReplyArray || len(item.Array) < 4 {
+					return AreaRead3D{}, protocolErrorf(command, "expected [cx, cy, cz, chunk] entries")
+				}
+				x, okX := item.Array[0].Int64()
+				y, okY := item.Array[1].Int64()
+				z, okZ := item.Array[2].Int64()
+				form, err := expectBulk(item.Array[3], command)
+				if !okX || !okY || !okZ || err != nil {
+					return AreaRead3D{}, protocolErrorf(command, "expected [cx, cy, cz, chunk] entries")
+				}
+				chunk, err := decodeAreaChunk(schema, form, names)
+				if err != nil {
+					return AreaRead3D{}, err
+				}
+				result.Chunks = append(result.Chunks, AreaChunk3D{CX: x, CY: y, CZ: z, Chunk: chunk})
+			}
+			return result, nil
+		})
 	})
 	return result, annotate(command, err)
 }

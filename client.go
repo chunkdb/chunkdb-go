@@ -588,7 +588,7 @@ func (d callDeadline) err() *Error {
 
 // exec runs one statement on the live connection. The caller must already
 // hold a pipeline slot.
-func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte) (Reply, error) {
+func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	established, err := c.connection(ctx)
 	if err != nil {
 		return Reply{}, err
@@ -596,7 +596,7 @@ func (c *Client) exec(ctx context.Context, command, statement string, params [][
 	if err := checkLimits(established.info, command, statement, params); err != nil {
 		return Reply{}, err
 	}
-	return c.execOn(ctx, established, command, statement, params)
+	return c.execOn(ctx, established, command, statement, params, options...)
 }
 
 // checkLimits refuses a statement the server's HELLO limits do not admit.
@@ -614,16 +614,30 @@ func checkLimits(info *ServerInfo, command, statement string, params [][]byte) e
 	return nil
 }
 
-func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte) (Reply, error) {
+func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	wire, err := encodeRequest(command, statement, params)
 	if err != nil {
 		return Reply{}, err
+	}
+	var limits *areaReplyLimits
+	if isAreaReadStatement(statement) {
+		if len(options) == 0 {
+			options = []areaReplyOptions{rawAreaReplyOptions(statement)}
+		}
+		limits, err = limitsForArea(established.info, options)
+		if err != nil {
+			return Reply{}, err
+		}
+		if limits.connection != nil {
+			*limits.connection = established
+			limits.connection = nil
+		}
 	}
 
 	deadline := c.commandDeadline(ctx, command)
 	defer deadline.cancel()
 
-	reply, err := established.roundTrip(deadline, wire)
+	reply, err := established.roundTrip(deadline, wire, limits)
 	if err != nil {
 		return Reply{}, err
 	}
@@ -652,6 +666,7 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 type pending struct {
 	command string
 	ch      chan result
+	limits  *areaReplyLimits
 }
 
 type result struct {
@@ -683,8 +698,11 @@ type conn struct {
 	info *ServerInfo
 }
 
-func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
+func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaReplyLimits) (Reply, error) {
 	waiter := &pending{command: deadline.command, ch: make(chan result, 1)}
+	if len(limits) != 0 {
+		waiter.limits = limits[0]
+	}
 
 	cn.writeMu.Lock()
 	cn.mu.Lock()
@@ -730,7 +748,18 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
 
 func (cn *conn) readLoop() {
 	for {
-		reply, err := readReply(cn.reader)
+		// Wait for bytes before selecting the head: it is queued before its request is written.
+		if _, err := cn.reader.Peek(1); err != nil {
+			_ = cn.shutdown(cn.readError(err))
+			return
+		}
+		cn.mu.Lock()
+		var limits *areaReplyLimits
+		if len(cn.queue) != 0 {
+			limits = cn.queue[0].limits
+		}
+		cn.mu.Unlock()
+		reply, err := readReplyLimited(cn.reader, limits)
 		if err != nil {
 			_ = cn.shutdown(cn.readError(err))
 			return

@@ -75,6 +75,24 @@ chunks: 1
 - `GetArea` uses inclusive chunk bounds and returns chunks with present blocks or nonbaseline chunk metadata.
 - `GetAreaAround` selects chunks within a radius.
 
+`GetAreaPage` accepts the same rectangle followed by `AreaPageOptions{Limit, After}` and optional column names.
+`GetAreaAroundPage` selects a disc; `GetAreaPage3D` and `GetAreaAroundPage3D` use `AreaPageOptions3D` for boxes and balls.
+Client, Pool and Tx expose these methods and require the advertised `area_paging` feature.
+Each page contains `Chunks`, `SchemaVersion`, `More` and `After`; pass its cursor with the same selector and projection to continue.
+Limit zero uses the negotiated maximum.
+The cursor advances across requested empty cells, so an unfinished page may contain no populated chunks.
+A completed page always has a nil cursor, including when its final page contains populated chunks.
+The server can shorten pages at its response-byte limit.
+Page calls return only one page and do not accumulate earlier pages or provide a snapshot across calls.
+
+All GET AREA replies enforce negotiated encoded-response bytes while parsing, before allocating declared bulk bodies.
+Known raw and typed area shapes also check the chunk-array count before allocating its initial storage.
+Aggregate reply storage is bounded to 64 MiB of reply slots; server errors and unsolicited pushes keep their separate framing.
+An oversized or malformed response closes the connection; a later independent call may reconnect.
+Typed area methods admit at most 4194304 combined block-column and chunk-metadata values across the complete area before allocating chunk value arrays.
+Select fewer columns or request smaller pages when this limit is exceeded.
+Use `Do` with a bounded GET AREA page to retain checked raw forms without dense typed decoding.
+
 ## Three-dimensional tables
 
 Set `TableSpec.ChunkDepth` to a positive side length when creating a three-dimensional table.
