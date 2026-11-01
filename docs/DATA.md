@@ -84,6 +84,7 @@ The cursor advances across requested empty cells, so an unfinished page may cont
 A completed page always has a nil cursor, including when its final page contains populated chunks.
 The server can shorten pages at its response-byte limit.
 Page calls return only one page and do not accumulate earlier pages or provide a snapshot across calls.
+The original command and context deadlines also cover typed area validation and decoding; expiry closes that response's connection and ends an active transaction.
 
 All GET AREA replies enforce negotiated encoded-response bytes while parsing, before allocating declared bulk bodies.
 Known raw and typed area shapes also check the chunk-array count before allocating its initial storage.

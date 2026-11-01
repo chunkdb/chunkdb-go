@@ -701,15 +701,15 @@ func getAreaWithSchema(ctx context.Context, s session, table, area string, withM
 		if withMetadata {
 			clause = " WITH SCHEMA"
 		}
-		var responseConnection *conn
-		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withMetadata, connection: &responseConnection})
+		var responseControl *areaResponseControl
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withMetadata, response: &responseControl})
 		if err != nil {
 			if isNoColumn(err) {
 				return AreaRead{}, &staleSchemaError{err: err}
 			}
 			return AreaRead{}, err
 		}
-		return decodeAreaResponse(responseConnection, func() (AreaRead, error) {
+		return decodeAreaResponse(responseControl, func() (AreaRead, error) {
 			result := AreaRead{}
 			if withMetadata {
 				if reply.Kind != ReplyArray || len(reply.Array) < 2 {
@@ -733,6 +733,9 @@ func getAreaWithSchema(ctx context.Context, s session, table, area string, withM
 			}
 			chunks := make([]AreaChunk, 0, len(reply.Array))
 			for _, item := range reply.Array {
+				if err := responseControl.checkpoint(); err != nil {
+					return AreaRead{}, err
+				}
 				if item.Kind != ReplyArray || len(item.Array) < 3 {
 					return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
 				}

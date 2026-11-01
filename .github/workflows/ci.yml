@@ -58,7 +58,7 @@ jobs:
         run: |
           branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
           if [ "$branch" = "feat/commit-core" ]; then
-            printf 'ref=%s\n' '2689a028899d5c4949a073dd9c1bb1a8b566853f' >> "$GITHUB_OUTPUT"
+            printf 'ref=%s\n' 'ef2e5ad301b6cf5797601599e69159ee7698bf14' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$branch" = "feat/chunk-model" ]; then

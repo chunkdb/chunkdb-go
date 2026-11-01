@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // AreaPageOptions selects one bounded page of requested two-dimensional cells.
@@ -48,13 +49,41 @@ type areaPageRequest struct {
 	limit       uint64
 }
 
-func decodeAreaResponse[T any](connection *conn, decode func() (T, error)) (T, error) {
-	value, err := decode()
+type areaResponseControl struct {
+	connection *conn
+	deadline   callDeadline
+}
+
+func (c *areaResponseControl) checkpoint() error {
+	if c.deadline.ctx.Err() != nil {
+		return c.deadline.err()
+	}
+	if end, exists := c.deadline.ctx.Deadline(); exists && !time.Now().Before(end) {
+		return c.deadline.err()
+	}
+	return nil
+}
+
+func decodeAreaResponse[T any](control *areaResponseControl, decode func() (T, error)) (T, error) {
+	var value T
+	if control == nil {
+		return value, protocolErrorf("GET AREA", "response has no validation deadline")
+	}
+	defer control.deadline.cancel()
+	err := control.checkpoint()
+	if err == nil {
+		value, err = decode()
+	}
+	if expired := control.checkpoint(); expired != nil {
+		var zero T
+		value = zero
+		err = expired
+	}
 	var typed *Error
 	var stale *staleSchemaError
 	var limit *areaDecodeLimitError
-	if err != nil && connection != nil && errors.As(err, &typed) && typed.Phase == PhaseProtocol && !errors.As(err, &stale) && !errors.As(err, &limit) {
-		_ = connection.shutdown(err)
+	if err != nil && errors.As(err, &typed) && (typed.Phase == PhaseTimeout || typed.Phase == PhaseProtocol && !errors.As(err, &stale) && !errors.As(err, &limit)) {
+		_ = control.connection.shutdown(err)
 	}
 	return value, err
 }
@@ -237,7 +266,14 @@ func areaReplyPoint(reply Reply, dims int) ([3]int64, error) {
 	return point, nil
 }
 
-func validateAreaPage(reply Reply, request areaPageRequest, maxChunks uint64) ([]Reply, bool, *[3]int64, error) {
+func validateAreaPage(reply Reply, request areaPageRequest, maxChunks uint64, checkpoints ...func() error) ([]Reply, bool, *[3]int64, error) {
+	var check func() error
+	if len(checkpoints) != 0 {
+		check = checkpoints[0]
+	}
+	if err := areaCheckpoint(check); err != nil {
+		return nil, false, nil, err
+	}
 	bad := func(message string) ([]Reply, bool, *[3]int64, error) {
 		return nil, false, nil, protocolErrorf("GET AREA", "%s", message)
 	}
@@ -246,6 +282,9 @@ func validateAreaPage(reply Reply, request areaPageRequest, maxChunks uint64) ([
 	}
 	fields := make(map[string]Reply, 3)
 	for _, entry := range reply.Map {
+		if err := areaCheckpoint(check); err != nil {
+			return nil, false, nil, err
+		}
 		name := ""
 		if entry.Key.Kind == ReplyBulk {
 			name = string(entry.Key.Bulk)
@@ -287,35 +326,18 @@ func validateAreaPage(reply Reply, request areaPageRequest, maxChunks uint64) ([
 	if more.Bool == (after == nil) {
 		return bad("only unfinished pages have a continuation cursor")
 	}
-	point, exists := request.firstPoint(), true
-	if request.after != nil {
-		point, exists = request.next(*request.after)
+	valid, err := request.validProgress(after, limit, check)
+	if err != nil {
+		return nil, false, nil, err
 	}
-	if after == nil {
-		visited := uint64(0)
-		for exists && visited < limit {
-			point, exists = request.next(point)
-			visited++
-		}
-		if exists {
-			return bad("page completed before visiting requested cells")
-		}
-	} else {
-		visited := uint64(0)
-		for exists && areaPointLess(point, *after, request.dims) && visited < limit {
-			point, exists = request.next(point)
-			visited++
-		}
-		if !exists || point != *after || visited >= limit {
-			return bad("cursor skips requested page")
-		}
-		_, following := request.next(*after)
-		if !following {
-			return bad("unfinished page has no remaining cells")
-		}
+	if !valid {
+		return bad("continuation or completion exceeds requested cell limit")
 	}
 	previous := request.after
 	for _, row := range chunks.Array {
+		if err := areaCheckpoint(check); err != nil {
+			return nil, false, nil, err
+		}
 		if row.Kind != ReplyArray || len(row.Array) < request.dims+1 {
 			return bad("chunk row is missing fields")
 		}
@@ -401,15 +423,15 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 			statement += " AFTER " + areaPointText(*request.after, request.dims)
 		}
 		statement += " WITH SCHEMA"
-		var responseConnection *conn
-		reply, err := s.call(ctx, statement, nil, areaReplyOptions{knownShape: true, page: true, withSchema: true, limit: limit, connection: &responseConnection})
+		var responseControl *areaResponseControl
+		reply, err := s.call(ctx, statement, nil, areaReplyOptions{knownShape: true, page: true, withSchema: true, limit: limit, response: &responseControl})
 		if err != nil {
 			if isNoColumn(err) {
 				return AreaPage3D{}, &staleSchemaError{err: err}
 			}
 			return AreaPage3D{}, err
 		}
-		return decodeAreaResponse(responseConnection, func() (AreaPage3D, error) {
+		return decodeAreaResponse(responseControl, func() (AreaPage3D, error) {
 			if reply.Kind != ReplyArray || len(reply.Array) < 2 {
 				return AreaPage3D{}, protocolErrorf("GET AREA", "invalid schema envelope")
 			}
@@ -420,7 +442,7 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 			if version != schema.Version {
 				return AreaPage3D{}, &staleSchemaError{err: protocolErrorf("GET AREA", "schema version changed during read")}
 			}
-			rows, more, after, err := validateAreaPage(reply.Array[1], request, limits.maxChunks)
+			rows, more, after, err := validateAreaPage(reply.Array[1], request, limits.maxChunks, responseControl.checkpoint)
 			if err != nil {
 				return AreaPage3D{}, err
 			}
@@ -432,6 +454,9 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 				page.After = &ChunkCoord3D{CX: after[0], CY: after[1], CZ: after[2]}
 			}
 			for _, row := range rows {
+				if err := responseControl.checkpoint(); err != nil {
+					return AreaPage3D{}, err
+				}
 				point, _ := areaReplyPoint(Reply{Kind: ReplyArray, Array: row.Array[:request.dims]}, request.dims)
 				chunk, err := decodeAreaChunk(schema, row.Array[request.dims].Bulk, names)
 				if err != nil {

@@ -13,7 +13,7 @@ var areaReadPrefix = regexp.MustCompile(`(?i)^[ \t]*GET[ \t]+AREA\b`)
 func isAreaReadStatement(statement string) bool { return areaReadPrefix.MatchString(statement) }
 
 type areaReplyOptions struct {
-	connection **conn
+	response   **areaResponseControl
 	knownShape bool
 	page       bool
 	withSchema bool

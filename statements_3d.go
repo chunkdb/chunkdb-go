@@ -148,15 +148,15 @@ func getArea3D(ctx context.Context, s session, table, area string, withSchemaVer
 		if withSchemaVersion {
 			clause = " WITH SCHEMA"
 		}
-		var responseConnection *conn
-		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withSchemaVersion, connection: &responseConnection})
+		var responseControl *areaResponseControl
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withSchemaVersion, response: &responseControl})
 		if err != nil {
 			if isNoColumn(err) {
 				return AreaRead3D{}, &staleSchemaError{err: err}
 			}
 			return AreaRead3D{}, err
 		}
-		return decodeAreaResponse(responseConnection, func() (AreaRead3D, error) {
+		return decodeAreaResponse(responseControl, func() (AreaRead3D, error) {
 			var result AreaRead3D
 			if withSchemaVersion {
 				if reply.Kind != ReplyArray || len(reply.Array) < 2 {
@@ -180,6 +180,9 @@ func getArea3D(ctx context.Context, s session, table, area string, withSchemaVer
 			}
 			result.Chunks = make([]AreaChunk3D, 0, len(reply.Array))
 			for _, item := range reply.Array {
+				if err := responseControl.checkpoint(); err != nil {
+					return AreaRead3D{}, err
+				}
 				if item.Kind != ReplyArray || len(item.Array) < 4 {
 					return AreaRead3D{}, protocolErrorf(command, "expected [cx, cy, cz, chunk] entries")
 				}

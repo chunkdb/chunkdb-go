@@ -580,10 +580,18 @@ func (c *Client) commandDeadline(ctx context.Context, command string) callDeadli
 }
 
 func (d callDeadline) err() *Error {
-	if d.parent.Err() != nil {
-		return timeoutErrorf(d.command, d.parent.Err(), "%s", d.parent.Err())
+	parentErr := d.parent.Err()
+	if end, exists := d.parent.Deadline(); parentErr == nil && exists && !time.Now().Before(end) {
+		parentErr = context.DeadlineExceeded
 	}
-	return timeoutErrorf(d.command, d.ctx.Err(), "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
+	if parentErr != nil {
+		return timeoutErrorf(d.command, parentErr, "%s", parentErr)
+	}
+	cause := d.ctx.Err()
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return timeoutErrorf(d.command, cause, "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
 }
 
 // exec runs one statement on the live connection. The caller must already
@@ -620,6 +628,7 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 		return Reply{}, err
 	}
 	var limits *areaReplyLimits
+	var responseTarget **areaResponseControl
 	if isAreaReadStatement(statement) {
 		if len(options) == 0 {
 			options = []areaReplyOptions{rawAreaReplyOptions(statement)}
@@ -628,14 +637,17 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 		if err != nil {
 			return Reply{}, err
 		}
-		if limits.connection != nil {
-			*limits.connection = established
-			limits.connection = nil
-		}
+		responseTarget = limits.response
+		limits.response = nil
 	}
 
 	deadline := c.commandDeadline(ctx, command)
-	defer deadline.cancel()
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			deadline.cancel()
+		}
+	}()
 
 	reply, err := established.roundTrip(deadline, wire, limits)
 	if err != nil {
@@ -658,6 +670,10 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 				"the server closed the connection after %s to an earlier request", reply.Code))
 		}
 		return Reply{}, replyError(phase, command, reply)
+	}
+	if responseTarget != nil {
+		*responseTarget = &areaResponseControl{connection: established, deadline: deadline}
+		handedOff = true
 	}
 	return reply, nil
 }
