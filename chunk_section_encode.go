@@ -19,7 +19,7 @@ func normalizedFormValue(column Column, raw any) (any, error) {
 	return normalize(column.Name, column.Type, raw)
 }
 
-func encodeMetadataRow(schema *Schema, metadata Record) ([]byte, uint64, error) {
+func encodeMetadataRow(schema *Schema, metadata Record, variableBudget uint64) ([]byte, uint64, error) {
 	if len(schema.ChunkColumns) == 0 {
 		if len(metadata) != 0 {
 			return nil, 0, requestErrorf("SET CHUNK", "table has no chunk columns")
@@ -89,6 +89,9 @@ func encodeMetadataRow(schema *Schema, metadata Record) ([]byte, uint64, error) 
 				raw = encodeNormalized(value)
 				if column.Null || len(raw) != 0 {
 					variableBytes += 12 + uint64(len(raw))
+					if variableBytes > variableBudget {
+						return nil, 0, requestErrorf("SET CHUNK", "combined variable data exceeds table byte limit")
+					}
 				}
 			}
 		}
@@ -126,6 +129,10 @@ func encodeSectionedChunkForm(schema *Schema, chunk *Chunk, includeMetadata bool
 		return nil, err
 	}
 	bad := func(what string) ([]byte, error) { return nil, requestErrorf("SET CHUNK", "chunk form: %s", what) }
+	variableLimit := uint64(maxSectionedVariableBytes)
+	if schema.Options.VarMaxChunkBytes != 0 && schema.Options.VarMaxChunkBytes < variableLimit {
+		variableLimit = schema.Options.VarMaxChunkBytes
+	}
 	if chunk == nil {
 		return bad("nil chunk")
 	}
@@ -227,7 +234,7 @@ func encodeSectionedChunkForm(schema *Schema, chunk *Chunk, includeMetadata bool
 					continue
 				}
 				variableBytes += 12 + uint64(len(encoded))
-				if schema.Options.VarMaxChunkBytes != 0 && variableBytes > schema.Options.VarMaxChunkBytes {
+				if variableBytes > variableLimit {
 					return bad("variable data exceeds table byte limit")
 				}
 				variables = append(variables, varEntry{column.ID, block, encoded})
@@ -265,13 +272,13 @@ func encodeSectionedChunkForm(schema *Schema, chunk *Chunk, includeMetadata bool
 	var metadata []byte
 	if includeMetadata {
 		var metadataBytes uint64
-		metadata, metadataBytes, err = encodeMetadataRow(schema, chunk.Metadata)
+		metadata, metadataBytes, err = encodeMetadataRow(schema, chunk.Metadata, variableLimit-variableBytes)
 		if err != nil {
 			return nil, err
 		}
 		variableBytes += metadataBytes
 	}
-	if schema.Options.VarMaxChunkBytes != 0 && variableBytes > schema.Options.VarMaxChunkBytes {
+	if variableBytes > variableLimit {
 		return bad("combined variable data exceeds table byte limit")
 	}
 	header := chunkFormHeader{version: chunk.Version, schema: schema.Version, commitTime: chunk.CommitTimeMS}
