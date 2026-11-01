@@ -40,12 +40,16 @@ func (c *Client) CreateTable(ctx context.Context, table string, spec TableSpec) 
 	if len(spec.Columns) == 0 {
 		return requestErrorf(command, "a table needs at least one column")
 	}
-	if spec.ChunkWidth <= 0 || spec.ChunkHeight <= 0 {
+	if spec.ChunkWidth <= 0 || spec.ChunkHeight <= 0 || spec.ChunkDepth < 0 {
 		return requestErrorf(command, "the chunk size must be positive, got %dx%d", spec.ChunkWidth, spec.ChunkHeight)
 	}
 	if spec.LargeWidth < 0 || spec.LargeHeight < 0 || (spec.LargeWidth == 0) != (spec.LargeHeight == 0) {
 		return requestErrorf(command, "the large-chunk size must be both zero or both positive, got %dx%d",
 			spec.LargeWidth, spec.LargeHeight)
+	}
+	if spec.LargeDepth < 0 || (spec.ChunkDepth == 0 && spec.LargeDepth != 0) ||
+		(spec.ChunkDepth > 0 && (spec.LargeWidth == 0) != (spec.LargeDepth == 0)) {
+		return requestErrorf(command, "large-chunk dimensions must match the chunk dimensions")
 	}
 	definitions := make([]string, 0, len(spec.Columns))
 	for _, column := range spec.Columns {
@@ -57,8 +61,25 @@ func (c *Client) CreateTable(ctx context.Context, table string, spec TableSpec) 
 	}
 	statement := "CREATE TABLE " + name + " (" + strings.Join(definitions, ", ") + ") CHUNK " +
 		strconv.Itoa(spec.ChunkWidth) + " x " + strconv.Itoa(spec.ChunkHeight)
+	if spec.ChunkDepth > 0 {
+		statement += " x " + strconv.Itoa(spec.ChunkDepth)
+	}
 	if spec.LargeWidth > 0 {
 		statement += " LARGE " + strconv.Itoa(spec.LargeWidth) + " x " + strconv.Itoa(spec.LargeHeight)
+		if spec.ChunkDepth > 0 {
+			statement += " x " + strconv.Itoa(spec.LargeDepth)
+		}
+	}
+	if len(spec.ChunkColumns) != 0 {
+		metadata := make([]string, 0, len(spec.ChunkColumns))
+		for _, column := range spec.ChunkColumns {
+			definition, err := columnDefinition(column)
+			if err != nil {
+				return annotate(command, err)
+			}
+			metadata = append(metadata, definition)
+		}
+		statement += " CHUNK COLUMNS (" + strings.Join(metadata, ", ") + ")"
 	}
 	if options := optionAssignments(spec.Options); len(options) > 0 {
 		statement += " WITH " + strings.Join(options, ", ")

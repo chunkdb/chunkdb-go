@@ -37,7 +37,7 @@ Run it again and the schema step prints `skipped`.
 ## Data layout
 
 A block holds typed column values at a grid coordinate.
-A chunk groups a fixed rectangle of blocks; an area selects a rectangle of chunks.
+A chunk groups a fixed rectangle or box of blocks; an area selects chunk coordinates.
 A version identifies chunk state for conditional writes; compare it for equality.
 A revision orders committed changes within a table's change feed.
 

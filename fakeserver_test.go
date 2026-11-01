@@ -320,21 +320,21 @@ func describeReply(table string, version int64, columns []string) string {
 	)
 }
 
-// worldFormBytes is the size of an empty chunk form of the fake tables:
-// chunk and schema version, presence, then the values (and validity bits) of
-// id, temp, solid, h, d and mask.
-const worldFormBytes = 16 + 1 + 5 + (4 + 1) + 1 + 16 + 32 + (2 + 1)
-
-// emptyWorldForm is an empty chunk form of size bytes at chunk version 7 and
-// schema version 1.
-func emptyWorldForm(size int) string {
-	form := make([]byte, size)
-	form[0], form[8] = 7, 1
+// emptyWorldForm is a checked versioned empty form of the fake world schema.
+func emptyWorldForm(columns ...string) string {
+	schema := worldSchema()
+	schema.Version = 1
+	for i := range schema.Columns {
+		schema.Columns[i].ID = uint32(i + 1)
+	}
+	chunk := NewChunk(schema)
+	chunk.Version = 7
+	form, err := encodeSectionedChunk(schema, chunk, columns...)
+	if err != nil {
+		panic(err)
+	}
 	return string(form)
 }
-
-// worldSectionBytes is the part of an empty chunk form each column takes.
-var worldSectionBytes = map[string]int{"id": 5, "temp": 4 + 1, "solid": 1, "h": 16, "d": 32, "mask": 2 + 1}
 
 // answerHello answers a HELLO line like a protocol 3 server started with
 // --auth none.
