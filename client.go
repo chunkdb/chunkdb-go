@@ -580,15 +580,23 @@ func (c *Client) commandDeadline(ctx context.Context, command string) callDeadli
 }
 
 func (d callDeadline) err() *Error {
-	if d.parent.Err() != nil {
-		return timeoutErrorf(d.command, d.parent.Err(), "%s", d.parent.Err())
+	parentErr := d.parent.Err()
+	if end, exists := d.parent.Deadline(); parentErr == nil && exists && !time.Now().Before(end) {
+		parentErr = context.DeadlineExceeded
 	}
-	return timeoutErrorf(d.command, d.ctx.Err(), "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
+	if parentErr != nil {
+		return timeoutErrorf(d.command, parentErr, "%s", parentErr)
+	}
+	cause := d.ctx.Err()
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return timeoutErrorf(d.command, cause, "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
 }
 
 // exec runs one statement on the live connection. The caller must already
 // hold a pipeline slot.
-func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte) (Reply, error) {
+func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	established, err := c.connection(ctx)
 	if err != nil {
 		return Reply{}, err
@@ -596,7 +604,7 @@ func (c *Client) exec(ctx context.Context, command, statement string, params [][
 	if err := checkLimits(established.info, command, statement, params); err != nil {
 		return Reply{}, err
 	}
-	return c.execOn(ctx, established, command, statement, params)
+	return c.execOn(ctx, established, command, statement, params, options...)
 }
 
 // checkLimits refuses a statement the server's HELLO limits do not admit.
@@ -614,16 +622,34 @@ func checkLimits(info *ServerInfo, command, statement string, params [][]byte) e
 	return nil
 }
 
-func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte) (Reply, error) {
+func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	wire, err := encodeRequest(command, statement, params)
 	if err != nil {
 		return Reply{}, err
 	}
+	var limits *areaReplyLimits
+	var responseTarget **areaResponseControl
+	if isAreaReadStatement(statement) {
+		if len(options) == 0 {
+			options = []areaReplyOptions{rawAreaReplyOptions(statement)}
+		}
+		limits, err = limitsForArea(established.info, options)
+		if err != nil {
+			return Reply{}, err
+		}
+		responseTarget = limits.response
+		limits.response = nil
+	}
 
 	deadline := c.commandDeadline(ctx, command)
-	defer deadline.cancel()
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			deadline.cancel()
+		}
+	}()
 
-	reply, err := established.roundTrip(deadline, wire)
+	reply, err := established.roundTrip(deadline, wire, limits)
 	if err != nil {
 		return Reply{}, err
 	}
@@ -645,6 +671,10 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 		}
 		return Reply{}, replyError(phase, command, reply)
 	}
+	if responseTarget != nil {
+		*responseTarget = &areaResponseControl{connection: established, deadline: deadline}
+		handedOff = true
+	}
 	return reply, nil
 }
 
@@ -652,6 +682,7 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 type pending struct {
 	command string
 	ch      chan result
+	limits  *areaReplyLimits
 }
 
 type result struct {
@@ -683,8 +714,11 @@ type conn struct {
 	info *ServerInfo
 }
 
-func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
+func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaReplyLimits) (Reply, error) {
 	waiter := &pending{command: deadline.command, ch: make(chan result, 1)}
+	if len(limits) != 0 {
+		waiter.limits = limits[0]
+	}
 
 	cn.writeMu.Lock()
 	cn.mu.Lock()
@@ -730,7 +764,18 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
 
 func (cn *conn) readLoop() {
 	for {
-		reply, err := readReply(cn.reader)
+		// Wait for bytes before selecting the head: it is queued before its request is written.
+		if _, err := cn.reader.Peek(1); err != nil {
+			_ = cn.shutdown(cn.readError(err))
+			return
+		}
+		cn.mu.Lock()
+		var limits *areaReplyLimits
+		if len(cn.queue) != 0 {
+			limits = cn.queue[0].limits
+		}
+		cn.mu.Unlock()
+		reply, err := readReplyLimited(cn.reader, limits)
 		if err != nil {
 			_ = cn.shutdown(cn.readError(err))
 			return
