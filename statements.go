@@ -590,12 +590,15 @@ func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk 
 		return Reply{}, err
 	}
 	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
+		// Admission depends on the stored size, which only the server knows.
+		writeSchema := *schema
+		writeSchema.Options.VarMaxChunkBytes = maxSectionedVariableBytes
 		var form []byte
 		var err error
 		if len(z) != 0 {
-			form, err = encodeSectionedChunk(schema, chunk)
+			form, err = encodeSectionedChunk(&writeSchema, chunk)
 		} else {
-			form, err = EncodeChunk(schema, chunk)
+			form, err = EncodeChunk(&writeSchema, chunk)
 		}
 		if err != nil {
 			return Reply{}, err

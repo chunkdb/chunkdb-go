@@ -111,7 +111,9 @@ Tx stages these updates for COMMIT; Pool exposes the same helpers through leased
 `IfAbsent()` permits a chunk write only when the chunk is not populated; retained tombstones count as absent and metadata-only populated chunks do not.
 It cannot be combined with `IfVersion` or used for block writes.
 These conditions report `VersionMismatchError` when refused.
-Stored variable data stays readable after lowering its table write quota; encoding enforces the current quota and read decoding enforces the combined hard format limit.
+Stored variable data stays readable after lowering its table write quota.
+Chunk write requests enforce the hard format limit and leave growth-aware quota admission to the server, which can accept non-growing replacements of older data above that quota.
+Standalone encoding uses the supplied schema's configured budget.
 
 ## Scans and schemas
 

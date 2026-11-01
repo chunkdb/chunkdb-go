@@ -52,7 +52,9 @@ func setChunkColumns(ctx context.Context, s session, table string, x, y int64, c
 		if _, err := formColumns(schema, columns); err != nil {
 			return Reply{}, &staleSchemaError{err: err, local: true}
 		}
-		form, err := encodeSectionedBlockMutation(schema, chunk, columns...)
+		writeSchema := *schema
+		writeSchema.Options.VarMaxChunkBytes = maxSectionedVariableBytes
+		form, err := encodeSectionedBlockMutation(&writeSchema, chunk, columns...)
 		if err != nil {
 			return Reply{}, err
 		}

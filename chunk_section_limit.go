@@ -42,12 +42,10 @@ func sectionedChunkFormLimit(schema *Schema) (uint64, error) {
 	if len(schema.ChunkColumns) != 0 {
 		metadata += 4 + 16*uint64(len(schema.ChunkColumns))
 	}
-	variable := schema.Options.VarMaxChunkBytes
-	if variable == 0 {
-		variable = maxSectionedVariableBytes
-	}
-	if variable > maxSectionedVariableBytes {
+	if schema.Options.VarMaxChunkBytes > maxSectionedVariableBytes {
 		return 0, requestErrorf(command, "invalid variable byte limit")
 	}
-	return sectionedHeaderBytes + 6*sectionDirectoryBytes + presence + fixed + 4 + 24*descriptors + metadata + variable, nil
+	// The server admits a non-growing replacement of stored data even when
+	// a lowered current quota is smaller than that stored chunk.
+	return sectionedHeaderBytes + 6*sectionDirectoryBytes + presence + fixed + 4 + 24*descriptors + metadata + maxSectionedVariableBytes, nil
 }
