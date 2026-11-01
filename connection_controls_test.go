@@ -20,6 +20,10 @@ func TestConnectionControlsWire(t *testing.T) {
 			writeRaw(conn, respMap("cancelled", respBool(false)))
 		case "KILL CONNECTION 18446744073709551615":
 			writeRaw(conn, respMap("killed", respBool(true)))
+		case "CANCEL 1":
+			writeRaw(conn, respMap("cancelled", respBool(true)))
+		case "KILL CONNECTION 1":
+			writeRaw(conn, respMap("killed", respBool(false)))
 		default:
 			t.Errorf("unexpected request %q", command)
 			writeSimple(conn, "unexpected")
@@ -34,6 +38,12 @@ func TestConnectionControlsWire(t *testing.T) {
 		t.Fatal(yes, err)
 	}
 	if yes, err := c.KillConnection(t.Context(), math.MaxUint64); err != nil || !yes {
+		t.Fatal(yes, err)
+	}
+	if yes, err := c.Cancel(t.Context(), 1); err != nil || !yes {
+		t.Fatal(yes, err)
+	}
+	if yes, err := c.KillConnection(t.Context(), 1); err != nil || yes {
 		t.Fatal(yes, err)
 	}
 	if _, err := c.Cancel(t.Context(), 0); !errors.Is(err, ErrProtocol) {
