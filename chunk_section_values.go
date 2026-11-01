@@ -8,6 +8,7 @@ import (
 )
 
 const maxSectionedVariableBytes = 64 * 1024 * 1024
+const maxDecodedChunkCells = 4 * 1024 * 1024
 
 func sectionedGeometry(schema *Schema) (int, int, error) {
 	if schema == nil || (schema.Dims != 0 && schema.Dims != 2 && schema.Dims != 3) {
@@ -93,6 +94,9 @@ func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chun
 	indexes, err := formColumns(schema, columns)
 	if err != nil {
 		return nil, err
+	}
+	if len(indexes) != 0 && count > maxDecodedChunkCells/len(indexes) {
+		return bad("decoded chunk exceeds 4194304 column values; select fewer columns or read the raw form")
 	}
 	if form.header.flags&chunkFormProjected == 0 && len(columns) != 0 {
 		if len(indexes) != len(schema.Columns) {

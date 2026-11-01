@@ -94,6 +94,8 @@ The existing two-axis methods and coordinate types retain their signatures.
 `TableSpec.ChunkColumns` declares a separate column namespace for one metadata row per chunk.
 `Schema.ChunkColumns` describes that row, and `Chunk.Metadata` contains its values.
 Block-column projections retain the complete metadata row.
+Typed chunk reads admit at most 4194304 block-column cells before allocating dense value arrays.
+Select fewer columns or read the raw form when a chunk exceeds that limit.
 `AddChunkColumn`, `DropChunkColumn`, and `RenameChunkColumn` change that namespace.
 
 `SetChunk` and `SetChunk3D` replace both the block values and the metadata row.
