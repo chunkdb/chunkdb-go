@@ -155,9 +155,9 @@ func foundationHelloReply() string {
 
 func TestFoundationHelloOptions(t *testing.T) {
 	tag := []byte{0, 255}
-	opts := Options{SessionOptions: map[string]any{"CLIENT_NAME": "worker", "statement_timeout_ms": uint64(math.MaxUint64), "default_tag": tag, "future": true}}
+	opts := Options{SessionOptions: map[string]any{"CLIENT_NAME": "worker", "statement_timeout_ms": uint64(86400000), "default_tag": tag, "future": true}}
 	server := newFakeServer(t, func(s *fakeServer, conn net.Conn, statement string) {
-		if statement != "HELLO 3 WITH client_name = $1, default_tag = $2, future = TRUE, statement_timeout_ms = 18446744073709551615" {
+		if statement != "HELLO 3 WITH client_name = $1, default_tag = $2, future = TRUE, statement_timeout_ms = 86400000" {
 			t.Errorf("unexpected HELLO: %s", statement)
 		}
 		params := s.paramsOf(conn)

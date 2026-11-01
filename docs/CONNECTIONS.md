@@ -82,7 +82,7 @@ pool connected
 
 Pool mirrors statement methods and Transaction; `WithClient` holds one lease for several calls.
 AcquireTimeout bounds waiting for a lease; zero follows CommandTimeout, and a negative value leaves deadlines to the context.
-Each ordinary connection occupies one server worker; size the pool accordingly.
+Idle connections do not reserve server workers.
 
 ## Errors
 
@@ -103,13 +103,27 @@ A table hidden by permissions returns `CodeNoTable`.
 
 Set `Options.SessionOptions` to a map of HELLO options.
 Names are case-insensitive; duplicate normalized names are rejected.
-`client_name` takes UTF-8 text, `statement_timeout_ms` takes a nonnegative integer, and `default_tag` takes at most 256 bytes.
+`client_name` takes UTF-8 text, `statement_timeout_ms` takes an integer from 0 through 86400000, and `default_tag` takes at most 256 bytes.
+Omit the timeout to inherit the server default; explicit zero disables the server statement deadline.
+The statement deadline is separate from the client's transport deadline.
 The client copies the map and byte values before connecting.
 
 `ServerInfo` exposes ConnectionID, Features, Options, NotApplied, IdleTimeoutMS and Limits.
 Use `info.Supports("read_metadata")` to check a capability.
 A reported limit does not imply that its feature is available.
-Pending timeout and tag semantics appear in NotApplied with `implementation_pending`; unknown options use `unknown_option`.
+The `statement_timeout` feature advertises server deadline support, and effective milliseconds appear in Options.
+Options not implemented by the server appear in NotApplied with `implementation_pending`; unknown options use `unknown_option`.
+
+`Client.ShowConnections` returns IDs, nullable user and statement text, peer addresses and state for visible live connections.
+`Client.Cancel(ctx, id)` cancels a target's current statement; false includes idle statements and work past its decision boundary.
+`Client.KillConnection(ctx, id)` closes the target safely; killing the calling connection is acknowledged before it closes.
+IDs are exact uint64 values and are not reused during a server run.
+The current user can control connections belonging to the same live user identity; ADMIN on `*` also permits other connections.
+Check `info.Supports("connection_controls")` before using these methods against a server without the capability.
+The pool exposes all three methods; use `WithClient` when actions must originate from one specific connection.
+Control an in-flight request from a separate client connection; pooled controls require an available lease and follow the leased client's request ordering.
+`CANCELLED` and `TIMEOUT` with `applied=false` report that the statement did not apply.
+`RATE_LIMITED` identifies `max_connections` or `statements_per_sec` in its reason and can include `retry_after_ms`.
 
 `Error.ServerKeys` preserves structured keys, including unknown keys and opaque malformed escapes.
 `Error.Metadata` exposes checked numeric fields; `Error.RetryClass` depends only on ServerCode.
