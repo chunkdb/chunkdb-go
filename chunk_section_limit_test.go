@@ -17,7 +17,7 @@ func TestSectionedRawBoundAfterQuotaReduction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	schema.Options.VarMaxChunkBytes = 1
+	schema.Options.VarMaxChunkBytes = 13
 	limit, err := sectionedChunkFormLimit(schema)
 	if err != nil || limit < uint64(len(form)) {
 		t.Fatal(limit, len(form), err)
@@ -33,7 +33,7 @@ func TestChunkModelTypedRequestsDeferLoweredQuota(t *testing.T) {
 		case "DESCRIBE":
 			description := strings.Replace(modelDescription(3, false), fakeColumn(1, "n", "u8", false, false, respInt(0)), fakeColumn(1, "n", "text(1024)", false, false, respBulk("")), 1)
 			description = strings.ReplaceAll(description, respBulk("text(8)"), respBulk("text(1024)"))
-			description = strings.Replace(description, respInt(1<<20), respInt(1), 1)
+			description = strings.Replace(description, respInt(1<<20), respInt(13), 1)
 			writeRaw(conn, description)
 		case "SET CHUNK":
 			writeRaw(conn, respInt(8))
@@ -67,7 +67,7 @@ func TestChunkModelTypedRequestsDeferLoweredQuota(t *testing.T) {
 			t.Fatal("typed request not sent intact")
 		}
 	}
-	if schema.Options.VarMaxChunkBytes != 1 {
+	if schema.Options.VarMaxChunkBytes != 13 {
 		t.Fatal("cached quota changed")
 	}
 }
