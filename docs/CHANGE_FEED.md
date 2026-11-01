@@ -49,6 +49,7 @@ tile: 6
 
 - Watch returns when the subscription is ready; later writes are observable.
 - Area bounds are inclusive chunk coordinates; you need READ on the table.
+- Area3D supplies all six bounds for a three-dimensional table and cannot be combined with Area.
 - `ChangeEvent.Blocks` has complete Before and After records; nil means absence, while a nil field means NULL.
 - A revision orders committed changes within a table; timestamps can move backwards.
 - An epoch identifies the table's lifetime and changes when you drop and recreate it.

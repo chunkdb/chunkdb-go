@@ -42,7 +42,7 @@ func TestNeverWrittenChunkNull(t *testing.T) {
 					t.Fatalf("versioned empty chunk: %+v, %v", chunk, err)
 				}
 				raw, err = r.GetChunkRaw(t.Context(), "world", 9, 9)
-				if err != nil || string(raw) != emptyWorldForm(worldFormBytes) {
+				if err != nil || string(raw) != emptyWorldForm() {
 					t.Fatalf("versioned empty raw chunk: %v", err)
 				}
 				return nil

@@ -12,6 +12,9 @@ import (
 // Area is an inclusive rectangle of chunk coordinates.
 type Area struct{ CX0, CY0, CX1, CY1 int64 }
 
+// Area3D is an inclusive box of three-dimensional chunk coordinates.
+type Area3D struct{ CX0, CY0, CZ0, CX1, CY1, CZ1 int64 }
+
 // Position identifies a point in a table's change stream.
 // Epoch identifies the table's lifetime; Revision orders committed changes within it.
 type Position struct {
@@ -22,9 +25,11 @@ type Position struct {
 // WatchOptions select a slot, area and optional position to resume after.
 type WatchOptions struct {
 	// Slot selects a durable consumer. Empty keeps an in-memory watch.
-	Slot  string
-	Area  *Area
-	After *Position
+	Slot string
+	Area *Area
+	// Area3D selects an explicit three-axis box and cannot be combined with Area.
+	Area3D *Area3D
+	After  *Position
 	// Columns selects a persisted projection; nil inherits slot filters.
 	Columns  []string
 	NoBefore bool
@@ -142,7 +147,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		}
 		statement += " SLOT '" + opts.Slot + "'"
 	}
-	filters, err := feedFilterClause("WATCH", opts.Area, opts.Columns, opts.NoBefore, opts.Chunks)
+	filters, err := feedFilterClause("WATCH", opts.Area, opts.Area3D, opts.Columns, opts.NoBefore, opts.Chunks)
 	if err != nil {
 		return nil, err
 	}

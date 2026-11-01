@@ -57,6 +57,10 @@ jobs:
         shell: bash
         run: |
           branch="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          if [ "$branch" = "feat/chunk-model" ]; then
+            printf 'ref=%s\n' '4842a36e3809c88331fa4a6e42c46775e53770e1' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           requested_ref="refs/heads/$branch"
           ref=main
           if remote_refs=$(git ls-remote --exit-code --heads https://github.com/chunkdb/chunkdb.git "$requested_ref"); then
