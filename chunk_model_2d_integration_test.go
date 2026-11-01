@@ -1,6 +1,9 @@
 package chunkdb
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestIntegrationChunkModelTwoDimensions(t *testing.T) {
 	for _, tlsEnabled := range []bool{false, true} {
@@ -62,6 +65,44 @@ func TestIntegrationChunkModelTwoDimensions(t *testing.T) {
 			area, err := c.GetAreaWithSchema(t.Context(), "", 0, 0, 1, 0, "n")
 			if err != nil || len(area.Chunks) != 2 || area.Chunks[1].Chunk.Metadata["owner"] != uint64(3) {
 				t.Fatal(area, err)
+			}
+			createTable(t, c, "quota", TableSpec{ChunkWidth: 1, ChunkHeight: 1,
+				Columns:      []ColumnDef{{Name: "n", Type: TypeUint(8)}, {Name: "text", Type: TypeText(1024)}},
+				ChunkColumns: []ColumnDef{{Name: "label", Type: TypeText(1024), Null: true}}})
+			quotaSchema, err := c.Schema(t.Context(), "quota")
+			if err != nil {
+				t.Fatal(err)
+			}
+			large := NewChunk(quotaSchema)
+			large.SetBlock(0, 0, Record{"text": strings.Repeat("x", 512)})
+			large.Metadata = Record{"label": strings.Repeat("y", 512)}
+			if _, err = c.SetChunk(t.Context(), "quota", 0, 0, large); err != nil {
+				t.Fatal(err)
+			}
+			if err = c.SetTableOption(t.Context(), "quota", "var_max_chunk_bytes", 13); err != nil {
+				t.Fatal(err)
+			}
+			large, err = c.GetChunk(t.Context(), "quota", 0, 0)
+			if err != nil || large.Metadata["label"] != strings.Repeat("y", 512) {
+				t.Fatal(large, err)
+			}
+			if _, err = c.SetChunk(t.Context(), "quota", 0, 0, large); err != nil {
+				t.Fatal("non-growing full replacement", err)
+			}
+			large.Columns["text"][0] = strings.Repeat("x", 400)
+			if _, err = c.SetChunkColumns(t.Context(), "quota", 0, 0, []string{"text"}, large); err != nil {
+				t.Fatal("shrinking partial replacement", err)
+			}
+			shrunk, err := c.GetChunk(t.Context(), "quota", 0, 0)
+			if err != nil || shrunk.Block(0, 0)["text"] != strings.Repeat("x", 400) || shrunk.Metadata["label"] != strings.Repeat("y", 512) {
+				t.Fatal(shrunk, err)
+			}
+			raw, err = c.GetChunkRaw(t.Context(), "quota", 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = c.SetChunkRaw(t.Context(), "quota", 0, 0, raw); err != nil {
+				t.Fatal("non-growing raw replacement", err)
 			}
 		})
 	}

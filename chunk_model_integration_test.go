@@ -98,8 +98,18 @@ func TestIntegrationChunkModelThreeDimensions(t *testing.T) {
 			if err != nil || len(ball) != 1 || ball[0].CX != 0 || ball[0].CY != 0 || ball[0].CZ != 0 {
 				t.Fatal(ball, err)
 			}
-			if _, err := c.SetChunkMetadata3D(t.Context(), "", 0, 0, 0, Record{"owner": 3}, IfAbsent()); !isServerCode(err, CodeConditionFailed) {
-				t.Fatal(err)
+			_, err = c.SetChunkMetadata3D(t.Context(), "", 0, 0, 0, Record{"owner": 3}, IfAbsent())
+			var mismatch *VersionMismatchError
+			if !errors.As(err, &mismatch) || mismatch.Current != chunk.Version || mismatch.Current == 0 {
+				t.Fatal("occupied IF ABSENT must return current producing version", err)
+			}
+			unchanged, err := c.GetChunkRaw3D(t.Context(), "", 0, 0, 0)
+			if err != nil || !bytes.Equal(raw, unchanged) {
+				t.Fatal("failed condition changed chunk state", err)
+			}
+			quiet, err := c.ScanChunks3DWithOptions(t.Context(), "", ScanOptions3D{Since: page.Position})
+			if err != nil || len(quiet.Chunks) != 0 || quiet.Position == nil || *quiet.Position != *page.Position {
+				t.Fatal("failed condition advanced the completed frontier", quiet, err)
 			}
 			if _, err := c.SetChunkMetadata3D(t.Context(), "", 1, 0, 0, Record{"owner": 6}, IfAbsent()); err != nil {
 				t.Fatal(err)

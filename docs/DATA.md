@@ -110,6 +110,7 @@ The incoming presence removes absent blocks, retains unnamed values on continuin
 Tx stages these updates for COMMIT; Pool exposes the same helpers through leased clients.
 
 `IfAbsent()` permits a chunk write only when the chunk is not populated; retained tombstones count as absent and metadata-only populated chunks do not.
+An occupied chunk returns `VersionMismatchError` with its current version and leaves the chunk unchanged.
 It cannot be combined with `IfVersion` or used for block writes.
 These conditions report `VersionMismatchError` when refused.
 Stored variable data stays readable after lowering its table write quota.

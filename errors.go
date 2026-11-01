@@ -223,7 +223,8 @@ func (e *Error) Is(target error) bool {
 }
 
 // VersionMismatchError is returned by a write with [IfVersion] when the chunk
-// is no longer at that version. Nothing was changed. It wraps the server's
+// is no longer at that version, or with [IfAbsent] when the chunk is populated.
+// Nothing was changed. It wraps the server's
 // [*Error] (code [CodeVersionMismatch]) and matches [ErrVersionMismatch] and
 // [ErrServer].
 type VersionMismatchError struct {
