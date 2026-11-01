@@ -132,7 +132,8 @@ Standalone encoding uses the supplied schema's configured budget.
 Scans across several requests do not share a snapshot.
 The option-based scan helpers return Epoch, nullable Position, and RetainedDeletionFloor with each page.
 Pass a saved Epoch to bind subsequent pages to the same table lifetime.
-Since selects versions strictly greater than that revision and includes retained deletions; history below RetainedDeletionFloor fails explicitly.
+Since selects versions strictly greater than that revision and includes retained deletions.
+History below RetainedDeletionFloor returns RESYNC_REQUIRED with reason=history_lost and Metadata.Floor; rebuild the snapshot before resuming.
 WithData supplies decoded forms, and Deleted distinguishes a tombstone from a live form.
 Deleted is nil without WithData, because version-only entries do not report whether they were deleted.
 Columns requires WithData and preserves complete chunk metadata.

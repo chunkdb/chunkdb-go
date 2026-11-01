@@ -145,8 +145,8 @@ func RetryClassForCode(code string) RetryClass {
 // ErrorMetadata exposes known keys without discarding unknown diagnostic keys.
 // Numeric pointers are nil when missing or outside the uint64 domain.
 type ErrorMetadata struct {
-	Reason, Table, Column, Epoch, Stage                             string
-	Current, Expected, Actual, Revision, ConnectionID, RetryAfterMS *uint64
+	Reason, Table, Column, Epoch, Stage                                    string
+	Current, Expected, Actual, Revision, ConnectionID, RetryAfterMS, Floor *uint64
 }
 
 const (
@@ -163,6 +163,8 @@ const (
 	CodeTimeout        = "TIMEOUT"
 	CodeKilled         = "KILLED"
 	CodeUnknownCommand = "UNKNOWN_COMMAND"
+	// CodeResyncRequired: retained history no longer covers the requested revision.
+	CodeResyncRequired = "RESYNC_REQUIRED"
 )
 
 // Error is the error type returned by every operation in this package.
@@ -455,7 +457,7 @@ func parseErrorKeys(message string) (map[string]string, string) {
 
 func errorMetadata(keys map[string]string) ErrorMetadata {
 	m := ErrorMetadata{Reason: keys["reason"], Table: keys["table"], Column: keys["column"], Epoch: keys["epoch"], Stage: keys["stage"]}
-	for key, dest := range map[string]**uint64{"current": &m.Current, "expected": &m.Expected, "actual": &m.Actual, "revision": &m.Revision, "connection_id": &m.ConnectionID, "retry_after_ms": &m.RetryAfterMS} {
+	for key, dest := range map[string]**uint64{"current": &m.Current, "expected": &m.Expected, "actual": &m.Actual, "revision": &m.Revision, "connection_id": &m.ConnectionID, "retry_after_ms": &m.RetryAfterMS, "floor": &m.Floor} {
 		if value, err := strconv.ParseUint(keys[key], 10, 64); err == nil {
 			*dest = &value
 		}

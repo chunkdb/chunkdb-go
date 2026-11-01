@@ -41,7 +41,7 @@ func TestChunkModelScanRetainsZeroZAndTombstoneVersion(t *testing.T) {
 		case 1:
 			writeRaw(conn, scanReply(respArray(respArray(respInt(1), respInt(2), respInt(0), "(18446744073709551615\r\n")), false, respNull, 0))
 		case 2:
-			writeRaw(conn, "-ERR INVALID_ARGUMENT reason=tombstone_history_lost requested history has been compacted\r\n")
+			writeRaw(conn, "-ERR RESYNC_REQUIRED reason=history_lost floor=18446744073709551614 current=18446744073709551615 requested history has been compacted\r\n")
 		}
 	}))
 	client := newTestClient(t, server, nil)
@@ -73,7 +73,7 @@ func TestChunkModelScanRetainsZeroZAndTombstoneVersion(t *testing.T) {
 	mode.Store(2)
 	_, err = client.ScanChunks3DWithOptions(t.Context(), "space", options)
 	var serverError *Error
-	if !errors.As(err, &serverError) || serverError.ServerCode != CodeInvalidArgument || serverError.Metadata.Reason != "tombstone_history_lost" {
+	if !errors.As(err, &serverError) || serverError.ServerCode != CodeResyncRequired || serverError.Metadata.Reason != "history_lost" || serverError.Metadata.Floor == nil || *serverError.Metadata.Floor != math.MaxUint64-1 || serverError.Metadata.Current == nil || *serverError.Metadata.Current != math.MaxUint64 || serverError.RetryClass != RetryFatal {
 		t.Fatalf("history loss hidden: %v", err)
 	}
 }
