@@ -70,6 +70,7 @@ chunks: 1
 - `GetChunk` and `GetChunkRaw` return `nil, nil` for a never-written chunk.
 - Create its first form with `NewChunk(schema)` and an unconditional write.
 - Collection keeps an empty written chunk's version and commit time in a retained tombstone.
+- Typed chunk decoding and raw writes require the checked CKCF form for both table dimensions.
 - `Schema.Locate` maps block coordinates to chunk and local coordinates, including negative addresses.
 - `GetArea` uses inclusive chunk bounds and returns chunks with present blocks or nonbaseline chunk metadata.
 - `GetAreaAround` selects chunks within a radius.

@@ -64,8 +64,7 @@ func decodeMetadataValue(column Column, raw []byte, null bool) (any, error) {
 	return append([]byte{}, raw...), nil
 }
 
-// Decode the checked section contract without consulting the legacy layout.
-// Public dispatch changes together with the server's coordinated format switch.
+// Decode the checked section contract for every active dimension.
 func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chunk, error) {
 	count, depth, err := sectionedGeometry(schema)
 	if err != nil {

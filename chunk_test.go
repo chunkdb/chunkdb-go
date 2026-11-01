@@ -47,19 +47,15 @@ func TestChunkFormLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeChunk: %v", err)
 	}
-	// The form the server answers for this chunk (see docs/CQL.md): chunk
-	// version 2, schema version 1, presence, then the columns.
-	want := []byte{2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0x01}
-	want = append(want, bytes.Repeat([]byte{0xff}, 8)...)
-	want = append(want, make([]byte, 24)...)
-	want = append(want, 0xfd, 0, 0, 0, 0x01)
-	want = append(want, 0x13, 0, 0)
-	want = binary.LittleEndian.AppendUint32(want, 3)
-	want = binary.LittleEndian.AppendUint32(want, 0)
-	want = binary.LittleEndian.AppendUint32(want, 2)
-	want = append(want, "hi"...)
-	if !bytes.Equal(form, want) {
-		t.Fatalf("got  %v\nwant %v", form, want)
+	// The public encoder emits the checked envelope and stable descriptors.
+	parsed, err := parseSectionedForm(form, uint64(len(form)), true)
+	if err != nil || parsed.header.schema != 1 || parsed.header.version != 2 ||
+		!bytes.Equal(parsed.section(sectionPresence), []byte{1}) {
+		t.Fatalf("checked form: %+v, %v", parsed, err)
+	}
+	spans, err := parseFormBlockSpans(parsed, 4)
+	if err != nil || len(spans) != 3 || spans[0].id != 1 || spans[1].id != 2 || spans[2].id != 4 {
+		t.Fatalf("stable descriptors: %+v, %v", spans, err)
 	}
 
 	decoded, err := DecodeChunk(schema, form)
@@ -130,18 +126,10 @@ func TestDecodeChunkWithColumns(t *testing.T) {
 	schema := worldSchema()
 	chunk := NewChunk(schema)
 	chunk.SetBlock(1, 0, Record{"id": 5, "name": "x", "blob": []byte{9}, "temp": -1})
-	full, err := EncodeChunk(schema, chunk)
+	form, err := encodeSectionedChunk(schema, chunk, "name", "temp")
 	if err != nil {
-		t.Fatalf("EncodeChunk: %v", err)
+		t.Fatal(err)
 	}
-	// name, then temp: versions, presence, temp's values and validity bits,
-	// then the value of name.
-	form := append([]byte{}, full[:17]...)
-	form = append(form, full[17+5:17+5+5]...)
-	form = binary.LittleEndian.AppendUint32(form, 9)
-	form = binary.LittleEndian.AppendUint32(form, 1)
-	form = binary.LittleEndian.AppendUint32(form, 1)
-	form = append(form, 'x')
 
 	decoded, err := DecodeChunk(schema, form, "name", "temp")
 	if err != nil {
@@ -157,16 +145,28 @@ func TestDecodeChunkRejectsBadForms(t *testing.T) {
 	chunk := NewChunk(schema)
 	chunk.SetBlock(0, 0, Record{"id": 1, "name": "abc"})
 	form, _ := EncodeChunk(schema, chunk)
-	fixedEnd := len(form) - 12 - 3
-
+	var variableOffset int
+	for i := 0; i < int(binary.LittleEndian.Uint16(form[32:])); i++ {
+		entry := form[36+12*i:]
+		if binary.LittleEndian.Uint16(entry) == sectionVariable {
+			variableOffset = int(binary.LittleEndian.Uint32(entry[4:]))
+			break
+		}
+	}
+	if variableOffset == 0 {
+		t.Fatal("missing variable section")
+	}
+	unknownID := bytes.Clone(form)
+	binary.LittleEndian.PutUint32(unknownID[variableOffset:], 99)
+	absentBlock := bytes.Clone(form)
+	binary.LittleEndian.PutUint32(absentBlock[variableOffset+4:], 3)
+	otherSchema := bytes.Clone(form)
+	binary.LittleEndian.PutUint64(otherSchema[16:], 2)
 	cases := map[string][]byte{
-		"too short":         form[:16],
-		"other schema":      append(append(append([]byte{}, form[:8]...), 2), form[9:]...),
-		"cut in a column":   form[:28],
-		"cut in a header":   form[:fixedEnd+6],
-		"cut in a value":    form[:len(form)-1],
-		"unknown column id": append(append([]byte{}, form[:fixedEnd]...), 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-		"absent block":      append(append([]byte{}, form[:fixedEnd]...), 9, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0),
+		"too short": form[:16], "other schema": otherSchema,
+		"cut in a column": form[:100], "cut in a header": form[:variableOffset+6],
+		"cut in a value":    form[:variableOffset+12+2],
+		"unknown column id": unknownID, "absent block": absentBlock,
 	}
 	for name, bad := range cases {
 		t.Run(name, func(t *testing.T) {

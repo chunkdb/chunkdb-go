@@ -514,13 +514,6 @@ func getChunk(ctx context.Context, s session, table string, cx, cy int64, column
 		if err != nil {
 			return nil, err
 		}
-		if len(z) != 0 {
-			chunk, err := decodeSectionedChunk(schema, form, names...)
-			if isMalformed(err) {
-				return nil, &staleSchemaError{err: err}
-			}
-			return chunk, err
-		}
 		return decodeOrStale(schema, form, names)
 	})
 	return chunk, annotate(command, err)
@@ -593,13 +586,7 @@ func setChunk(ctx context.Context, s session, table string, cx, cy int64, chunk 
 		// Admission depends on the stored size, which only the server knows.
 		writeSchema := *schema
 		writeSchema.Options.VarMaxChunkBytes = maxSectionedVariableBytes
-		var form []byte
-		var err error
-		if len(z) != 0 {
-			form, err = encodeSectionedChunk(&writeSchema, chunk)
-		} else {
-			form, err = EncodeChunk(&writeSchema, chunk)
-		}
+		form, err := EncodeChunk(&writeSchema, chunk)
 		if err != nil {
 			return Reply{}, err
 		}
@@ -642,23 +629,15 @@ func setChunkRaw(ctx context.Context, s session, table string, cx, cy int64, for
 		return Reply{}, requestErrorf(command, "the chunk form is nil")
 	}
 	return withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
-		var limit uint64
-		var err error
-		if len(z) != 0 {
-			limit, err = sectionedChunkFormLimit(schema)
-		} else {
-			limit, err = chunkFormLimit(schema)
-		}
+		limit, err := chunkFormLimit(schema)
 		if err != nil {
 			return Reply{}, err
 		}
 		if uint64(len(form)) > limit {
 			return Reply{}, requestErrorf(command, "chunk form for table %s takes at most %d bytes, got %d", name, limit, len(form))
 		}
-		if len(z) != 0 {
-			if _, err := parseSectionedForm(form, limit, true); err != nil {
-				return Reply{}, err
-			}
+		if _, err := parseSectionedForm(form, limit, true); err != nil {
+			return Reply{}, err
 		}
 		return setChunkForm(ctx, s, name, cx, cy, form, clause, z...)
 	})

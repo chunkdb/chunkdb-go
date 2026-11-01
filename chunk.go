@@ -1,73 +1,14 @@
 package chunkdb
 
-import (
-	"bytes"
-	"encoding/binary"
-	"math"
-	"slices"
-)
+import "math"
 
 // varEntryHeaderBytes is the column id, block index and length before each
 // text or bytes value of a chunk form.
 const varEntryHeaderBytes = 12
 
-// formHeaderBytes is the chunk version and the schema version that start a
-// chunk form.
-const formHeaderBytes = 16
-
-// chunkFormLimit matches the server's full legacy form parameter bound.
-// Variable columns use their shared byte budget rather than a fixed width.
+// chunkFormLimit bounds a checked chunk mutation before sending its frame.
 func chunkFormLimit(schema *Schema) (uint64, error) {
-	const command = "SET CHUNK"
-	if schema.Dims != 0 && schema.Dims != 2 {
-		return 0, requestErrorf(command, "raw chunk writes support 2 dimensions, got %d", schema.Dims)
-	}
-	if schema.ChunkWidth <= 0 || schema.ChunkHeight <= 0 {
-		return 0, requestErrorf(command, "invalid chunk geometry for table %s", schema.Table)
-	}
-	width, height := uint64(schema.ChunkWidth), uint64(schema.ChunkHeight)
-	overflow := func() (uint64, error) {
-		return 0, requestErrorf(command, "chunk form size overflows uint64 for table %s", schema.Table)
-	}
-	if width > math.MaxUint64/height {
-		return overflow()
-	}
-	count := width * height
-	bytesForBits := func(bits uint64) uint64 {
-		return bits/8 + min(bits%8, 1)
-	}
-	presence := bytesForBits(count)
-	limit := uint64(formHeaderBytes) + presence
-	for _, column := range schema.Columns {
-		if column.Type.Kind == ColumnUnknown {
-			return 0, requestErrorf(command, "cannot write raw chunk: column %s has unknown type %s", column.Name, column.Type.RawType)
-		}
-		if err := column.Type.validate(); err != nil {
-			return 0, annotate(command, err)
-		}
-		bits, fixed := column.Type.fixedWidth()
-		if !fixed {
-			continue
-		}
-		if count > math.MaxUint64/uint64(bits) {
-			return overflow()
-		}
-		section := bytesForBits(count * uint64(bits))
-		if column.Null {
-			if section > math.MaxUint64-presence {
-				return overflow()
-			}
-			section += presence
-		}
-		if section > math.MaxUint64-limit {
-			return overflow()
-		}
-		limit += section
-	}
-	if schema.Options.VarMaxChunkBytes > math.MaxUint64-limit {
-		return overflow()
-	}
-	return limit + schema.Options.VarMaxChunkBytes, nil
+	return sectionedChunkFormLimit(schema)
 }
 
 // Chunk is a decoded chunk form: its version, the schema version it was
@@ -209,123 +150,11 @@ func formColumns(schema *Schema, names []string) ([]int, error) {
 	return indexes, nil
 }
 
-// DecodeChunk decodes a chunk form of a table with schema: the chunk version
-// and the schema version (u64 little-endian each), the presence bitmap, per
-// fixed-width column its values and, for a NULL column, its validity bits,
-// then the text and bytes values. columns names the columns the form was read
-// with (GET CHUNK ... COLUMNS), in that order; none means every column. A form
-// of another schema version than schema's is an error.
-// Text and bytes values are mapped to columns by [Column.ID].
+// DecodeChunk decodes a checked chunk form with complete chunk metadata.
+// columns names its block-column projection; none means every block column.
+// The form must match the supplied schema version and active dimensions.
 func DecodeChunk(schema *Schema, form []byte, columns ...string) (*Chunk, error) {
-	indexes, err := formColumns(schema, columns)
-	if err != nil {
-		return nil, err
-	}
-	for _, index := range indexes {
-		col := schema.Columns[index]
-		if col.Type.Kind == ColumnUnknown {
-			return nil, protocolErrorf("", "cannot decode legacy chunk form with unknown column type %s; use raw chunk APIs or known-column reads", col.Type.RawType)
-		}
-	}
-
-	bad := func(format string, args ...any) (*Chunk, error) {
-		return nil, protocolErrorf("", "chunk form of table "+schema.Table+": "+format, args...)
-	}
-	count := schema.BlockCount()
-	presenceBytes := (count + 7) / 8
-	if len(form) < formHeaderBytes+presenceBytes {
-		return bad("%d bytes is shorter than its versions and presence", len(form))
-	}
-	chunk := &Chunk{
-		Version:       binary.LittleEndian.Uint64(form),
-		SchemaVersion: binary.LittleEndian.Uint64(form[8:]),
-		Width:         schema.ChunkWidth,
-		Height:        schema.ChunkHeight,
-		Present:       make([]bool, count),
-		Columns:       make(map[string][]any, len(indexes)),
-	}
-	if chunk.SchemaVersion != schema.Version {
-		return bad("encoded for schema version %d, not %d", chunk.SchemaVersion, schema.Version)
-	}
-	presence := form[formHeaderBytes : formHeaderBytes+presenceBytes]
-	for i := range count {
-		chunk.Present[i] = bitAt(presence, i)
-	}
-	offset := formHeaderBytes + presenceBytes
-
-	var varColumns []int
-	for _, index := range indexes {
-		column := schema.Columns[index]
-		values := make([]any, count)
-		chunk.Columns[column.Name] = values
-		width, fixed := column.Type.fixedWidth()
-		if !fixed {
-			varColumns = append(varColumns, index)
-			for i := range count {
-				if chunk.Present[i] && !column.Null {
-					values[i] = emptyValue(column.Type)
-				}
-			}
-			continue
-		}
-		valueBytes := (count*width + 7) / 8
-		validityBytes := 0
-		if column.Null {
-			validityBytes = presenceBytes
-		}
-		if len(form) < offset+valueBytes+validityBytes {
-			return bad("%d bytes ends inside column %s", len(form), column.Name)
-		}
-		section := form[offset : offset+valueBytes]
-		validity := form[offset+valueBytes : offset+valueBytes+validityBytes]
-		for i := range count {
-			if !chunk.Present[i] || (column.Null && !bitAt(validity, i)) {
-				continue
-			}
-			values[i] = readFixed(column.Type, section, i*width, width)
-		}
-		offset += valueBytes + validityBytes
-	}
-
-	for offset < len(form) {
-		if len(form)-offset < varEntryHeaderBytes {
-			return bad("a text or bytes value is cut off")
-		}
-		id := binary.LittleEndian.Uint32(form[offset:])
-		block := int(binary.LittleEndian.Uint32(form[offset+4:]))
-		length := int(binary.LittleEndian.Uint32(form[offset+8:]))
-		offset += varEntryHeaderBytes
-		if length > len(form)-offset {
-			return bad("a text or bytes value is cut off")
-		}
-		value := form[offset : offset+length]
-		offset += length
-		index, err := varColumnOf(schema, varColumns, id)
-		if err != nil {
-			return nil, err
-		}
-		if block >= count || !chunk.Present[block] {
-			return bad("a value of column %s belongs to an absent block %d", schema.Columns[index].Name, block)
-		}
-		column := schema.Columns[index]
-		if column.Type.Kind == ColumnText {
-			chunk.Columns[column.Name][block] = string(value)
-		} else {
-			chunk.Columns[column.Name][block] = bytes.Clone(value)
-		}
-	}
-	return chunk, nil
-}
-
-// varColumnOf maps the column id of a text or bytes value to a schema index
-// among the form's text and bytes columns.
-func varColumnOf(schema *Schema, varColumns []int, id uint32) (int, error) {
-	for _, index := range varColumns {
-		if schema.Columns[index].ID == id {
-			return index, nil
-		}
-	}
-	return 0, protocolErrorf("", "chunk form of table %s: a text or bytes value of column id %d, which it was not read with", schema.Table, id)
+	return decodeSectionedChunk(schema, form, columns...)
 }
 
 func emptyValue(t ColumnType) any {
@@ -420,113 +249,7 @@ func writeFixed(t ColumnType, section []byte, off, width int, value any) {
 // it takes the column's default, else zero or empty, and is an error in a
 // REQUIRED column without a default.
 func EncodeChunk(schema *Schema, chunk *Chunk) ([]byte, error) {
-	for _, col := range schema.Columns {
-		if col.Type.Kind == ColumnUnknown {
-			return nil, protocolErrorf("", "cannot decode or encode legacy chunk form with unknown column type %s; use raw chunk APIs or known-column reads", col.Type.RawType)
-		}
-	}
-
-	if chunk == nil {
-		return nil, requestErrorf("", "the chunk is nil")
-	}
-	count := schema.BlockCount()
-	if chunk.Width != schema.ChunkWidth || chunk.Height != schema.ChunkHeight || len(chunk.Present) != count {
-		return nil, requestErrorf("", "the chunk is %dx%d blocks with %d presence entries; table %s has %dx%d blocks",
-			chunk.Width, chunk.Height, len(chunk.Present), schema.Table, schema.ChunkWidth, schema.ChunkHeight)
-	}
-	for name := range chunk.Columns {
-		if schema.columnIndex(name) < 0 {
-			return nil, requestErrorf("", "table %s has no column %s", schema.Table, name)
-		}
-	}
-	presenceBytes := (count + 7) / 8
-	form := make([]byte, formHeaderBytes+presenceBytes, formHeaderBytes+presenceBytes+count)
-	binary.LittleEndian.PutUint64(form, chunk.Version)
-	binary.LittleEndian.PutUint64(form[8:], schema.Version)
-	for i, present := range chunk.Present {
-		if present {
-			form[formHeaderBytes+i/8] |= 1 << (i % 8)
-		}
-	}
-
-	type entry struct {
-		id    uint32
-		block int
-		value []byte
-	}
-	var entries []entry
-	varBytes := uint64(0)
-	for _, column := range schema.Columns {
-		values, ok := chunk.Columns[column.Name]
-		if !ok || len(values) != count {
-			return nil, requestErrorf("", "the chunk needs %d values of column %s, got %d", count, column.Name, len(values))
-		}
-		width, fixed := column.Type.fixedWidth()
-		var section, validity []byte
-		if fixed {
-			section = make([]byte, (count*width+7)/8)
-			if column.Null {
-				validity = make([]byte, presenceBytes)
-			}
-		}
-		for i, raw := range values {
-			if !chunk.Present[i] {
-				continue
-			}
-			value, err := normalize(column.Name, column.Type, raw)
-			if err != nil {
-				return nil, err
-			}
-			if value == nil && !column.Null {
-				if column.Required && column.Default == nil {
-					return nil, requestErrorf("", "column %s is REQUIRED: block %d has no value", column.Name, i)
-				}
-				value = column.Default
-				if value == nil {
-					value = zeroValue(column.Type)
-				}
-			}
-			if value == nil {
-				continue
-			}
-			if fixed {
-				writeFixed(column.Type, section, i*width, width, value)
-				if column.Null {
-					validity[i/8] |= 1 << (i % 8)
-				}
-				continue
-			}
-			data := encodeNormalized(value)
-			if len(data) == 0 && !column.Null {
-				// The empty value of a column that cannot be NULL has no entry.
-				continue
-			}
-			entries = append(entries, entry{id: column.ID, block: i, value: data})
-			varBytes += uint64(varEntryHeaderBytes + len(data))
-		}
-		form = append(form, section...)
-		form = append(form, validity...)
-	}
-	if limit := schema.Options.VarMaxChunkBytes; limit > 0 && varBytes > limit {
-		return nil, requestErrorf("", "the chunk's text and bytes values take %d bytes; table %s holds at most %d (var_max_chunk_bytes)",
-			varBytes, schema.Table, limit)
-	}
-	slices.SortStableFunc(entries, func(a, b entry) int {
-		if a.id != b.id {
-			if a.id < b.id {
-				return -1
-			}
-			return 1
-		}
-		return a.block - b.block
-	})
-	for _, e := range entries {
-		form = binary.LittleEndian.AppendUint32(form, e.id)
-		form = binary.LittleEndian.AppendUint32(form, uint32(e.block))
-		form = binary.LittleEndian.AppendUint32(form, uint32(len(e.value)))
-		form = append(form, e.value...)
-	}
-	return form, nil
+	return encodeSectionedChunk(schema, chunk)
 }
 
 func zeroValue(t ColumnType) any {

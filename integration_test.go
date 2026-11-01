@@ -463,7 +463,7 @@ func TestIntegrationChunkNull(t *testing.T) {
 		t.Fatalf("written empty chunk: %+v, %v", chunk, err)
 	}
 	raw, err := client.GetChunkRaw(ctx, "", 0, 0, "id")
-	if err != nil || len(raw) < 16 || binary.LittleEndian.Uint64(raw) != version {
+	if err != nil || len(raw) < sectionedHeaderBytes || binary.LittleEndian.Uint64(raw[8:]) != version {
 		t.Fatalf("written empty raw chunk: %v, %v", raw, err)
 	}
 	checkUnpopulated()
@@ -630,11 +630,11 @@ func TestIntegrationChunks(t *testing.T) {
 		t.Fatalf("SetChunkRaw: %v", err)
 	}
 	again, err := client.GetChunkRaw(ctx, "things", 10, 10)
-	if err != nil || !bytes.Equal(again[8:], raw[8:]) {
+	if err != nil || !bytes.Equal(again[:8], raw[:8]) || !bytes.Equal(again[16:24], raw[16:24]) || !bytes.Equal(again[32:], raw[32:]) {
 		t.Fatalf("GetChunkRaw: %v; the copy differs", err)
 	}
-	if _, err := client.SetChunkRaw(ctx, "things", 10, 10, raw[:12]); !isServerCode(err, CodeInvalidArgument) {
-		t.Fatalf("got %v, want INVALID_ARGUMENT for a short form", err)
+	if _, err := client.SetChunkRaw(ctx, "things", 10, 10, raw[:12]); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("got %v, want local refusal for a short form", err)
 	}
 }
 
