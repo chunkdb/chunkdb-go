@@ -8,6 +8,9 @@ uses protocol 3 (CQL); see the engine's
 
 ## Unreleased
 
+### Added
+- `SlotOptions.Owner` creates a slot for a named user with `CREATE SLOT ... OWNER`, and `Slot.Owner` reports the owner from SHOW SLOTS when the server shows it.
+
 ### Documentation
 - A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.
 - Shorten user guides and check their Go examples against a real server.
