@@ -93,7 +93,7 @@ func ParseColumnType(text string) (ColumnType, error) {
 			continue
 		}
 		digits, ok := strings.CutSuffix(rest, ")")
-		size, err := strconv.ParseUint(strings.TrimSpace(digits), 10, 32)
+		size, err := strconv.ParseUint(strings.TrimSpace(digits), 10, 31)
 		if !ok || err != nil {
 			return invalid()
 		}
@@ -158,7 +158,7 @@ func (t ColumnType) validate() error {
 	case ColumnBits:
 		ok = t.Size >= 1 && t.Size <= 65535
 	case ColumnText, ColumnBytes:
-		ok = t.Size >= 1 && t.Size <= math.MaxUint32
+		ok = t.Size >= 1 && t.Size <= math.MaxInt32
 	}
 	if !ok {
 		return requestErrorf("", "invalid column type %s", t)

@@ -303,14 +303,15 @@ func TestClientHelloRejectsBadReplies(t *testing.T) {
 	}
 
 	cases := map[string]string{
-		"protocol 2":             respMap(append([]string{"protocol", respInt(2)}, limits...)...),
-		"protocol missing":       respMap(limits...),
-		"max_line_bytes missing": without("max_line_bytes"),
-		"max_parameters missing": without("max_parameters"),
-		"server_version missing": without("server_version"),
-		"max_scan_limit zero":    strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":1024", ":0", 1),
-		"not a map":              "+OK\r\n",
-		"a bulk string":          respBulk("protocol=3\n"),
+		"protocol 2":                   respMap(append([]string{"protocol", respInt(2)}, limits...)...),
+		"protocol missing":             respMap(limits...),
+		"max_line_bytes missing":       without("max_line_bytes"),
+		"max_parameters missing":       without("max_parameters"),
+		"server_version missing":       without("server_version"),
+		"max_scan_limit zero":          strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":1024", ":0", 1),
+		"max_response_bytes over 2^40": strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":67108864", ":1099511627777", 1),
+		"not a map":                    "+OK\r\n",
+		"a bulk string":                respBulk("protocol=3\n"),
 	}
 
 	for name, reply := range cases {

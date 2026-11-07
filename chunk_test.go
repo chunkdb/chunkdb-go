@@ -167,6 +167,8 @@ func TestDecodeChunkRejectsBadForms(t *testing.T) {
 		"cut in a value":    form[:len(form)-1],
 		"unknown column id": append(append([]byte{}, form[:fixedEnd]...), 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
 		"absent block":      append(append([]byte{}, form[:fixedEnd]...), 9, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0),
+		"block over int32":  append(append([]byte{}, form[:fixedEnd]...), 9, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0),
+		"length over int32": append(append([]byte{}, form[:fixedEnd]...), 9, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff),
 	}
 	for name, bad := range cases {
 		t.Run(name, func(t *testing.T) {
