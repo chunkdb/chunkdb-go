@@ -9,6 +9,7 @@ uses protocol 3 (CQL); see the engine's
 ## Unreleased
 
 ### Documentation
+- A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.
 - Shorten user guides and check their Go examples against a real server.
 - Use timestamped backup names and link to the server's resync and ACK persistence guidance.
 - Rewrite the README and package overview for chunkdb 2.0, with separate data, values, users, transactions, feed/slots, migrations, backup and connection guides.
