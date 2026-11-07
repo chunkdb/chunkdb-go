@@ -163,14 +163,14 @@ func (c *collector) waitLine(t *testing.T, prefix string) string {
 	return ""
 }
 
-// waitStored waits for the stored line of a change; only skipped duplicates may come first.
+// waitStored waits for the stored line of a change; only skipped duplicates and schema lines may come first.
 func (c *collector) waitStored(t *testing.T, epoch string, revision uint64) {
 	t.Helper()
 	want := fmt.Sprintf("stored %s:%d", epoch, revision)
 	for {
 		if line := c.waitLine(t, ""); line == want {
 			return
-		} else if !strings.HasPrefix(line, "skipped ") {
+		} else if !strings.HasPrefix(line, "skipped ") && !strings.HasPrefix(line, "stored schema ") {
 			t.Fatalf("collector line %q, want %q; output:\n%s", line, want, c.text())
 		}
 	}
@@ -187,29 +187,40 @@ func (c *collector) wait(t *testing.T) error {
 	return nil
 }
 
-func journalRevisions(t *testing.T, path string) []uint64 {
+// journalLines returns the journal as "schema <version>" and "change <revision> schema <version>" lines.
+func journalLines(t *testing.T, path string) []string {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var revisions []uint64
+	var lines []string
 	for _, line := range strings.SplitAfter(string(data), "\n") {
 		if line == "" {
 			continue
 		}
 		var stored struct {
-			Revision uint64 `json:"revision"`
-			Blocks   []struct {
+			Kind          string            `json:"kind"`
+			Revision      uint64            `json:"revision"`
+			SchemaVersion uint64            `json:"schema_version"`
+			Columns       []json.RawMessage `json:"columns"`
+			Blocks        []struct {
 				After map[string]any `json:"after"`
 			} `json:"blocks"`
 		}
-		if !strings.HasSuffix(line, "\n") || json.Unmarshal([]byte(line), &stored) != nil || len(stored.Blocks) != 1 {
+		if !strings.HasSuffix(line, "\n") || json.Unmarshal([]byte(line), &stored) != nil {
 			t.Fatalf("journal line %q", line)
 		}
-		revisions = append(revisions, stored.Revision)
+		switch {
+		case stored.Kind == "schema" && len(stored.Columns) > 0:
+			lines = append(lines, fmt.Sprintf("schema %d", stored.SchemaVersion))
+		case stored.Kind == "change" && len(stored.Blocks) == 1:
+			lines = append(lines, fmt.Sprintf("change %d schema %d", stored.Revision, stored.SchemaVersion))
+		default:
+			t.Fatalf("journal line %q", line)
+		}
 	}
-	return revisions
+	return lines
 }
 
 func TestIntegrationJournalExampleResumesWithoutDuplicates(t *testing.T) {
@@ -245,6 +256,7 @@ func TestIntegrationJournalExampleResumesWithoutDuplicates(t *testing.T) {
 	// From here no acknowledgement reaches the server, as if each one were lost to a crash after the store synced.
 	proxy.hold()
 	var stored []uint64
+	want := []string{"schema 1"}
 	for x := int64(1); x <= 3; x++ {
 		revision, err := c.SetBlock(t.Context(), "journal_go", x, 0, Record{"tile": x})
 		if err != nil {
@@ -252,6 +264,7 @@ func TestIntegrationJournalExampleResumesWithoutDuplicates(t *testing.T) {
 		}
 		first.waitStored(t, schema.Epoch, revision)
 		stored = append(stored, revision)
+		want = append(want, fmt.Sprintf("change %d schema 1", revision))
 	}
 	// The first collector stored and synced each change, but none of its acknowledgements arrived.
 	if err := first.command.Process.Signal(syscall.SIGKILL); err != nil {
@@ -261,6 +274,17 @@ func TestIntegrationJournalExampleResumesWithoutDuplicates(t *testing.T) {
 	slots, err := c.Slots(t.Context(), "journal_go")
 	if err != nil || len(slots) != 1 || slots[0].Acked >= stored[0] {
 		t.Fatalf("slot before resume = %+v, %v; want acked below %d", slots, err, stored[0])
+	}
+	// A crash during a write leaves a last line without its newline, which the resumed run removes.
+	torn, err := os.OpenFile(journal, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := torn.WriteString(`{"kind":"change","epoch":"`); err != nil {
+		t.Fatal(err)
+	}
+	if err := torn.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	// The server can still hold the killed collector's watch, so the resumed run takes it over.
@@ -272,14 +296,25 @@ func TestIntegrationJournalExampleResumesWithoutDuplicates(t *testing.T) {
 	}
 	second.waitStored(t, schema.Epoch, revision)
 	stored = append(stored, revision)
+	want = append(want, fmt.Sprintf("change %d schema 1", revision))
+	// A schema change is stored once, before the first change that uses its columns.
+	if err := c.AddColumn(t.Context(), "journal_go", ColumnDef{Name: "light", Type: TypeUint(4), Default: 15}); err != nil {
+		t.Fatal(err)
+	}
+	if revision, err = c.SetBlock(t.Context(), "journal_go", 1, 1, Record{"tile": 5}); err != nil {
+		t.Fatal(err)
+	}
+	second.waitStored(t, schema.Epoch, revision)
+	stored = append(stored, revision)
+	want = append(want, "schema 2", fmt.Sprintf("change %d schema 2", revision))
 	if err := second.command.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
 	}
 	if err := second.wait(t); err != nil || !strings.HasSuffix(second.text(), "stopped\n") {
 		t.Fatalf("second collector: %v\n%s", err, second.text())
 	}
-	if got := journalRevisions(t, journal); !reflect.DeepEqual(got, stored) {
-		t.Fatalf("journal revisions = %v, want each change once: %v", got, stored)
+	if got := journalLines(t, journal); !reflect.DeepEqual(got, want) {
+		t.Fatalf("journal = %q, want each change and schema version once: %q", got, want)
 	}
 	slots, err = c.Slots(t.Context(), "journal_go")
 	if err != nil || len(slots) != 1 || slots[0].Acked != revision {

@@ -1,8 +1,8 @@
 // Run with CHUNKDB_URI=chunk://admin:password@127.0.0.1:4242/ go run ./examples/journal.
 //
-// The collector follows a durable slot and appends each change to a JSON Lines file.
+// The collector follows a durable slot and appends each change and schema description to a JSON Lines file.
 // It syncs the file before it acknowledges the change, so an acknowledged change is always stored.
-// On start it resumes after the last stored position and skips changes the file already holds.
+// On start it resumes after the last stored change and skips changes and schema versions the file already holds.
 // Interrupt it to stop; the slot keeps its acknowledged position.
 package main
 
@@ -24,14 +24,33 @@ import (
 	chunkdb "github.com/chunkdb/chunkdb-go/v2"
 )
 
-// entry is one committed change as stored in the journal, one JSON object per line.
-type entry struct {
-	Epoch    string  `json:"epoch"`
-	Revision uint64  `json:"revision"`
-	TimeMs   uint64  `json:"time_ms"`
-	User     *string `json:"user"`
-	Txn      *uint64 `json:"txn,omitempty"`
-	Blocks   []block `json:"blocks"`
+// header starts every journal line; kind is "schema" or "change".
+type header struct {
+	Kind          string `json:"kind"`
+	Epoch         string `json:"epoch"`
+	Revision      uint64 `json:"revision"`
+	SchemaVersion uint64 `json:"schema_version"`
+}
+
+// schemaEntry holds the columns of every later change; blocks stored before it keep the earlier columns.
+type schemaEntry struct {
+	header
+	Columns []column `json:"columns"`
+}
+
+type column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Null bool   `json:"null,omitempty"`
+}
+
+// changeEntry is one committed change.
+type changeEntry struct {
+	header
+	TimeMs uint64  `json:"time_ms"`
+	User   *string `json:"user"`
+	Txn    *uint64 `json:"txn,omitempty"`
+	Blocks []block `json:"blocks"`
 }
 
 // block holds the values before and after the change; null means the block is absent.
@@ -41,6 +60,13 @@ type block struct {
 	Z      chunkdb.Coordinate `json:"z,omitempty"`
 	Before map[string]any     `json:"before"`
 	After  map[string]any     `json:"after"`
+}
+
+// state is what the journal already holds.
+type state struct {
+	epoch  string            // epoch of the last line, or "" for an empty journal
+	change *chunkdb.Position // last stored change, or nil
+	schema uint64            // last stored schema version
 }
 
 func main() {
@@ -63,7 +89,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	journal, last, err := openJournal(*path)
+	journal, held, err := openJournal(*path)
 	if err != nil {
 		return err
 	}
@@ -76,14 +102,12 @@ func run() error {
 		return err
 	}
 	defer client.Close()
-	opts := chunkdb.WatchOptions{Slot: *slot, Takeover: *takeover}
-	if last == nil {
+	opts := chunkdb.WatchOptions{Slot: *slot, Takeover: *takeover, After: held.change}
+	if held.epoch == "" {
 		// The slot holds only changes committed after it exists; earlier state is in a base snapshot.
 		if err := client.CreateSlotWithOptions(setup, *table, *slot, chunkdb.SlotOptions{IfNotExists: true}); err != nil {
 			return explain(err, *table, *slot)
 		}
-	} else {
-		opts.After = last
 	}
 	watch, err := client.Watch(setup, *table, opts)
 	if err != nil {
@@ -103,17 +127,20 @@ func run() error {
 		switch e := event.(type) {
 		case *chunkdb.ChangeEvent:
 			position := e.Position
-			if last != nil && position.Epoch != last.Epoch {
-				return fmt.Errorf("change in epoch %s after journal epoch %s: start a new journal from a base snapshot", position.Epoch, last.Epoch)
+			if held.epoch != "" && position.Epoch != held.epoch {
+				return fmt.Errorf("change in epoch %s after journal epoch %s: start a new journal from a base snapshot", position.Epoch, held.epoch)
 			}
-			if last != nil && position.Revision <= last.Revision {
+			if len(e.Tag) > 0 || len(e.ChunkChanges) > 0 {
+				return fmt.Errorf("change %s:%d carries a tag or chunk changes, which this journal does not store", position.Epoch, position.Revision)
+			}
+			if held.change != nil && position.Revision <= held.change.Revision {
 				// A crash before the ACK reached the server can deliver a stored change again.
 				fmt.Printf("skipped %s:%d\n", position.Epoch, position.Revision)
 			} else {
-				if err := appendEntry(journal, e); err != nil {
+				if err := appendLine(journal, changeLine(e)); err != nil {
 					return err
 				}
-				last = &position
+				held.epoch, held.change = position.Epoch, &position
 				fmt.Printf("stored %s:%d\n", position.Epoch, position.Revision)
 			}
 			if err := watch.Ack(ctx, position.Revision); err != nil {
@@ -122,9 +149,23 @@ func run() error {
 				}
 				return explain(err, *table, *slot)
 			}
+		case *chunkdb.SchemaEvent:
+			if held.epoch != "" && e.Position.Epoch != held.epoch {
+				return fmt.Errorf("schema in epoch %s after journal epoch %s: start a new journal from a base snapshot", e.Position.Epoch, held.epoch)
+			}
+			// A watch describes the schema before its first change, so a resumed watch repeats a stored version.
+			if held.epoch != "" && e.Version <= held.schema {
+				fmt.Printf("skipped schema version %d\n", e.Version)
+				continue
+			}
+			if err := appendLine(journal, schemaLine(e)); err != nil {
+				return err
+			}
+			held.epoch, held.schema = e.Position.Epoch, e.Version
+			fmt.Printf("stored schema version %d at %s:%d\n", e.Version, e.Position.Epoch, e.Position.Revision)
 		case *chunkdb.ResyncEvent:
 			return fmt.Errorf("resync at %s:%d: the slot no longer holds the changes after this journal; rebuild from a base snapshot and start a new journal", e.Position.Epoch, e.Position.Revision)
-		case *chunkdb.ProgressEvent, *chunkdb.SchemaEvent:
+		case *chunkdb.ProgressEvent:
 			// Nothing to store. A slot with AREA must also store and acknowledge progress.
 		default:
 			return fmt.Errorf("unexpected %T: this example stores block changes from a slot without CHUNKS", event)
@@ -149,32 +190,32 @@ func explain(err error, table, slot string) error {
 	}
 	switch server.ServerCode {
 	case chunkdb.CodeSlotLost:
-		return fmt.Errorf("slot %s on %s is lost, so this journal has a gap: take a base snapshot, drop and recreate the slot, and start a new journal: %w", slot, table, err)
-	case "SLOT_BUSY":
+		return fmt.Errorf("slot %s on %s is lost, so this journal has a gap: drop and recreate the slot, then take a base snapshot and start a new journal: %w", slot, table, err)
+	case chunkdb.CodeSlotBusy:
 		return fmt.Errorf("slot %s on %s has another watcher: stop it, or run with -takeover to replace a watcher left by an earlier run: %w", slot, table, err)
 	case chunkdb.CodeNoTable:
 		return fmt.Errorf("table %s is missing or this user can no longer read it: %w", table, err)
-	case "KILLED":
+	case chunkdb.CodeKilled:
 		return fmt.Errorf("another watcher took over slot %s on %s: %w", slot, table, err)
 	}
 	return err
 }
 
-// openJournal opens the journal for appending and returns its last stored position, or nil when it is empty.
+// openJournal opens the journal for appending and returns what it already holds.
 // A last line without its newline never finished its sync, so it was never acknowledged; it is removed and delivered again.
-func openJournal(path string) (*os.File, *chunkdb.Position, error) {
+func openJournal(path string) (*os.File, state, error) {
+	var held state
 	_, statErr := os.Stat(path)
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, nil, err
+		return nil, held, err
 	}
 	if errors.Is(statErr, os.ErrNotExist) {
 		if err := syncDir(filepath.Dir(path)); err != nil {
 			file.Close()
-			return nil, nil, err
+			return nil, held, err
 		}
 	}
-	var last *chunkdb.Position
 	var complete int64
 	reader := bufio.NewReader(file)
 	for {
@@ -184,15 +225,24 @@ func openJournal(path string) (*os.File, *chunkdb.Position, error) {
 		}
 		if err != nil {
 			file.Close()
-			return nil, nil, err
+			return nil, held, err
 		}
-		var stored entry
+		var stored header
 		if err := json.Unmarshal(line, &stored); err != nil {
 			file.Close()
-			return nil, nil, fmt.Errorf("%s: entry at byte %d: %w", path, complete, err)
+			return nil, held, fmt.Errorf("%s: entry at byte %d: %w", path, complete, err)
 		}
 		complete += int64(len(line))
-		last = &chunkdb.Position{Epoch: stored.Epoch, Revision: stored.Revision}
+		held.epoch = stored.Epoch
+		switch stored.Kind {
+		case "schema":
+			held.schema = stored.SchemaVersion
+		case "change":
+			held.change = &chunkdb.Position{Epoch: stored.Epoch, Revision: stored.Revision}
+		default:
+			file.Close()
+			return nil, held, fmt.Errorf("%s: entry at byte %d has kind %q", path, complete-int64(len(line)), stored.Kind)
+		}
 	}
 	info, err := file.Stat()
 	if err == nil && info.Size() > complete {
@@ -202,20 +252,32 @@ func openJournal(path string) (*os.File, *chunkdb.Position, error) {
 	}
 	if err != nil {
 		file.Close()
-		return nil, nil, err
+		return nil, held, err
 	}
-	return file, last, nil
+	return file, held, nil
 }
 
-// appendEntry writes the change as one line and waits until the file is synced.
-func appendEntry(file *os.File, change *chunkdb.ChangeEvent) error {
-	stored := entry{
-		Epoch: change.Position.Epoch, Revision: change.Position.Revision,
-		TimeMs: change.CommitTimeMs, User: change.User, Txn: change.Txn,
+func schemaLine(e *chunkdb.SchemaEvent) schemaEntry {
+	stored := schemaEntry{header: header{Kind: "schema", Epoch: e.Position.Epoch, Revision: e.Position.Revision, SchemaVersion: e.Version}}
+	for _, c := range e.Columns {
+		stored.Columns = append(stored.Columns, column{Name: c.Name, Type: c.Type.String(), Null: c.Null})
 	}
-	for _, b := range change.Blocks {
+	return stored
+}
+
+func changeLine(e *chunkdb.ChangeEvent) changeEntry {
+	stored := changeEntry{
+		header: header{Kind: "change", Epoch: e.Position.Epoch, Revision: e.Position.Revision, SchemaVersion: e.SchemaVersion},
+		TimeMs: e.CommitTimeMs, User: e.User, Txn: e.Txn,
+	}
+	for _, b := range e.Blocks {
 		stored.Blocks = append(stored.Blocks, block{X: b.X, Y: b.Y, Z: b.Z, Before: values(b.Before), After: values(b.After)})
 	}
+	return stored
+}
+
+// appendLine writes the entry as one line and waits until the file is synced.
+func appendLine(file *os.File, stored any) error {
 	line, err := json.Marshal(stored)
 	if err != nil {
 		return err
