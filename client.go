@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"maps"
+	"math"
 	"net"
 	"slices"
 	"strings"
@@ -879,7 +880,7 @@ func parseServerInfo(reply Reply) (*ServerInfo, error) {
 	} {
 		value, _ := reply.Lookup(field.key)
 		number, ok := value.Int64()
-		if !ok || number <= 0 || number > 1<<40 {
+		if !ok || number <= 0 || number > min(1<<40, math.MaxInt) {
 			return nil, protocolErrorf("HELLO", "HELLO reply has no valid %s", field.key)
 		}
 		*field.target = int(number)

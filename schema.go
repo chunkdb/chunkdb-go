@@ -292,7 +292,7 @@ func parsePair(reply Reply, key string) (int, int, error) {
 	}
 	width, okWidth := pair.Array[0].Int64()
 	height, okHeight := pair.Array[1].Int64()
-	if !okWidth || !okHeight || width <= 0 || height <= 0 || width > 1<<31 || height > 1<<31 {
+	if !okWidth || !okHeight || width <= 0 || height <= 0 || width > math.MaxInt32 || height > math.MaxInt32 {
 		return 0, 0, protocolErrorf("DESCRIBE", "malformed DESCRIBE reply: %s", key)
 	}
 	return int(width), int(height), nil

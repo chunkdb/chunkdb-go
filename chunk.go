@@ -252,19 +252,21 @@ func DecodeChunk(schema *Schema, form []byte, columns ...string) (*Chunk, error)
 			return bad("a text or bytes value is cut off")
 		}
 		id := binary.LittleEndian.Uint32(form[offset:])
-		block := int(binary.LittleEndian.Uint32(form[offset+4:]))
-		length := int(binary.LittleEndian.Uint32(form[offset+8:]))
+		// Compared as uint64 before indexing, so a header value above the
+		// largest int is refused rather than turned negative.
+		block := binary.LittleEndian.Uint32(form[offset+4:])
+		length := binary.LittleEndian.Uint32(form[offset+8:])
 		offset += varEntryHeaderBytes
-		if length > len(form)-offset {
+		if uint64(length) > uint64(len(form)-offset) {
 			return bad("a text or bytes value is cut off")
 		}
-		value := form[offset : offset+length]
-		offset += length
+		value := form[offset : offset+int(length)]
+		offset += int(length)
 		index, err := varColumnOf(schema, varColumns, id)
 		if err != nil {
 			return nil, err
 		}
-		if block >= count || !chunk.Present[block] {
+		if uint64(block) >= uint64(count) || !chunk.Present[block] {
 			return bad("a value of column %s belongs to an absent block %d", schema.Columns[index].Name, block)
 		}
 		column := schema.Columns[index]

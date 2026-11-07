@@ -9,19 +9,21 @@ import (
 
 func TestParseColumnType(t *testing.T) {
 	cases := map[string]ColumnType{
-		"u1":            TypeUint(1),
-		"u64":           TypeUint(64),
-		"i2":            TypeInt(2),
-		"I64":           TypeInt(64),
-		"bool":          TypeBool(),
-		"f32":           TypeF32(),
-		"f64":           TypeF64(),
-		"bits(1)":       TypeBits(1),
-		"bits(65535)":   TypeBits(65535),
-		"text(256)":     TypeText(256),
-		"bytes(4)":      TypeBytes(4),
-		" bytes( 4 ) ":  TypeBytes(4),
-		"text(1048576)": TypeText(1 << 20),
+		"u1":                TypeUint(1),
+		"u64":               TypeUint(64),
+		"i2":                TypeInt(2),
+		"I64":               TypeInt(64),
+		"bool":              TypeBool(),
+		"f32":               TypeF32(),
+		"f64":               TypeF64(),
+		"bits(1)":           TypeBits(1),
+		"bits(65535)":       TypeBits(65535),
+		"text(256)":         TypeText(256),
+		"bytes(4)":          TypeBytes(4),
+		" bytes( 4 ) ":      TypeBytes(4),
+		"text(1048576)":     TypeText(1 << 20),
+		"text(2147483647)":  TypeText(math.MaxInt32),
+		"bytes(2147483647)": TypeBytes(math.MaxInt32),
 	}
 	for text, want := range cases {
 		got, err := ParseColumnType(text)
@@ -30,9 +32,15 @@ func TestParseColumnType(t *testing.T) {
 		}
 	}
 	for _, text := range []string{"", "u0", "u65", "i1", "i65", "u", "u+8", "f16", "bits(0)", "bits(65536)",
-		"text(0)", "text", "text(x)", "bytes(4", "int", "u8 NULL"} {
+		"text(0)", "text", "text(x)", "bytes(4", "int", "u8 NULL",
+		"text(2147483648)", "text(4294967295)", "bytes(2147483648)", "bytes(4294967295)", "text(18446744073709551615)"} {
 		if _, err := ParseColumnType(text); !errors.Is(err, ErrProtocol) {
 			t.Fatalf("ParseColumnType(%q): got %v, want an error", text, err)
+		}
+	}
+	for _, size := range []int64{1 << 31, math.MaxUint32} {
+		if int64(int(size)) == size && (TypeText(int(size)).validate() == nil || TypeBytes(int(size)).validate() == nil) {
+			t.Fatalf("size %d was accepted", size)
 		}
 	}
 	for _, text := range []string{"u10", "i8", "bool", "f32", "f64", "bits(3)", "text(16)", "bytes(4)"} {
