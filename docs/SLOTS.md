@@ -92,7 +92,7 @@ Schema, resync and unknown events never raise that bound.
 Takeover resumes from the persisted ACK, so unacknowledged events remain replayable.
 
 Slots reports typed Filters, LostReason and Owner metadata.
-Owner is shown to that user and to users who manage users; it is nil otherwise and for unowned slots.
+Owner is shown to that user, to users who manage users and to everyone on a server started with `--auth none`; it is nil otherwise and for unowned slots.
 Filters.Columns aligns current display names with stable ColumnIDs; a dropped column keeps its ID and has a nil name.
 A rename changes the display name without changing that persisted identity.
 Area stores lower coordinates followed by upper coordinates, with its length determined by dimensions.

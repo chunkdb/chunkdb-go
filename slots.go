@@ -17,7 +17,8 @@ type Slot struct {
 	LostReason *string
 	// Owner is the user the slot belongs to. It is nil when the slot has no
 	// recorded owner, when the viewer is neither that user nor a user who
-	// manages users, or for servers that do not report owners.
+	// manages users on a server that requires logins, or for servers that do
+	// not report owners.
 	Owner  *string
 	Fields map[string]Reply
 }
