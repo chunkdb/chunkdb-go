@@ -28,6 +28,7 @@
 //
 // [Client] supports concurrent use on one connection; [Pool] leases several connections.
 // Credentials use SCRAM-SHA-256; chunks:// enables TLS.
+// Over TLS each login is bound to its connection, so a login relayed by something that ends TLS fails; set [Options.ChannelBinding] to [ChannelBindingOff] behind a load balancer that ends TLS.
 // Network methods take a context; an interrupted in-flight request closes its connection.
 // The next ordinary request reconnects without replaying the failed request; a failed write's outcome can be unknown.
 //
