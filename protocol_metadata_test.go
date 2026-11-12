@@ -271,11 +271,12 @@ func TestFoundationExplicitTableSelection(t *testing.T) {
 	}
 }
 
-func TestDescribeChunkSizesFitInt32(t *testing.T) {
+func TestDescribeGeometryLimits(t *testing.T) {
 	r := readOne(t, describeReply("world", 1, []string{fakeColumn(1, "id", "u8", false, false, respInt(0))}))
-	for _, key := range []string{"chunk", "large"} {
-		largest := replaceMapValue(r, key, readOne(t, respArray(respInt(math.MaxInt32), respInt(math.MaxInt32))))
-		schema, err := parseSchema(largest)
+	// A chunk side is at most 4096 blocks, 1048576 blocks in all; a large side is at most 1000000 chunks.
+	for key, largest := range map[string][2]int64{"chunk": {4096, 256}, "large": {1000000, 1000000}} {
+		reply := replaceMapValue(r, key, readOne(t, respArray(respInt(largest[0]), respInt(largest[1]))))
+		schema, err := parseSchema(reply)
 		if err != nil {
 			t.Fatal(key, err)
 		}
@@ -283,10 +284,11 @@ func TestDescribeChunkSizesFitInt32(t *testing.T) {
 		if key == "large" {
 			width, height = schema.LargeWidth, schema.LargeHeight
 		}
-		if width != math.MaxInt32 || height != math.MaxInt32 {
+		if int64(width) != largest[0] || int64(height) != largest[1] {
 			t.Fatalf("%s: got %d x %d", key, width, height)
 		}
-		for _, pair := range [][2]int64{{1 << 31, 1}, {1, 1 << 31}, {math.MaxUint32, 1}, {1, math.MaxUint32}} {
+		over := largest[0] + 1
+		for _, pair := range [][2]int64{{over, 1}, {1, over}, {1 << 31, 1}, {1, 1 << 31}, {math.MaxUint32, 1}, {1, math.MaxUint32}} {
 			bad := replaceMapValue(r, key, readOne(t, respArray(respInt(pair[0]), respInt(pair[1]))))
 			if _, err := parseSchema(bad); !errors.Is(err, ErrProtocol) {
 				t.Fatalf("%s %v: got %v, want ErrProtocol", key, pair, err)

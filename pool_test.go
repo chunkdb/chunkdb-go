@@ -335,7 +335,7 @@ func TestPoolMirrorsClientCommands(t *testing.T) {
 		{"get chunk", func() error { _, err := pool.GetChunk(ctx, "", 1, 2); return err },
 			"GET CHUNK 1 2 FROM world COLUMNS id, temp, solid, h, d, mask, name, blob"},
 		{"get chunk raw", func() error { _, err := pool.GetChunkRaw(ctx, "", 1, 2, "id"); return err }, "GET CHUNK 1 2 FROM world COLUMNS id"},
-		{"set chunk raw", func() error { _, err := pool.SetChunkRaw(ctx, "", 1, 2, []byte{0}); return err }, "SET CHUNK 1 2 IN world $1"},
+		{"set chunk raw", func() error { _, err := pool.SetChunkRaw(ctx, "", 1, 2, []byte(emptyWorldForm())); return err }, "SET CHUNK 1 2 IN world $1"},
 		{"get area", func() error { _, err := pool.GetArea(ctx, "", 1, 2, 3, 4, "id"); return err }, "GET AREA 1 2 TO 3 4 FROM world COLUMNS id"},
 		{"get area around", func() error { _, err := pool.GetAreaAround(ctx, "", 1, 2, 3, "id"); return err },
 			"GET AREA AROUND 1 2 RADIUS 3 FROM world COLUMNS id"},
