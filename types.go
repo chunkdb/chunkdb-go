@@ -59,6 +59,12 @@ type Options struct {
 	CA   []byte
 	Cert []byte
 	Key  []byte
+	// ChannelBinding binds each login made over TLS to its connection, so a
+	// login relayed by something that ends TLS fails. Empty means
+	// [ChannelBindingAuto]; use [ChannelBindingOff] when TLS ends at a load
+	// balancer in front of the server, and [ChannelBindingRequire] to refuse
+	// connections whose login cannot be bound.
+	ChannelBinding ChannelBinding
 
 	// PipelineDepth caps concurrent in-flight requests on one connection.
 	// Zero and one both mean sequential request/reply.

@@ -160,6 +160,10 @@ func TestDecodeChunkRejectsBadForms(t *testing.T) {
 	binary.LittleEndian.PutUint32(unknownID[variableOffset:], 99)
 	absentBlock := bytes.Clone(form)
 	binary.LittleEndian.PutUint32(absentBlock[variableOffset+4:], 3)
+	blockOver := bytes.Clone(form)
+	binary.LittleEndian.PutUint32(blockOver[variableOffset+4:], 0xffffffff)
+	lengthOver := bytes.Clone(form)
+	binary.LittleEndian.PutUint32(lengthOver[variableOffset+8:], 0xffffffff)
 	otherSchema := bytes.Clone(form)
 	binary.LittleEndian.PutUint64(otherSchema[16:], 2)
 	cases := map[string][]byte{
@@ -167,6 +171,7 @@ func TestDecodeChunkRejectsBadForms(t *testing.T) {
 		"cut in a column": form[:100], "cut in a header": form[:variableOffset+6],
 		"cut in a value":    form[:variableOffset+12+2],
 		"unknown column id": unknownID, "absent block": absentBlock,
+		"block over int32": blockOver, "length over int32": lengthOver,
 	}
 	for name, bad := range cases {
 		t.Run(name, func(t *testing.T) {

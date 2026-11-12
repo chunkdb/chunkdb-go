@@ -58,6 +58,7 @@ After a crash, skip already applied revisions; an ACK alone cannot prevent dupli
 |---|---|
 | Slot names | `[a-z_][a-z0-9_]*`, at most 63 bytes. |
 | Create or drop | ADMIN on the table. |
+| Watch | READ for the slot's owner; another user also needs ADMIN on `*`. |
 | Active watches | One per slot; another receives `CodeSlotBusy`. |
 | Retention | Table's `slot_max_bytes`; exceeded history makes the slot lost. |
 | ACK bound | Last delivered change/chunks/progress event or initial position. |
@@ -74,6 +75,10 @@ See [Change feed](CHANGE_FEED.md) for events and [server recovery](https://githu
 Area3D uses explicit three-axis lower and upper corners; supplying both area forms is refused before sending.
 Omitted watch filters inherit the slot's filters; explicitly supplied filters must match.
 Changing filters requires a different slot, and IfNotExists also checks the existing filters.
+SlotOptions.Owner sets the user the slot belongs to; that user need not exist yet.
+An empty Owner makes the creating user the owner, or records no owner on a server started with `--auth none`.
+A slot without an owner belongs to the first user that watches it without ADMIN on `*`.
+IfNotExists with a different Owner returns `CodeInvalidArgument` with reason `slot_filters`.
 Dropping a projected column makes the slot lost instead of broadening its projection.
 
 WatchOptions.Takeover requires a slot and revokes its previous owner with `KILLED reason=slot_takeover`.
@@ -87,7 +92,8 @@ Next must return a progress event before Ack can cover its revision.
 Schema, resync and unknown events never raise that bound.
 Takeover resumes from the persisted ACK, so unacknowledged events remain replayable.
 
-Slots reports typed Filters and LostReason metadata.
+Slots reports typed Filters, LostReason and Owner metadata.
+Owner is shown to that user, to users who manage users and to everyone on a server started with `--auth none`; it is nil otherwise and for unowned slots.
 Filters.Columns aligns current display names with stable ColumnIDs; a dropped column keeps its ID and has a nil name.
 A rename changes the display name without changing that persisted identity.
 Area stores lower coordinates followed by upper coordinates, with its length determined by dimensions.

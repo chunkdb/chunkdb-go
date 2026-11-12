@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"maps"
+	"math"
 	"net"
 	"slices"
 	"strings"
@@ -32,6 +33,8 @@ type resolvedOptions struct {
 	ca             []byte
 	cert           []byte
 	key            []byte
+	// channelBinding is never empty: "" resolves to ChannelBindingAuto.
+	channelBinding ChannelBinding
 	pipelineDepth  int
 	table          string
 	// verifierIterations is the PBKDF2 iteration count of new verifiers.
@@ -98,6 +101,20 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		return resolvedOptions{}, connectionErrorf("", nil, "invalid table name %q: names are [a-z_][a-z0-9_]*", table)
 	}
 
+	channelBinding := cmp.Or(opts.ChannelBinding, ChannelBindingAuto)
+	switch channelBinding {
+	case ChannelBindingAuto, ChannelBindingOff:
+	case ChannelBindingRequire:
+		if !secure {
+			return resolvedOptions{}, connectionErrorf("", nil, "ChannelBinding require needs TLS: use a chunks:// URI or Options.TLS")
+		}
+		if user == "" {
+			return resolvedOptions{}, connectionErrorf("", nil, "ChannelBinding require needs a user: only a login with a user can be bound")
+		}
+	default:
+		return resolvedOptions{}, connectionErrorf("", nil, "invalid ChannelBinding %q: use auto, off or require", opts.ChannelBinding)
+	}
+
 	session, err := sessionOptions(opts.SessionOptions)
 	if err != nil {
 		return resolvedOptions{}, err
@@ -121,6 +138,7 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		ca:                 opts.CA,
 		cert:               opts.Cert,
 		key:                opts.Key,
+		channelBinding:     channelBinding,
 		pipelineDepth:      max(1, opts.PipelineDepth),
 		table:              table,
 		verifierIterations: iterations,
@@ -444,13 +462,19 @@ func (c *Client) helloOn(ctx context.Context, established *conn) error {
 
 // login runs the SCRAM-SHA-256 exchange: HELLO 3 USER with the client-first
 // message, then AUTH with the client-final message. It returns the HELLO
-// reply and the server signature that reply must carry.
+// reply and the server signature that reply must carry. Under
+// [Options.ChannelBinding] the login is bound to the TLS connection, whose
+// handshake dial completed; a login that fails is not tried again unbound.
 func (c *Client) login(ctx context.Context, established *conn) (Reply, string, error) {
+	binding, err := channelBindingOf(c.opts.channelBinding, established.netConn)
+	if err != nil {
+		return Reply{}, "", err
+	}
 	nonce, err := newScramNonce()
 	if err != nil {
 		return Reply{}, "", err
 	}
-	exchange := newScramLogin(c.opts.uri.User, nonce)
+	exchange := newScramLogin(c.opts.uri.User, nonce, binding)
 	statement, params := helloOptions("HELLO 3 USER "+c.opts.uri.User+" $1", [][]byte{[]byte(exchange.clientFirst())}, c.opts.sessionOptions)
 	reply, err := c.execOn(ctx, established, "HELLO", statement, params)
 	if err != nil {
@@ -475,12 +499,19 @@ func (c *Client) login(ctx context.Context, established *conn) (Reply, string, e
 // helloError reports a server of an older protocol as such. A server of
 // protocol 2 answers "-ERR PROTOCOL expected HELLO 2"; a 1.x server does not
 // know HELLO, or, when it requires a token, answers AUTH_REQUIRED although
-// HELLO named a user, which a protocol 3 server never does. The server error
-// is not wrapped, so the result matches ErrProtocol and not ErrServer.
+// HELLO named a user, with no reason key. A protocol 3 server gives every error
+// a reason key, so its AUTH_REQUIRED to a login with a user, such as
+// reason=channel_binding from a server that requires channel binding, stays
+// the server's error. Otherwise the server error is not wrapped, so the
+// result matches ErrProtocol and not ErrServer.
 func (c *Client) helloError(err error) error {
 	var typed *Error
-	if errors.As(err, &typed) && ((typed.ServerCode == CodeProtocol && strings.Contains(typed.ServerMessage, "HELLO 2")) ||
-		typed.ServerCode == "UNKNOWN_COMMAND" || (typed.ServerCode == CodeAuthRequired && c.opts.uri.User != "")) {
+	if !errors.As(err, &typed) {
+		return err
+	}
+	_, hasReason := typed.ServerKeys["reason"]
+	if (typed.ServerCode == CodeProtocol && strings.Contains(typed.ServerMessage, "HELLO 2")) ||
+		typed.ServerCode == "UNKNOWN_COMMAND" || (typed.ServerCode == CodeAuthRequired && c.opts.uri.User != "" && !hasReason) {
 		return protocolErrorf("HELLO",
 			"the server speaks an older chunkdb protocol (it replied %q); this client needs a server of protocol 3",
 			typed.ServerCode+" "+typed.ServerMessage)
@@ -924,7 +955,7 @@ func parseServerInfo(reply Reply) (*ServerInfo, error) {
 	} {
 		value, _ := reply.Lookup(field.key)
 		number, ok := value.Int64()
-		if !ok || number <= 0 || number > 1<<40 {
+		if !ok || number <= 0 || number > min(1<<40, math.MaxInt) {
 			return nil, protocolErrorf("HELLO", "HELLO reply has no valid %s", field.key)
 		}
 		*field.target = int(number)

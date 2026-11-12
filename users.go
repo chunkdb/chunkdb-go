@@ -26,6 +26,9 @@ const AllTables = "*"
 type User struct {
 	Name         string
 	ManagesUsers bool
+	// RequiresChannelBinding reports that the user logs in only with a login
+	// bound to its TLS connection; false from a server that does not show it.
+	RequiresChannelBinding bool
 	// Grants maps a table name, or [AllTables], to the user's right on it.
 	Grants map[string]Right
 }
@@ -35,6 +38,9 @@ type CreateUserOptions struct {
 	// ManagesUsers lets the user create, change and drop users and grant and
 	// revoke rights.
 	ManagesUsers bool
+	// RequiresChannelBinding lets the user log in only with a login bound to
+	// its TLS connection ([Options.ChannelBinding]).
+	RequiresChannelBinding bool
 }
 
 // CreateUser creates a user with password. The client computes the user's
@@ -52,6 +58,9 @@ func (c *Client) CreateUser(ctx context.Context, name, password string, opts Cre
 	statement := "CREATE USER " + name + " VERIFIER $1"
 	if opts.ManagesUsers {
 		statement += " MANAGES USERS"
+	}
+	if opts.RequiresChannelBinding {
+		statement += " REQUIRE CHANNEL BINDING"
 	}
 	return c.userStatement(ctx, statement, []byte(verifier))
 }
@@ -80,6 +89,20 @@ func (c *Client) SetManagesUsers(ctx context.Context, name string, manages bool)
 	statement := "ALTER USER " + name + " MANAGES USERS"
 	if !manages {
 		statement = "ALTER USER " + name + " NO MANAGES USERS"
+	}
+	return c.userStatement(ctx, statement, nil)
+}
+
+// SetRequiresChannelBinding sets whether a user logs in only with a login
+// bound to its TLS connection ([Options.ChannelBinding]); an unbound login of
+// such a user fails like a wrong password. It needs MANAGES USERS.
+func (c *Client) SetRequiresChannelBinding(ctx context.Context, name string, require bool) error {
+	if err := checkNames("ALTER USER", "user", name); err != nil {
+		return err
+	}
+	statement := "ALTER USER " + name + " REQUIRE CHANNEL BINDING"
+	if !require {
+		statement = "ALTER USER " + name + " NO REQUIRE CHANNEL BINDING"
 	}
 	return c.userStatement(ctx, statement, nil)
 }
@@ -128,6 +151,12 @@ func (c *Client) Users(ctx context.Context) ([]User, error) {
 			return nil, protocolErrorf(command, "a user needs name, manages_users and grants")
 		}
 		user := User{Name: string(name.Bulk), ManagesUsers: manages.Bool, Grants: make(map[string]Right, len(grants.Map))}
+		if requires, ok := item.Lookup("requires_channel_binding"); ok {
+			if requires.Kind != ReplyBoolean {
+				return nil, protocolErrorf(command, "requires_channel_binding of user %s is not a boolean", user.Name)
+			}
+			user.RequiresChannelBinding = requires.Bool
+		}
 		for _, grant := range grants.Map {
 			if grant.Key.Kind != ReplyBulk || grant.Value.Kind != ReplyBulk {
 				return nil, protocolErrorf(command, "the grants of user %s are not table names and rights", user.Name)
