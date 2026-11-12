@@ -47,6 +47,7 @@ Use TLS over an untrusted network.
 | MANAGES USERS | Permits user administration and grants, independently of table rights. |
 | `SetManagesUsers`, `DropUser`, `Users` | Require MANAGES USERS. |
 | `SetPassword` | Changes your password; another user's requires MANAGES USERS. |
+| `RequiresChannelBinding`, `SetRequiresChannelBinding` | The user logs in only with a login bound to its TLS connection; an unbound login fails like a wrong password. |
 
 The last manager cannot be dropped or lose that capability.
 Already authenticated connections remain logged in after password changes.

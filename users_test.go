@@ -17,7 +17,9 @@ func usersHandler(s *fakeServer, conn net.Conn, command string) {
 		writeRaw(conn, respArray(
 			respMap("name", respBulk("admin"), "manages_users", respBool(true),
 				"grants", respMap("*", respBulk("ADMIN"))),
-			respMap("name", respBulk("bot"), "manages_users", respBool(false),
+			// The admin entry has no requires_channel_binding, as an older
+			// server lists users.
+			respMap("name", respBulk("bot"), "manages_users", respBool(false), "requires_channel_binding", respBool(true),
 				"grants", respMap("world", respBulk("WRITE"), "terrain", respBulk("READ"))),
 		))
 	default:
@@ -51,9 +53,18 @@ func TestClientUserStatements(t *testing.T) {
 		{func() error { return client.CreateUser(ctx, "bot", "hunter2", CreateUserOptions{}) }, "CREATE USER bot VERIFIER $1"},
 		{func() error { return client.CreateUser(ctx, "ops", "hunter2", CreateUserOptions{ManagesUsers: true}) },
 			"CREATE USER ops VERIFIER $1 MANAGES USERS"},
+		{func() error {
+			return client.CreateUser(ctx, "svc", "hunter2", CreateUserOptions{ManagesUsers: true, RequiresChannelBinding: true})
+		}, "CREATE USER svc VERIFIER $1 MANAGES USERS REQUIRE CHANNEL BINDING"},
+		{func() error {
+			return client.CreateUser(ctx, "svc", "hunter2", CreateUserOptions{RequiresChannelBinding: true})
+		},
+			"CREATE USER svc VERIFIER $1 REQUIRE CHANNEL BINDING"},
 		{func() error { return client.SetPassword(ctx, "bot", "hunter2") }, "ALTER USER bot VERIFIER $1"},
 		{func() error { return client.SetManagesUsers(ctx, "bot", true) }, "ALTER USER bot MANAGES USERS"},
 		{func() error { return client.SetManagesUsers(ctx, "bot", false) }, "ALTER USER bot NO MANAGES USERS"},
+		{func() error { return client.SetRequiresChannelBinding(ctx, "bot", true) }, "ALTER USER bot REQUIRE CHANNEL BINDING"},
+		{func() error { return client.SetRequiresChannelBinding(ctx, "bot", false) }, "ALTER USER bot NO REQUIRE CHANNEL BINDING"},
 		{func() error { return client.Grant(ctx, RightRead, AllTables, "bot") }, "GRANT READ ON * TO bot"},
 		{func() error { return client.Grant(ctx, RightWrite, "", "bot") }, "GRANT WRITE ON world TO bot"},
 		{func() error { return client.Revoke(ctx, RightAdmin, "terrain", "bot") }, "REVOKE ADMIN ON terrain FROM bot"},
@@ -79,10 +90,10 @@ func TestClientUserStatements(t *testing.T) {
 	}
 	want := []User{
 		{Name: "admin", ManagesUsers: true, Grants: map[string]Right{"*": RightAdmin}},
-		{Name: "bot", Grants: map[string]Right{"world": RightWrite, "terrain": RightRead}},
+		{Name: "bot", RequiresChannelBinding: true, Grants: map[string]Right{"world": RightWrite, "terrain": RightRead}},
 	}
 	if !slices.EqualFunc(users, want, func(a, b User) bool {
-		return a.Name == b.Name && a.ManagesUsers == b.ManagesUsers && maps.Equal(a.Grants, b.Grants)
+		return a.Name == b.Name && a.ManagesUsers == b.ManagesUsers && a.RequiresChannelBinding == b.RequiresChannelBinding && maps.Equal(a.Grants, b.Grants)
 	}) {
 		t.Fatalf("got %+v, want %+v", users, want)
 	}
@@ -97,6 +108,7 @@ func TestClientUserStatementsValidateBeforeSending(t *testing.T) {
 		"user name":       func() error { return client.CreateUser(ctx, "Bot", "pw", CreateUserOptions{}) },
 		"password user":   func() error { return client.SetPassword(ctx, "a b", "pw") },
 		"manages user":    func() error { return client.SetManagesUsers(ctx, "", true) },
+		"binding user":    func() error { return client.SetRequiresChannelBinding(ctx, "x-y", true) },
 		"drop user":       func() error { return client.DropUser(ctx, "bot;") },
 		"right":           func() error { return client.Grant(ctx, Right("ALL"), "world", "bot") },
 		"table":           func() error { return client.Grant(ctx, RightRead, "World", "bot") },

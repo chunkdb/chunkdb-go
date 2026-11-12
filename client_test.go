@@ -65,14 +65,11 @@ func genericHandler(_ *fakeServer, conn net.Conn, command string) {
 		writeRaw(conn, respInt(7))
 	case "GET CHUNK":
 		// An empty form of the named columns, or of every column.
-		size := worldFormBytes
+		var columns []string
 		if _, names, ok := strings.Cut(command, " COLUMNS "); ok {
-			size = 17
-			for _, name := range strings.Split(names, ", ") {
-				size += worldSectionBytes[name]
-			}
+			columns = strings.Split(names, ", ")
 		}
-		writeRaw(conn, respBulk(emptyWorldForm(size)))
+		writeRaw(conn, respBulk(emptyWorldForm(columns...)))
 	case "GET AREA":
 		writeRaw(conn, respArray())
 	case "SCAN CHUNKS":
@@ -303,14 +300,15 @@ func TestClientHelloRejectsBadReplies(t *testing.T) {
 	}
 
 	cases := map[string]string{
-		"protocol 2":             respMap(append([]string{"protocol", respInt(2)}, limits...)...),
-		"protocol missing":       respMap(limits...),
-		"max_line_bytes missing": without("max_line_bytes"),
-		"max_parameters missing": without("max_parameters"),
-		"server_version missing": without("server_version"),
-		"max_scan_limit zero":    strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":1024", ":0", 1),
-		"not a map":              "+OK\r\n",
-		"a bulk string":          respBulk("protocol=3\n"),
+		"protocol 2":                   respMap(append([]string{"protocol", respInt(2)}, limits...)...),
+		"protocol missing":             respMap(limits...),
+		"max_line_bytes missing":       without("max_line_bytes"),
+		"max_parameters missing":       without("max_parameters"),
+		"server_version missing":       without("server_version"),
+		"max_scan_limit zero":          strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":1024", ":0", 1),
+		"max_response_bytes over 2^40": strings.Replace(respMap(append([]string{"protocol", respInt(3)}, limits...)...), ":67108864", ":1099511627777", 1),
+		"not a map":                    "+OK\r\n",
+		"a bulk string":                respBulk("protocol=3\n"),
 	}
 
 	for name, reply := range cases {
@@ -417,8 +415,11 @@ func TestClientStatementEncoding(t *testing.T) {
 			"GET CHUNK 1 -2 FROM world COLUMNS h", nil},
 		{"get chunk raw", func() error { _, err := client.GetChunkRaw(ctx, "", 1, 2); return err },
 			"GET CHUNK 1 2 FROM world", nil},
-		{"set chunk raw", func() error { _, err := client.SetChunkRaw(ctx, "", 1, 2, []byte("a\r\nb"), IfVersion(3)); return err },
-			"SET CHUNK 1 2 IN world $1 IF VERSION 3", [][]byte{[]byte("a\r\nb")}},
+		{"set chunk raw", func() error {
+			_, err := client.SetChunkRaw(ctx, "", 1, 2, []byte(emptyWorldForm()), IfVersion(3))
+			return err
+		},
+			"SET CHUNK 1 2 IN world $1 IF VERSION 3", [][]byte{[]byte(emptyWorldForm())}},
 		{"get area", func() error { _, err := client.GetArea(ctx, "", -1, -2, 3, 4, "id"); return err },
 			"GET AREA -1 -2 TO 3 4 FROM world COLUMNS id", nil},
 		{"get area around", func() error { _, err := client.GetAreaAround(ctx, "", 1, 2, 3); return err },
@@ -854,7 +855,7 @@ func TestClientSetChunkReencodesAfterASchemaMismatch(t *testing.T) {
 		case "SET CHUNK":
 			sets++
 			params := s.params[len(s.params)-1]
-			if got := int64(binary.LittleEndian.Uint64(params[0][8:])); got != schemaVersion {
+			if got := int64(binary.LittleEndian.Uint64(params[0][16:])); got != schemaVersion {
 				writeServerError(conn, fmt.Sprintf("ERR SCHEMA_MISMATCH current=%d the chunk was encoded for schema version %d", schemaVersion, got))
 				return
 			}

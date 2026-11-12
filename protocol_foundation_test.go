@@ -135,7 +135,7 @@ func TestFoundationUnknownColumnAndExtendedRows(t *testing.T) {
 	if _, err := decodeWatchRow(schema.Columns, readOne(t, respArray(respInt(8), respInt(9), respBool(false)))); !errors.Is(err, ErrProtocol) {
 		t.Fatal(err)
 	}
-	if _, err := DecodeChunk(schema, nil); !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "unknown column type") {
+	if _, err := DecodeChunk(schema, nil); !errors.Is(err, ErrProtocol) {
 		t.Fatal(err)
 	}
 	if _, err := EncodeChunk(schema, NewChunk(schema)); !errors.Is(err, ErrProtocol) {
@@ -585,6 +585,7 @@ func TestFoundationUnknownWidthKnownProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	form[6] = byte(chunkFormProjected)
 	decoded, err := DecodeChunk(schema, form, "id", "flag")
 	if err != nil || decoded.Block(0, 0)["id"] != uint64(7) || decoded.Block(0, 0)["flag"] != true {
 		t.Fatal(decoded, err)

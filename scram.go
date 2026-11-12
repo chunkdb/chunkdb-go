@@ -21,8 +21,6 @@ const (
 	verifierSaltBytes = 16
 	// scramNonceBytes is the random part of the client nonce.
 	scramNonceBytes = 18
-	// scramChannelBinding is base64("n,,"): no channel binding.
-	scramChannelBinding = "c=biws"
 )
 
 // ComputeVerifier computes the SCRAM-SHA-256 verifier of password, with a new
@@ -90,19 +88,21 @@ func newScramNonce() (string, error) {
 }
 
 // scramLogin is the client side of one SCRAM-SHA-256 login (RFC 5802, RFC
-// 7677) without channel binding.
+// 7677), bound to its TLS connection (SCRAM-SHA-256-PLUS, RFC 9266, RFC 5929)
+// when binding names a channel binding type.
 type scramLogin struct {
 	nonce     string
+	binding   scramBinding
 	firstBare string
 }
 
-func newScramLogin(user, nonce string) scramLogin {
-	return scramLogin{nonce: nonce, firstBare: "n=" + user + ",r=" + nonce}
+func newScramLogin(user, nonce string, binding scramBinding) scramLogin {
+	return scramLogin{nonce: nonce, binding: binding, firstBare: "n=" + user + ",r=" + nonce}
 }
 
 // clientFirst is the client-first message HELLO 3 USER carries.
 func (s scramLogin) clientFirst() string {
-	return "n,," + s.firstBare
+	return s.binding.header() + s.firstBare
 }
 
 // clientFinal answers the server-first message: it returns the client-final
@@ -142,7 +142,10 @@ func (s scramLogin) clientFinal(password, serverFirst string) (message, serverSi
 	if err != nil {
 		return "", "", annotate("HELLO", err)
 	}
-	withoutProof := scramChannelBinding + ",r=" + nonce
+	// c= carries the GS2 header and the channel binding data, so the proof
+	// and the server signature cover the binding; unbound, it is c=biws.
+	channelBinding := append([]byte(s.binding.header()), s.binding.data...)
+	withoutProof := "c=" + base64.StdEncoding.EncodeToString(channelBinding) + ",r=" + nonce
 	authMessage := s.firstBare + "," + serverFirst + "," + withoutProof
 	proof := hmacSHA256(keys.storedKey, authMessage)
 	for i := range proof {

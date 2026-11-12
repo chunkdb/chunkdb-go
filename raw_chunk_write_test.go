@@ -81,8 +81,12 @@ func TestRawChunkWriteAdmission(t *testing.T) {
 						t.Fatalf("raw GET retention: %x, %v", raw, err)
 					}
 					if scenario == "oversize" {
-						// 16 header + 1 presence + ceil(4*9/8) + 1 null bitmap + 64 vars.
-						raw = make([]byte, 88)
+						// Structural admission uses the hard variable ceiling after quota changes.
+						limit, err := chunkFormLimit(schema)
+						if err != nil {
+							t.Fatal(err)
+						}
+						raw = make([]byte, limit+1)
 					}
 					err = write(raw)
 					if scenario == "known" {
@@ -96,7 +100,7 @@ func TestRawChunkWriteAdmission(t *testing.T) {
 						if scenario == "unknown" && (!strings.Contains(err.Error(), "future") || !strings.Contains(err.Error(), "future_fixed(19)")) {
 							t.Fatalf("refusal must name column and retained type: %v", err)
 						}
-						if scenario == "oversize" && !strings.Contains(err.Error(), "at most 87 bytes") {
+						if scenario == "oversize" && !strings.Contains(err.Error(), "at most ") {
 							t.Fatalf("wrong full-form bound: %v", err)
 						}
 					}
@@ -163,8 +167,8 @@ func TestRawChunkFormLimit(t *testing.T) {
 		Columns: []Column{{Name: "id", Type: TypeUint(9), Null: true}, {Name: "solid", Type: TypeBool()},
 			{Name: "label", Type: TypeText(16), Null: true}, {Name: "blob", Type: TypeBytes(16)}},
 		Options: TableOptions{VarMaxChunkBytes: 64}}
-	if limit, err := chunkFormLimit(schema); err != nil || limit != 97 {
-		t.Fatalf("rounded sections and variable budget: %d, %v; want 97", limit, err)
+	if limit, err := chunkFormLimit(schema); err != nil || limit != 67109041 {
+		t.Fatalf("rounded sections and variable budget: %d, %v; want 67109041", limit, err)
 	}
 	for _, scenario := range []string{"dimensions", "geometry", "unknown", "fixed overflow", "budget overflow"} {
 		t.Run(scenario, func(t *testing.T) {

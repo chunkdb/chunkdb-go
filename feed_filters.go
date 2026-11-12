@@ -9,14 +9,28 @@ import (
 // new slot. Columns retain their declared order; nil selects every column.
 type SlotOptions struct {
 	Area        *Area
+	Area3D      *Area3D
 	Columns     []string
 	NoBefore    bool
 	Chunks      bool
 	IfNotExists bool
+	// Owner is the user the slot belongs to; the user need not exist yet.
+	// Empty leaves it to the server: the user running CREATE SLOT, or no
+	// owner on a server started with --auth none.
+	Owner string
 }
 
-func feedFilterClause(command string, area *Area, columns []string, noBefore, chunks bool) (string, error) {
+func feedFilterClause(command string, area *Area, area3D *Area3D, columns []string, noBefore, chunks bool) (string, error) {
 	clause := ""
+	if area != nil && area3D != nil {
+		return "", requestErrorf(command, "AREA needs either two or three dimensions")
+	}
+	if area3D != nil {
+		if area3D.CX0 > area3D.CX1 || area3D.CY0 > area3D.CY1 || area3D.CZ0 > area3D.CZ1 {
+			return "", requestErrorf(command, "inverted area")
+		}
+		clause += " AREA " + areaRange3D(area3D.CX0, area3D.CY0, area3D.CZ0, area3D.CX1, area3D.CY1, area3D.CZ1)
+	}
 	if area != nil {
 		if area.CX0 > area.CX1 || area.CY0 > area.CY1 {
 			return "", requestErrorf(command, "inverted area")
@@ -50,7 +64,8 @@ func feedFilterClause(command string, area *Area, columns []string, noBefore, ch
 
 // CreateSlotWithOptions creates a durable slot with fixed filters. A watch
 // omitting filters inherits them; explicit watch filters must match them.
-// IF NOT EXISTS also requires matching filters on an existing slot.
+// IF NOT EXISTS also requires matching filters on an existing slot, and the
+// same owner when Owner is set.
 func (c *Client) CreateSlotWithOptions(ctx context.Context, table, name string, opts SlotOptions) error {
 	const command = "CREATE SLOT"
 	if err := slotName(command, name); err != nil {
@@ -60,9 +75,15 @@ func (c *Client) CreateSlotWithOptions(ctx context.Context, table, name string, 
 	if err != nil {
 		return err
 	}
-	filters, err := feedFilterClause(command, opts.Area, opts.Columns, opts.NoBefore, opts.Chunks)
+	filters, err := feedFilterClause(command, opts.Area, opts.Area3D, opts.Columns, opts.NoBefore, opts.Chunks)
 	if err != nil {
 		return err
+	}
+	if opts.Owner != "" {
+		if err := checkNames(command, "user", opts.Owner); err != nil {
+			return err
+		}
+		filters += " OWNER " + opts.Owner
 	}
 	statement := command
 	if opts.IfNotExists {

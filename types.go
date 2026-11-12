@@ -59,6 +59,12 @@ type Options struct {
 	CA   []byte
 	Cert []byte
 	Key  []byte
+	// ChannelBinding binds each login made over TLS to its connection, so a
+	// login relayed by something that ends TLS fails. Empty means
+	// [ChannelBindingAuto]; use [ChannelBindingOff] when TLS ends at a load
+	// balancer in front of the server, and [ChannelBindingRequire] to refuse
+	// connections whose login cannot be bound.
+	ChannelBinding ChannelBinding
 
 	// PipelineDepth caps concurrent in-flight requests on one connection.
 	// Zero and one both mean sequential request/reply.
@@ -133,6 +139,7 @@ type WriteOption func(*writeOptions)
 
 type writeOptions struct {
 	ifVersion *uint64
+	ifAbsent  bool
 }
 
 // IfVersion makes a write conditional: it applies only while the chunk is
@@ -142,6 +149,11 @@ type writeOptions struct {
 func IfVersion(version uint64) WriteOption {
 	return func(o *writeOptions) { o.ifVersion = &version }
 }
+
+// IfAbsent applies a chunk write only when no populated chunk exists.
+// Tombstones count as absent, while metadata-only populated chunks remain present.
+// It cannot be combined with IfVersion or used for block writes.
+func IfAbsent() WriteOption { return func(o *writeOptions) { o.ifAbsent = true } }
 
 func resolveWriteOptions(opts []WriteOption) writeOptions {
 	var resolved writeOptions
@@ -163,8 +175,7 @@ type TableOptions struct {
 	WalGroupCommitUpdates uint64
 	// CheckpointCompression is "none" or "zrle".
 	CheckpointCompression string
-	// VarMaxChunkBytes is the most bytes of text and bytes values one chunk
-	// holds, counting 12 bytes per value.
+	// VarMaxChunkBytes is the shared encoded variable-value budget for block and chunk columns, counting 12 bytes per stored value.
 	VarMaxChunkBytes uint64
 	// FeedBufferBytes is the table's in-memory change-feed byte budget.
 	FeedBufferBytes uint64
@@ -188,14 +199,19 @@ type ColumnDef struct {
 // TableSpec describes a new table for [Client.CreateTable].
 type TableSpec struct {
 	Columns []ColumnDef
+	// ChunkColumns describes one row of values attached to each chunk.
+	ChunkColumns []ColumnDef
 	// ChunkWidth and ChunkHeight are the blocks of a chunk; both are
 	// required.
 	ChunkWidth  int
 	ChunkHeight int
+	// ChunkDepth selects three dimensions when positive; zero selects two.
+	ChunkDepth int
 	// LargeWidth and LargeHeight are the chunks of a large chunk (one file
 	// group on disk); zero takes the server's default.
 	LargeWidth  int
 	LargeHeight int
+	LargeDepth  int
 	Options     TableOptions
 }
 

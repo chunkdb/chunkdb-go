@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -42,6 +43,21 @@ type fakeServer struct {
 	// finished counts connections the client closed or the server dropped.
 	finished int
 	stopped  bool
+}
+
+// newTLSFakeServer is a fake server behind a TLS listener with config.
+func newTLSFakeServer(t *testing.T, config *tls.Config, handle func(*fakeServer, net.Conn, string)) *fakeServer {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	server := &fakeServer{listener: tls.NewListener(listener, config), handle: handle}
+	go server.acceptLoop()
+	t.Cleanup(server.stop)
+	return server
 }
 
 func newFakeServer(t *testing.T, handle func(*fakeServer, net.Conn, string)) *fakeServer {
@@ -320,21 +336,21 @@ func describeReply(table string, version int64, columns []string) string {
 	)
 }
 
-// worldFormBytes is the size of an empty chunk form of the fake tables:
-// chunk and schema version, presence, then the values (and validity bits) of
-// id, temp, solid, h, d and mask.
-const worldFormBytes = 16 + 1 + 5 + (4 + 1) + 1 + 16 + 32 + (2 + 1)
-
-// emptyWorldForm is an empty chunk form of size bytes at chunk version 7 and
-// schema version 1.
-func emptyWorldForm(size int) string {
-	form := make([]byte, size)
-	form[0], form[8] = 7, 1
+// emptyWorldForm is a checked versioned empty form of the fake world schema.
+func emptyWorldForm(columns ...string) string {
+	schema := worldSchema()
+	schema.Version = 1
+	for i := range schema.Columns {
+		schema.Columns[i].ID = uint32(i + 1)
+	}
+	chunk := NewChunk(schema)
+	chunk.Version = 7
+	form, err := encodeSectionedChunk(schema, chunk, columns...)
+	if err != nil {
+		panic(err)
+	}
 	return string(form)
 }
-
-// worldSectionBytes is the part of an empty chunk form each column takes.
-var worldSectionBytes = map[string]int{"id": 5, "temp": 4 + 1, "solid": 1, "h": 16, "d": 32, "mask": 2 + 1}
 
 // answerHello answers a HELLO line like a protocol 3 server started with
 // --auth none.
@@ -397,11 +413,14 @@ type fakeLogin struct {
 	password string
 	// tamper makes the server answer a wrong server signature.
 	tamper bool
+	// certificate is the DER certificate a TLS server presents, which
+	// tls-server-end-point binds; it is signed with ECDSA and SHA-256.
+	certificate []byte
 
 	mu sync.Mutex
 	// pending holds, per connection, the client-first-bare and server-first
-	// messages of a login waiting for AUTH.
-	pending map[net.Conn][2]string
+	// messages of a login waiting for AUTH, and the c= attribute it must send.
+	pending map[net.Conn][3]string
 }
 
 const fakeServerNonce = "3rfcNHYJY1ZVvWVs7j"
@@ -413,9 +432,13 @@ func (l *fakeLogin) handler(handle func(*fakeServer, net.Conn, string)) func(*fa
 		switch {
 		case strings.HasPrefix(command, "HELLO 3 USER "):
 			params := s.paramsOf(conn)
-			bare, ok := strings.CutPrefix(string(params[0]), "n,,")
+			bare, attribute, err := l.channelBinding(conn, string(params[0]))
+			if err != nil {
+				writeServerError(conn, "ERR INVALID_ARGUMENT "+err.Error())
+				return
+			}
 			_, nonce, found := strings.Cut(bare, ",r=")
-			if !ok || !found {
+			if !found {
 				writeServerError(conn, "ERR INVALID_ARGUMENT bad client-first message")
 				return
 			}
@@ -423,9 +446,9 @@ func (l *fakeLogin) handler(handle func(*fakeServer, net.Conn, string)) func(*fa
 			serverFirst := "r=" + nonce + fakeServerNonce + ",s=" + salt + ",i=4096"
 			l.mu.Lock()
 			if l.pending == nil {
-				l.pending = make(map[net.Conn][2]string)
+				l.pending = make(map[net.Conn][3]string)
 			}
-			l.pending[conn] = [2]string{bare, serverFirst}
+			l.pending[conn] = [3]string{bare, serverFirst, attribute}
 			l.mu.Unlock()
 			writeSimple(conn, "SCRAM "+serverFirst)
 		case command == "AUTH $1":
@@ -437,7 +460,7 @@ func (l *fakeLogin) handler(handle func(*fakeServer, net.Conn, string)) func(*fa
 				writeServerError(conn, "ERR PROTOCOL AUTH follows HELLO 3 USER <name> $1")
 				return
 			}
-			signature, valid := l.check(messages[0], messages[1], string(s.paramsOf(conn)[0]))
+			signature, valid := l.check(messages[0], messages[1], messages[2], string(s.paramsOf(conn)[0]))
 			if !valid {
 				writeServerError(conn, "ERR AUTH_FAILED invalid user or password")
 				return
@@ -452,13 +475,53 @@ func (l *fakeLogin) handler(handle func(*fakeServer, net.Conn, string)) func(*fa
 	}
 }
 
+// channelBinding splits the GS2 header off a client-first message and returns
+// the c= attribute the client-final message must carry on conn: the header
+// and the binding data this side of the TLS connection sees.
+func (l *fakeLogin) channelBinding(conn net.Conn, clientFirst string) (bare, attribute string, err error) {
+	header := "n,,"
+	if strings.HasPrefix(clientFirst, "p=") {
+		end := strings.Index(clientFirst, ",,")
+		if end < 0 {
+			return "", "", fmt.Errorf("bad GS2 header")
+		}
+		header = clientFirst[:end+2]
+	} else if !strings.HasPrefix(clientFirst, header) {
+		return "", "", fmt.Errorf("the client-first message starts with n,, or p=<type>,,")
+	}
+	var data []byte
+	if header != "n,," {
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			return "", "", fmt.Errorf("channel binding needs TLS")
+		}
+		state := tlsConn.ConnectionState()
+		switch header {
+		case "p=tls-exporter,,":
+			if state.Version != tls.VersionTLS13 {
+				return "", "", fmt.Errorf("tls-exporter needs TLS 1.3")
+			}
+			if data, err = state.ExportKeyingMaterial("EXPORTER-Channel-Binding", nil, 32); err != nil {
+				return "", "", err
+			}
+		case "p=tls-server-end-point,,":
+			sum := sha256.Sum256(l.certificate)
+			data = sum[:]
+		default:
+			return "", "", fmt.Errorf("unknown channel binding type")
+		}
+	}
+	return clientFirst[len(header):], "c=" + base64.StdEncoding.EncodeToString(append([]byte(header), data...)), nil
+}
+
 // check verifies a client-final message like the server does, from the
-// StoredKey alone, and returns the server signature.
-func (l *fakeLogin) check(firstBare, serverFirst, clientFinal string) (string, bool) {
+// StoredKey alone, and returns the server signature. attribute is the c=
+// attribute the message must start with.
+func (l *fakeLogin) check(firstBare, serverFirst, attribute, clientFinal string) (string, bool) {
 	withoutProof, proofText, ok := strings.Cut(clientFinal, ",p=")
 	proof, err := base64.StdEncoding.DecodeString(proofText)
 	nonce, _, _ := strings.Cut(serverFirst, ",")
-	if !ok || err != nil || len(proof) != 32 || withoutProof != "c=biws,"+nonce || !strings.HasPrefix(firstBare, "n="+l.user+",") {
+	if !ok || err != nil || len(proof) != 32 || withoutProof != attribute+","+nonce || !strings.HasPrefix(firstBare, "n="+l.user+",") {
 		return "", false
 	}
 	keys, err := deriveScramKeys(l.password, []byte("fake-salt-16byte"), 4096)
