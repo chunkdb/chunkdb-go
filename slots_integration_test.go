@@ -2,6 +2,7 @@ package chunkdb
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -155,5 +156,61 @@ func TestIntegrationSlotLost(t *testing.T) {
 	}
 	if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !isServerCode(err, CodeSlotLost) {
 		t.Fatal(err)
+	}
+}
+
+func TestIntegrationSlotOwners(t *testing.T) {
+	s := startServer(t, serverConfig{workers: 4})
+	ctx := t.Context()
+	admin := connectIntegration(t, s, nil)
+	createTable(t, admin, "owned", TableSpec{Columns: []ColumnDef{{Name: "v", Type: TypeUint(64)}}, ChunkWidth: 2, ChunkHeight: 2})
+	for _, user := range []string{"reader", "other"} {
+		if err := admin.CreateUser(ctx, user, "pw", CreateUserOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := admin.Grant(ctx, RightRead, "owned", user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := admin.CreateSlotWithOptions(ctx, "owned", "consumer", SlotOptions{Owner: "reader"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := admin.CreateSlot(ctx, "owned", "implicit"); err != nil {
+		t.Fatal(err)
+	}
+	owners := func(c *Client) map[string]*string {
+		t.Helper()
+		slots, err := c.Slots(ctx, "owned")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]*string{}
+		for _, slot := range slots {
+			got[slot.Name] = slot.Owner
+		}
+		return got
+	}
+	is := func(owner *string, want string) bool { return owner != nil && *owner == want }
+	if got := owners(admin); !is(got["consumer"], "reader") || !is(got["implicit"], "admin") {
+		t.Fatal(got)
+	}
+	reader := connectIntegration(t, s, func(o *Options) { o.URI = s.uriAs("reader", "pw") })
+	if got := owners(reader); !is(got["consumer"], "reader") || got["implicit"] != nil {
+		t.Fatal(got)
+	}
+	other := connectIntegration(t, s, func(o *Options) { o.URI = s.uriAs("other", "pw") })
+	if got := owners(other); len(got) != 2 || got["consumer"] != nil || got["implicit"] != nil {
+		t.Fatal(got)
+	}
+	if err := admin.CreateSlotWithOptions(ctx, "owned", "consumer", SlotOptions{IfNotExists: true, Owner: "reader"}); err != nil {
+		t.Fatal(err)
+	}
+	var typed *Error
+	err := admin.CreateSlotWithOptions(ctx, "owned", "consumer", SlotOptions{IfNotExists: true, Owner: "other"})
+	if !errors.As(err, &typed) || typed.ServerCode != CodeInvalidArgument || typed.Metadata.Reason != "slot_filters" {
+		t.Fatal(err)
+	}
+	if got := owners(admin); !is(got["consumer"], "reader") {
+		t.Fatal(got)
 	}
 }

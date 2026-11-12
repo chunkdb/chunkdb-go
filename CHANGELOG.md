@@ -8,7 +8,12 @@ uses protocol 3 (CQL); see the engine's
 
 ## Unreleased
 
+### Added
+- Logins over TLS are bound to their connection (SCRAM-SHA-256-PLUS with `tls-exporter` on TLS 1.3 and `tls-server-end-point` on TLS 1.2), so a login relayed by something that ends TLS fails with `AUTH_FAILED reason=channel_binding`. `Options.ChannelBinding` takes `ChannelBindingAuto` (the default), `ChannelBindingOff` and `ChannelBindingRequire`; `CreateUserOptions.RequiresChannelBinding`, `Client.SetRequiresChannelBinding` and `User.RequiresChannelBinding` manage users who log in only bound. An `AUTH_REQUIRED` reply with a reason, such as from a server started with `--auth-channel-binding require`, is reported as the server's error rather than as an older server (chunkdb/chunkdb#162).
+- `SlotOptions.Owner` creates a slot for a named user with `CREATE SLOT ... OWNER`, and `Slot.Owner` reports the owner from SHOW SLOTS when the server shows it.
+
 ### Documentation
+- A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.
 - Shorten user guides and check their Go examples against a real server.
 - Use timestamped backup names and link to the server's resync and ACK persistence guidance.
 - Rewrite the README and package overview for chunkdb 2.0, with separate data, values, users, transactions, feed/slots, migrations, backup and connection guides.
@@ -43,6 +48,7 @@ uses protocol 3 (CQL); see the engine's
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ### Fixed
+- `ParseColumnType`, DESCRIBE replies and table definitions refuse a `text(max)` or `bytes(max)` size or a chunk or large-chunk dimension above 2147483647 on every platform; on 32-bit platforms such a value, a chunk form entry header or a HELLO limit above the largest `int` used to wrap and is now refused.
 - Bind WATCH layouts to their described epoch and schema version so table replacement cannot reuse another table's cached columns. (#69).
 - Return nil without an error for never-written typed and raw chunk reads, including pools and transactions; retain versioned empty forms. (#73).
 - Connection errors identify refused addresses and give server, URI scheme, TLS trust and timeout guidance while preserving error types and wrapped causes

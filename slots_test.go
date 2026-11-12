@@ -393,3 +393,46 @@ func TestSlotAckUint64AndConcurrentControls(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+func TestSlotOwner(t *testing.T) {
+	s := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, _ string) { writeSimple(cn, "OK") }))
+	c := newTestClient(t, s, nil)
+	if err := c.CreateSlotWithOptions(t.Context(), "world", "consumer", SlotOptions{Columns: []string{"id"}, IfNotExists: true, Owner: "reader"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.lastCommand(t); got != "CREATE SLOT IF NOT EXISTS 'consumer' ON world COLUMNS (id) OWNER reader" {
+		t.Fatal(got)
+	}
+	if err := c.CreateSlotWithOptions(t.Context(), "world", "consumer", SlotOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.lastCommand(t); got != "CREATE SLOT 'consumer' ON world" {
+		t.Fatal(got)
+	}
+	sent := len(s.commands())
+	for _, owner := range []string{"Reader", "bad name", "x'", "1st"} {
+		if err := c.CreateSlotWithOptions(t.Context(), "world", "consumer", SlotOptions{Owner: owner}); !errors.Is(err, ErrProtocol) {
+			t.Fatal(owner, err)
+		}
+	}
+	if len(s.commands()) != sent {
+		t.Fatal("invalid owner reached the server", s.commands())
+	}
+
+	reader := "reader"
+	withOwner := func(owner string) string {
+		return respArray(respMap("table", respBulk("world"), "name", respBulk("consumer"), "epoch", respBulk(watchEpoch), "acked", respInt(1), "retained_bytes", respInt(0), "lost", respBool(false), "owner", owner))
+	}
+	for frame, want := range map[string]*string{withOwner(respBulk("reader")): &reader, withOwner(respNull): nil, respArray(slotReply(respInt(1), respInt(0))): nil} {
+		server := newFakeServer(t, respondWith(frame))
+		slots, err := newTestClient(t, server, nil).Slots(t.Context(), "")
+		if err != nil || len(slots) != 1 || !reflect.DeepEqual(slots[0].Owner, want) {
+			t.Fatal(frame, slots, err)
+		}
+	}
+	for _, invalid := range []string{respBulk("Reader"), respBulk(""), respInt(1), respArray()} {
+		server := newFakeServer(t, respondWith(withOwner(invalid)))
+		if _, err := newTestClient(t, server, nil).Slots(t.Context(), ""); !errors.Is(err, ErrProtocol) {
+			t.Fatal(invalid, err)
+		}
+	}
+}

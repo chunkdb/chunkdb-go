@@ -15,7 +15,12 @@ type Slot struct {
 	Filters *SlotFilters
 	// LostReason preserves diagnostic strings, including future reasons.
 	LostReason *string
-	Fields     map[string]Reply
+	// Owner is the user the slot belongs to. It is nil when the slot has no
+	// recorded owner, when the viewer is neither that user nor a user who
+	// manages users on a server that requires logins, or for servers that do
+	// not report owners.
+	Owner  *string
+	Fields map[string]Reply
 }
 
 func slotName(command, name string) error {
@@ -120,6 +125,14 @@ func (c *Client) Slots(ctx context.Context, table string) ([]Slot, error) {
 		}
 		if hasFilters != hasReason {
 			return nil, protocolErrorf(command, "incomplete slot metadata")
+		}
+		if owner, hasOwner := item.Lookup("owner"); hasOwner {
+			if owner.Kind == ReplyBulk && isName(string(owner.Bulk)) {
+				name := string(owner.Bulk)
+				slot.Owner = &name
+			} else if owner.Kind != ReplyNull {
+				return nil, protocolErrorf(command, "invalid owner")
+			}
 		}
 		slots = append(slots, slot)
 	}

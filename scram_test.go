@@ -22,7 +22,7 @@ const (
 )
 
 func TestScramRFC7677(t *testing.T) {
-	login := newScramLogin(rfcUser, rfcClientNonce)
+	login := newScramLogin(rfcUser, rfcClientNonce, scramBinding{})
 	if got := login.clientFirst(); got != "n,,n=user,r=rOprNGfwEbeRWgbNEkqO" {
 		t.Fatalf("got client-first %q", got)
 	}
@@ -44,7 +44,7 @@ func TestScramRFC7677(t *testing.T) {
 }
 
 func TestScramRejectsBadServerFirst(t *testing.T) {
-	login := newScramLogin(rfcUser, rfcClientNonce)
+	login := newScramLogin(rfcUser, rfcClientNonce, scramBinding{})
 	for name, serverFirst := range map[string]string{
 		"empty":            "",
 		"missing parts":    "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==",
