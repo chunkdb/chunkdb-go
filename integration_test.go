@@ -1752,4 +1752,16 @@ func TestIntegrationDoGuardedTableStatementsForgetSchema(t *testing.T) {
 	if got := read(); got != int64(7) {
 		t.Fatalf("got %#v, want int64(7) from the recreated table", got)
 	}
+
+	// Another client drops the table, so only the guarded CREATE on this
+	// client can clear its cached schema.
+	other := connectIntegration(t, server, nil)
+	if _, err := other.Do(ctx, "DROP TABLE guarded"); err != nil {
+		t.Fatalf("Do DROP TABLE on the other client: %v", err)
+	}
+	do("CREATE TABLE IF NOT EXISTS guarded (v u8) CHUNK 2 x 2")
+	do("SET BLOCK 0 0 IN guarded v = 9")
+	if got := read(); got != uint64(9) {
+		t.Fatalf("got %#v, want uint64(9) after the guarded CREATE", got)
+	}
 }

@@ -35,6 +35,8 @@ func TestTableStatementTarget(t *testing.T) {
 		"ALTER TABLE world ADD COLUMN IF NOT EXISTS d u8":      "world",
 		"DROP TABLE IF world":                                  "",
 		"CREATE TABLE IF EXISTS land (id u8)":                  "",
+		"DROP TABLE IF NOT world":                              "",
+		"CREATE TABLE IF EXISTS x land (id u8)":                "",
 		"DROP TABLE IF EXISTS":                                 "",
 		"DESCRIBE world":                                       "",
 		"DROP COLUMN x y":                                      "",
