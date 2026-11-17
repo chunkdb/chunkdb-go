@@ -194,14 +194,28 @@ func readReply(r *bufio.Reader) (Reply, error) {
 }
 
 func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
+	return readReplyAtLimited(r, depth, nil, replyShapeNone)
+}
+
+func readReplyAtLimited(r *bufio.Reader, depth int, budget *replyBudget, shape replyShape) (Reply, error) {
 	if depth > maxReplyDepth {
 		return Reply{}, protocolErrorf("", "reply nests deeper than %d levels", maxReplyDepth)
+	}
+	if budget != nil {
+		if err := budget.consume(1); err != nil {
+			return Reply{}, err
+		}
 	}
 	prefix, err := r.ReadByte()
 	if err != nil {
 		return Reply{}, err
 	}
-	line, err := readReplyLine(r)
+	var line string
+	if budget == nil {
+		line, err = readReplyLine(r)
+	} else {
+		line, err = budget.line(r)
+	}
 	if err != nil {
 		return Reply{}, err
 	}
@@ -266,6 +280,11 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 		if length > MaxBulkBytes {
 			return Reply{}, protocolErrorf("", "bulk reply of %d bytes exceeds the %d-byte limit", length, MaxBulkBytes)
 		}
+		if budget != nil {
+			if err := budget.consume(uint64(length) + 2); err != nil {
+				return Reply{}, err
+			}
+		}
 		payload := make([]byte, length+2)
 		if _, err := io.ReadFull(r, payload); err != nil {
 			return Reply{}, err
@@ -283,11 +302,23 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 		if err != nil {
 			return Reply{}, err
 		}
+		if budget != nil {
+			if err := budget.aggregate(uint64(count), false, shape); err != nil {
+				return Reply{}, err
+			}
+		}
 		// The capacity hint is clamped so a bogus count cannot preallocate an
 		// arbitrarily large slice before any element has arrived.
 		items := make([]Reply, 0, min(count, 1024))
-		for range count {
-			item, err := readReplyAt(r, depth+1)
+		for i := range count {
+			child := replyShapeNone
+			if shape == replyShapeSchema && i == 1 && budget != nil {
+				child = replyShapeRows
+				if budget.limits.page {
+					child = replyShapePage
+				}
+			}
+			item, err := readReplyAtLimited(r, depth+1, budget, child)
 			if err != nil {
 				return Reply{}, err
 			}
@@ -304,13 +335,22 @@ func readReplyAt(r *bufio.Reader, depth int) (Reply, error) {
 		if err != nil {
 			return Reply{}, err
 		}
+		if budget != nil {
+			if err := budget.aggregate(uint64(count), true, shape); err != nil {
+				return Reply{}, err
+			}
+		}
 		entries := make([]MapEntry, 0, min(count, 1024))
 		for range count {
-			key, err := readReplyAt(r, depth+1)
+			key, err := readReplyAtLimited(r, depth+1, budget, replyShapeNone)
 			if err != nil {
 				return Reply{}, err
 			}
-			value, err := readReplyAt(r, depth+1)
+			child := replyShapeNone
+			if shape == replyShapePage && ((key.Kind == ReplyBulk && string(key.Bulk) == "chunks") || (key.Kind == ReplySimple && key.Text == "chunks")) {
+				child = replyShapeRows
+			}
+			value, err := readReplyAtLimited(r, depth+1, budget, child)
 			if err != nil {
 				return Reply{}, err
 			}
