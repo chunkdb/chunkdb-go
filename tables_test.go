@@ -22,12 +22,22 @@ func TestURITable(t *testing.T) {
 
 func TestTableStatementTarget(t *testing.T) {
 	cases := map[string]string{
-		"CREATE TABLE land (id u8) CHUNK 4 x 4": "land",
-		"create table land(id u8) CHUNK 4 x 4":  "land",
-		"ALTER TABLE world DROP COLUMN d":       "world",
-		"DROP TABLE world":                      "world",
-		"DESCRIBE world":                        "",
-		"DROP COLUMN x y":                       "",
+		"CREATE TABLE land (id u8) CHUNK 4 x 4":                "land",
+		"create table land(id u8) CHUNK 4 x 4":                 "land",
+		"ALTER TABLE world DROP COLUMN d":                      "world",
+		"DROP TABLE world":                                     "world",
+		"DROP TABLE IF EXISTS world":                           "world",
+		"drop table if exists world":                           "world",
+		"CREATE TABLE IF NOT EXISTS land (id u8) CHUNK 4 x 4":  "land",
+		"create table if not exists land(id u8)":               "land",
+		"MIGRATE 'm1' DROP TABLE IF EXISTS world":              "world",
+		"MIGRATE 'm2' CREATE TABLE IF NOT EXISTS land (id u8)": "land",
+		"ALTER TABLE world ADD COLUMN IF NOT EXISTS d u8":      "world",
+		"DROP TABLE IF world":                                  "",
+		"CREATE TABLE IF EXISTS land (id u8)":                  "",
+		"DROP TABLE IF EXISTS":                                 "",
+		"DESCRIBE world":                                       "",
+		"DROP COLUMN x y":                                      "",
 	}
 	for statement, want := range cases {
 		got, ok := tableStatementTarget(statement)

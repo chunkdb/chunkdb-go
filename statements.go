@@ -17,7 +17,7 @@ import (
 // Server rejections return [Error] or a specialized permission, version, schema, or conflict error.
 //
 // BACKUP paths refer to the server's filesystem.
-// CREATE, ALTER, and DROP TABLE invalidate the table's cached schema, including inside MIGRATE.
+// CREATE, ALTER, and DROP TABLE, with or without IF NOT EXISTS or IF EXISTS, invalidate the table's cached schema, including inside MIGRATE.
 func (c *Client) Do(ctx context.Context, statement string, params ...[]byte) (Reply, error) {
 	if table, ok := tableStatementTarget(statement); ok {
 		defer c.forgetSchema(table)
@@ -54,7 +54,7 @@ func commandOf(statement string) string {
 }
 
 // tableStatementTarget returns the table a CREATE, ALTER or DROP TABLE
-// statement names.
+// statement names, after an optional IF NOT EXISTS or IF EXISTS guard.
 func tableStatementTarget(statement string) (string, bool) {
 	fields := strings.Fields(statement)
 	if len(fields) >= 5 && strings.EqualFold(fields[0], "MIGRATE") {
@@ -63,12 +63,25 @@ func tableStatementTarget(statement string) (string, bool) {
 	if len(fields) < 3 || !strings.EqualFold(fields[1], "TABLE") {
 		return "", false
 	}
+	var guard []string
 	switch strings.ToUpper(fields[0]) {
-	case "CREATE", "ALTER", "DROP":
-		name, _, _ := strings.Cut(fields[2], "(")
-		return name, name != ""
+	case "CREATE":
+		guard = []string{"IF", "NOT", "EXISTS"}
+	case "DROP":
+		guard = []string{"IF", "EXISTS"}
+	case "ALTER":
+	default:
+		return "", false
 	}
-	return "", false
+	fields = fields[2:]
+	if len(guard) > 0 && strings.EqualFold(fields[0], guard[0]) {
+		if len(fields) <= len(guard) || !slices.EqualFunc(fields[:len(guard)], guard, strings.EqualFold) {
+			return "", false
+		}
+		fields = fields[len(guard):]
+	}
+	name, _, _ := strings.Cut(fields[0], "(")
+	return name, name != ""
 }
 
 // annotate names the command in a client-side error that has none.
