@@ -193,3 +193,96 @@ func TestClientCallWaitingBehindBlockedWriteHonorsItsContext(t *testing.T) {
 		t.Fatal("the blocked request succeeded after Close")
 	}
 }
+
+// lateCancelConn ends a context right after a write went through, before the
+// client's write call returns, and remembers the last write deadline set.
+type lateCancelConn struct {
+	net.Conn
+
+	mu            sync.Mutex
+	cancel        context.CancelFunc
+	writeDeadline time.Time
+}
+
+func (c *lateCancelConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.mu.Lock()
+	cancel := c.cancel
+	c.cancel = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return n, err
+}
+
+func (c *lateCancelConn) SetWriteDeadline(at time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = at
+	c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(at)
+}
+
+func (c *lateCancelConn) lastWriteDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writeDeadline
+}
+
+func TestClientClearsAWriteDeadlineSetAfterTheWrite(t *testing.T) {
+	server := newFakeServer(t, withHello(genericHandler))
+	client := newTestClient(t, server, func(o *Options) { o.CommandTimeout = -1 })
+	netConn, err := net.Dial("tcp", server.addr())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	hooked := &lateCancelConn{Conn: netConn, cancel: cancel}
+	established := &conn{client: client, netConn: hooked, reader: bufio.NewReader(hooked),
+		writer: bufio.NewWriter(hooked), writeTurn: make(chan struct{}, 1)}
+	go established.readLoop()
+	defer func() { _ = established.shutdown(ErrClosed) }()
+
+	// The context ends once the request is written, so its end expires the
+	// write deadline too late to interrupt anything. When the reply then wins
+	// over the cancellation, the connection stays in use, so the deadline
+	// must be cleared before the call returns.
+	_, _ = client.execOn(ctx, established, "PING", "PING", nil)
+	if at := hooked.lastWriteDeadline(); !at.IsZero() {
+		t.Fatalf("the connection keeps the write deadline %v", at)
+	}
+}
+
+func TestClientRequestWithEndedContextOnAnIdleConnection(t *testing.T) {
+	server := newFakeServer(t, withHello(genericHandler))
+	client := newTestClient(t, server, func(o *Options) { o.CommandTimeout = -1 })
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	// A request whose context already ended takes a free write turn, so it
+	// fails only as an interrupted request, which drops the connection;
+	// transactions rely on it for ROLLBACK. Its reply may still win, which
+	// leaves the connection in step. Waiting for the turn and the ended
+	// context would race, so the check repeats.
+	const requests = 16
+	for range requests {
+		established, err := client.connection(t.Context())
+		if err != nil {
+			t.Fatalf("connection: %v", err)
+		}
+		_, err = client.execOn(ended, established, "PING", "PING", nil)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, ErrTimeout) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want it to wrap context.Canceled", err)
+		}
+		if established.terminalError() == nil {
+			t.Fatal("the connection was kept after a request with an ended context failed")
+		}
+	}
+	if err := client.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+}
