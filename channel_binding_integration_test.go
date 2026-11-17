@@ -40,7 +40,7 @@ func loginCapped(t *testing.T, opts Options, maxVersion uint16) (string, error) 
 	}
 	var sent bytes.Buffer
 	established := &conn{client: client, netConn: netConn, reader: bufio.NewReader(netConn),
-		writer: bufio.NewWriter(io.MultiWriter(netConn, &sent))}
+		writer: bufio.NewWriter(io.MultiWriter(netConn, &sent)), writeTurn: make(chan struct{}, 1)}
 	go established.readLoop()
 	defer func() { _ = established.shutdown(ErrClosed) }()
 	if err := client.helloOn(t.Context(), established); err != nil {

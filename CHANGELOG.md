@@ -56,6 +56,7 @@ uses protocol 3 (CQL); see the engine's
 - Typed permission and schema mismatch errors retain server guidance without including it in right or table fields
 - Slot ACK validation uses the last returned change or initial position and lets the server validate decreasing revisions, including retries after rejected ACKs
 - Closing during an ACK write reports the interrupted write or connection error instead of a timeout caused by Close; recoverable ACK rejections received while closing are discarded
+- Cancelling a request or reaching CommandTimeout interrupts a request write blocked on a server that stopped reading, and drops the connection; a call waiting for its turn to write behind it returns when its own context ends
 
 ## 1.1.0 - 2026-09-03
 

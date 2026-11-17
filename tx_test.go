@@ -569,3 +569,39 @@ func TestTransactionClosesAStatementConflict(t *testing.T) {
 	}
 	waitForFinishedConns(t, broken, 1)
 }
+
+func TestTransactionCommitNotSentDropsTheConnection(t *testing.T) {
+	server, state := newTxServer(t)
+	client := newTestClient(t, server, func(o *Options) { o.CommandTimeout = 100 * time.Millisecond })
+
+	var held *conn
+	_, err := client.Transaction(t.Context(), func(tx *Tx) error {
+		if err := tx.DeleteBlock(t.Context(), "world", 0, 0); err != nil {
+			return err
+		}
+		// Another write holds the connection's write turn, so COMMIT gives
+		// up waiting for it and is never sent.
+		held = tx.conn
+		held.writeTurn <- struct{}{}
+		return nil
+	})
+	<-held.writeTurn
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want a command timeout", err)
+	}
+	if slices.Contains(state.statements(), "COMMIT") {
+		t.Fatalf("got %q, want no COMMIT sent", state.statements())
+	}
+
+	// The transaction is still open on the server, so the next request must
+	// not run on its connection.
+	if err := client.Ping(t.Context()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	if got := server.acceptedConns(); got != 2 {
+		t.Fatalf("got %d connections, want 2", got)
+	}
+	if got := state.entries(); got[len(got)-1] != "2:PING" {
+		t.Fatalf("got %q, want PING on a new connection", got)
+	}
+}

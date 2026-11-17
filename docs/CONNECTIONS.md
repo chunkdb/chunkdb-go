@@ -45,7 +45,7 @@ Use TLS over an untrusted network because authentication does not encrypt subseq
 ## Timeouts and retries
 
 - `NewClient` connects on its first request; `Connect` and `ConnectURI` connect immediately.
-- ConnectTimeout bounds dialing and TLS; CommandTimeout bounds authentication and statement replies.
+- ConnectTimeout bounds dialing and TLS; CommandTimeout bounds authentication, sending each statement and its reply.
 - Both default to five seconds; negative values leave deadlines to the context.
 - A Client supports concurrent use; PipelineDepth defaults to one request at a time.
 - Failed requests are never replayed; the next ordinary request reconnects after transport failure.

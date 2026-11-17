@@ -231,12 +231,18 @@ func (tx *Tx) fetchSchema(ctx context.Context, table string) (*Schema, error) {
 
 func (tx *Tx) forgetSchema(table string) { tx.client.forgetSchema(table) }
 
-// commit sends COMMIT, which closes the transaction in any case.
+// commit sends COMMIT, whose reply closes the transaction in any case. When
+// COMMIT was not sent or got no reply, it drops the connection, which rolls
+// back a transaction the server may still have open, so no later request of
+// the client runs inside it.
 func (tx *Tx) commit(ctx context.Context) (uint64, error) {
 	tx.closed = true
 	reply, err := tx.client.execOn(ctx, tx.conn, "COMMIT", "COMMIT", nil)
 	if err != nil {
 		tx.ended(err)
+		if !errors.Is(err, ErrServer) {
+			_ = tx.conn.shutdown(connectionErrorf("COMMIT", err, "COMMIT failed: %s", err))
+		}
 		return 0, err
 	}
 	if reply.Kind == ReplyNull {
