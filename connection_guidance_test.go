@@ -99,3 +99,29 @@ func TestTypedServerErrorsPreserveGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConnectionGuidanceUserWithoutPassword(t *testing.T) {
+	for _, opts := range []Options{{URI: "chunk://admin@127.0.0.1:4242/"}, {User: "admin"}} {
+		_, err := NewClient(opts)
+		if !errors.Is(err, ErrConnection) || !strings.Contains(err.Error(), "user admin has no password") || !strings.Contains(err.Error(), "chunk://admin:PASSWORD@host:4242/") {
+			t.Errorf("NewClient(%+v) = %v", opts, err)
+		}
+	}
+}
+
+func TestUnknownColumnGuidance(t *testing.T) {
+	server := newFakeServer(t, withHello(genericHandler))
+	client := newTestClient(t, server, nil)
+	_, err := client.SetBlock(t.Context(), "world", 0, 0, Record{"colour": 1})
+	if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "table world has no column colour; Describe lists its columns") {
+		t.Fatal(err)
+	}
+	schema := worldSchema()
+	form, err := EncodeChunk(schema, NewChunk(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeChunk(schema, form, "colour"); err == nil || !strings.Contains(err.Error(), "has no column colour; Describe lists its columns") {
+		t.Fatal(err)
+	}
+}

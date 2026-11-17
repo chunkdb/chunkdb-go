@@ -143,7 +143,7 @@ func formColumns(schema *Schema, names []string) ([]int, error) {
 	for _, name := range names {
 		i := schema.columnIndex(name)
 		if i < 0 {
-			return nil, requestErrorf("", "table %s has no column %s", schema.Table, name)
+			return nil, requestErrorf("", "table %s has no column %s; Describe lists its columns", schema.Table, name)
 		}
 		indexes = append(indexes, i)
 	}

@@ -36,6 +36,7 @@ connected
 | Explicit Host, Port, User, Password | Nonempty values override URI values. |
 | No credentials | Requires a server started with `--auth none`. |
 
+A user needs a password: a user without one returns `ErrConnection` before dialing.
 Selecting a table does not create it; a fresh server has no tables.
 Without a selected table, table methods return a local error before sending a data request.
 URI-escape reserved password characters, or supply unescaped credentials through `Options`.
@@ -104,6 +105,7 @@ Each ordinary connection occupies one server worker; size the pool accordingly.
 Use `errors.Is` for classification and `errors.As` for typed details.
 `Error` carries Phase, Command, ServerCode, and ServerMessage; specialized errors add structured fields.
 `MigrationError` wraps the failed step's cause.
+Common first-run errors end with a next step: the URI form, `chunk://` versus `chunks://`, or `Describe` for an unknown column.
 A table hidden by permissions returns `CodeNoTable`.
 
 ## Session negotiation

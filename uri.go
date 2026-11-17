@@ -7,6 +7,9 @@ import (
 	"strings"
 )
 
+// uriForm is the endpoint form that URI errors suggest.
+const uriForm = "chunk://user:password@host:4242/"
+
 // URI is a parsed chunk:// or chunks:// endpoint.
 type URI struct {
 	Scheme string
@@ -26,26 +29,29 @@ type URI struct {
 // the user and password are taken from the userinfo component, where %XX
 // escapes let them hold ':', '@' or '/'.
 func ParseURI(raw string) (URI, error) {
+	if !strings.Contains(raw, "://") {
+		return URI{}, connectionErrorf("", nil, "invalid chunk URI: %s has no scheme; add chunk:// (or chunks:// for TLS), for example %s", raw, uriForm)
+	}
 	parsed, err := neturl.Parse(raw)
 	if err != nil {
-		return URI{}, connectionErrorf("", err, "invalid chunk URI: %s", raw)
+		return URI{}, connectionErrorf("", err, "invalid chunk URI: %s; use the form %s and percent-encode reserved characters in the user and password", raw, uriForm)
 	}
 
 	scheme := parsed.Scheme
 	if scheme != "chunk" && scheme != "chunks" {
-		return URI{}, connectionErrorf("", nil, "unsupported chunk URI scheme: %s", scheme)
+		return URI{}, connectionErrorf("", nil, "unsupported chunk URI scheme: %s; use chunk:// for a plain listener or chunks:// for TLS", scheme)
 	}
 
 	host := parsed.Hostname()
 	if host == "" {
-		return URI{}, connectionErrorf("", nil, "chunk URI requires a host")
+		return URI{}, connectionErrorf("", nil, "chunk URI requires a host, for example %s", uriForm)
 	}
 
 	port := DefaultPort
 	if text := parsed.Port(); text != "" {
 		port, err = strconv.Atoi(text)
 		if err != nil || port <= 0 || port > 65535 {
-			return URI{}, connectionErrorf("", nil, "invalid chunk URI port: %s", text)
+			return URI{}, connectionErrorf("", nil, "invalid chunk URI port: %s; use a port from 1 to 65535, for example %s", text, uriForm)
 		}
 	}
 
@@ -54,7 +60,7 @@ func ParseURI(raw string) (URI, error) {
 		user = parsed.User.Username()
 		password, _ = parsed.User.Password()
 		if user == "" {
-			return URI{}, connectionErrorf("", nil, "chunk URI userinfo has no user")
+			return URI{}, connectionErrorf("", nil, "chunk URI userinfo has no user; use %s, or drop the userinfo for a server started with --auth none", uriForm)
 		}
 	}
 

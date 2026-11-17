@@ -2,6 +2,7 @@ package chunkdb
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -137,5 +138,23 @@ func TestURIAddress(t *testing.T) {
 	uri := URI{Host: "::1", Port: 4242}
 	if got := uri.Address(); got != "[::1]:4242" {
 		t.Fatalf("got %q, want %q", got, "[::1]:4242")
+	}
+}
+
+func TestParseURIErrorsGiveNextStep(t *testing.T) {
+	cases := map[string]string{
+		"127.0.0.1:4242":          "add chunk://",
+		"admin@127.0.0.1:4242":    "add chunk://",
+		"http://host:4242/":       "use chunk:// for a plain listener or chunks:// for TLS",
+		"chunk:///":               "for example chunk://user:password@host:4242/",
+		"chunk://host:70000/":     "use a port from 1 to 65535",
+		"chunk://:secret@host:1/": "use chunk://user:password@host:4242/",
+		"chunk://bot:%zz@host:1/": "percent-encode reserved characters",
+	}
+	for raw, hint := range cases {
+		_, err := ParseURI(raw)
+		if !errors.Is(err, ErrConnection) || !strings.Contains(err.Error(), hint) {
+			t.Errorf("ParseURI(%q) = %v, want ErrConnection with %q", raw, err, hint)
+		}
 	}
 }
