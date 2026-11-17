@@ -10,6 +10,23 @@ import (
 const maxSectionedVariableBytes = 64 * 1024 * 1024
 const maxDecodedChunkCells = 4 * 1024 * 1024
 
+type areaDecodeLimitError struct{ err *Error }
+
+func (e *areaDecodeLimitError) Error() string { return e.err.Error() }
+func (e *areaDecodeLimitError) Unwrap() error { return e.err }
+
+func checkAreaDecodedCells(schema *Schema, indexes []int, chunks int) error {
+	blocks, _, err := sectionedGeometry(schema)
+	if err != nil {
+		return err
+	}
+	cells := uint64(blocks)*uint64(len(indexes)) + uint64(len(schema.ChunkColumns))
+	if chunks < 0 || (cells != 0 && uint64(chunks) > maxDecodedChunkCells/cells) {
+		return &areaDecodeLimitError{protocolErrorf("GET AREA", "decoded area exceeds 4194304 column values; select fewer columns, request smaller pages, or read raw forms")}
+	}
+	return nil
+}
+
 func sectionedGeometry(schema *Schema) (int, int, error) {
 	if schema == nil || (schema.Dims != 0 && schema.Dims != 2 && schema.Dims != 3) {
 		return 0, 0, protocolErrorf("", "invalid chunk dimensions")
