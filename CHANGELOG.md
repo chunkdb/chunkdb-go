@@ -49,6 +49,7 @@ uses protocol 3 (CQL); see the engine's
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ### Fixed
+- WATCH with `Columns` decodes changes with the requested block columns in their requested order, keeps complete chunk metadata and follows column renames; the first change no longer fails with `row does not match schema columns`. A name the table does not have is refused before WATCH is sent.
 - `Do` refreshes the cached schema of the named table after `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF EXISTS`, including inside MIGRATE; typed reads no longer decode a recreated table with the columns of the dropped one.
 - `ParseColumnType`, DESCRIBE replies and table definitions refuse a `text(max)` or `bytes(max)` size or a chunk or large-chunk dimension above 2147483647 on every platform; on 32-bit platforms such a value, a chunk form entry header or a HELLO limit above the largest `int` used to wrap and is now refused.
 - Bind WATCH layouts to their described epoch and schema version so table replacement cannot reuse another table's cached columns. (#69).

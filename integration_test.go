@@ -87,6 +87,8 @@ func (s *testServer) uriAs(user, password string) string {
 
 type serverConfig struct {
 	tls bool
+	// dataDir selects an existing directory, for example a read-only backup.
+	dataDir string
 	// authNone starts the server without users (--auth none).
 	authNone bool
 	// workers sizes the server's worker pool. A worker is occupied for as long
@@ -114,9 +116,13 @@ func startServer(t *testing.T, config serverConfig) *testServer {
 		workers = 2
 	}
 
+	dataDir := config.dataDir
+	if dataDir == "" {
+		dataDir = t.TempDir()
+	}
 	args := []string{
 		"--listen-uri", base,
-		"--data-dir", t.TempDir(),
+		"--data-dir", dataDir,
 		"--durability", "relaxed",
 		"--workers", strconv.Itoa(workers),
 		"--log-level", "warn",

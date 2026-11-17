@@ -30,7 +30,7 @@ type WatchOptions struct {
 	// Area3D selects an explicit three-axis box and cannot be combined with Area.
 	Area3D *Area3D
 	After  *Position
-	// Columns selects a persisted projection; nil inherits slot filters.
+	// Columns selects block columns in order; nil inherits slot filters.
 	Columns  []string
 	NoBefore bool
 	Chunks   bool
@@ -54,7 +54,7 @@ type ChunkOffset struct {
 // Event is a change, schema change, or a request to rebuild local state.
 type Event interface{ GetPosition() Position }
 
-// BlockChange contains the complete rows before and after a changed block.
+// BlockChange contains the selected columns before and after a changed block.
 // Nil rows denote absence; a nil field within a row denotes NULL.
 type BlockChange struct {
 	X, Y          Coordinate
@@ -114,6 +114,9 @@ type Watch struct {
 	start          Position
 	schemas        map[watchSchemaKey][]Column
 	schemaDetails  map[watchSchemaKey]*Schema
+	columnNames    []string
+	columnIDs      []uint32
+	columnEpoch    string
 	pushes         chan Reply
 	closing, done  chan struct{}
 	nextGate       chan struct{}
@@ -174,11 +177,24 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 	dedicated := c.copyOptions()
 	w := &Watch{client: dedicated, table: name, pushes: make(chan Reply), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1)}
 	w.slot = opts.Slot
+	w.columnNames = append([]string(nil), opts.Columns...)
 	w.controlGate = make(chan struct{}, 1)
 	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 	// Seed before WATCH, so schema changes racing with setup are retained in
 	// the stream rather than decoded with a later DESCRIBE's columns.
 	schema, err := w.describe(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range w.columnNames {
+		column, ok := schema.Column(name)
+		if !ok {
+			return nil, requestErrorf("WATCH", "table %s has no column %s", w.table, name)
+		}
+		w.columnIDs = append(w.columnIDs, column.ID)
+	}
+	w.columnEpoch = schema.Epoch
+	schema, err = w.projectSchema(schema, schema.Epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +228,11 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		return nil, err
 	}
 	w.delivered = w.start
+	// A DESCRIBE without an epoch cannot prove ownership; the stream's first
+	// epoch owns the projected IDs, so later DESCRIBEs reuse them after renames.
+	if w.columnNames != nil && w.columnEpoch == "" {
+		w.columnEpoch = w.start.Epoch
+	}
 	return w, nil
 }
 
@@ -402,6 +423,7 @@ func (w *Watch) decodeLegacy(ctx context.Context, r Reply) (Event, error) {
 			ids[col.ID] = true
 			columns = append(columns, col)
 		}
+		w.bindProjectionSchema(pos.Epoch, columns)
 		w.cacheSchema(&Schema{Epoch: pos.Epoch, Version: version, Dims: 2, Columns: columns})
 		// Keep cache ownership separate from mutable event values.
 		eventColumns := (&Schema{Columns: columns}).clone().Columns
@@ -518,6 +540,53 @@ func (w *Watch) describe(ctx context.Context) (*Schema, error) {
 		w.metadataMu.Unlock()
 	}()
 	return metadata.Describe(lookupCtx, w.table)
+}
+
+// DESCRIBE supplies every block column, whereas explicit watch projections
+// decode rows in their requested order. Stable IDs belong to one table epoch.
+func (w *Watch) projectSchema(schema *Schema, epoch string) (*Schema, error) {
+	if w.columnNames == nil {
+		return schema, nil
+	}
+	ids := w.columnIDs
+	if w.columnEpoch != epoch {
+		ids = make([]uint32, 0, len(w.columnNames))
+		for _, name := range w.columnNames {
+			column, ok := schema.Column(name)
+			if !ok {
+				return nil, protocolErrorf("WATCH", "projected column %s unavailable in the new epoch; resume or rebuild state", name)
+			}
+			ids = append(ids, column.ID)
+		}
+	}
+	projected := schema.clone()
+	projected.Columns = make([]Column, 0, len(ids))
+	for _, id := range ids {
+		found := false
+		for _, column := range schema.Columns {
+			if column.ID == id {
+				projected.Columns = append(projected.Columns, column)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, protocolErrorf("WATCH", "projected column %d unavailable; resume or rebuild state", id)
+		}
+	}
+	w.columnIDs, w.columnEpoch = ids, epoch
+	return projected, nil
+}
+
+func (w *Watch) bindProjectionSchema(epoch string, columns []Column) {
+	if w.columnNames == nil || w.columnEpoch == epoch {
+		return
+	}
+	ids := make([]uint32, len(columns))
+	for i, column := range columns {
+		ids[i] = column.ID
+	}
+	w.columnIDs, w.columnEpoch = ids, epoch
 }
 
 // Ack acknowledges applied work on a slot watch.
