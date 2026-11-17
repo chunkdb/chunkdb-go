@@ -32,6 +32,7 @@ bot false
 ```
 
 The name `bot` must be unused.
+A password must not be empty; `CreateUser` and `SetPassword` return `ErrProtocol` for an empty one before sending a request.
 Connect it with `chunk://bot:bot-password@127.0.0.1:4242/world_go`.
 URI-escape reserved password characters, or use `Options.User` and `Options.Password`.
 Use TLS over an untrusted network.

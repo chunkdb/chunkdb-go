@@ -268,13 +268,13 @@ func normalize(column string, t ColumnType, v any) (any, error) {
 		}
 		if t.Kind == ColumnUnsigned {
 			if negative || (t.Size < 64 && magnitude >= 1<<t.Size) {
-				return fail("%s is out of range", formatInteger(negative, magnitude))
+				return fail("%s is out of range; %s holds 0 to %d", formatInteger(negative, magnitude), t, uint64(1<<t.Size-1))
 			}
 			return magnitude, nil
 		}
 		limit := uint64(1) << (t.Size - 1)
 		if (negative && magnitude > limit) || (!negative && magnitude >= limit) {
-			return fail("%s is out of range", formatInteger(negative, magnitude))
+			return fail("%s is out of range; %s holds -%d to %d", formatInteger(negative, magnitude), t, limit, limit-1)
 		}
 		if negative {
 			return int64(-magnitude), nil
@@ -296,7 +296,7 @@ func normalize(column string, t ColumnType, v any) (any, error) {
 			return number, nil
 		}
 		if !math.IsInf(number, 0) && !math.IsNaN(number) && math.Abs(number) > math.MaxFloat32 {
-			return fail("%g is out of range", number)
+			return fail("%g is out of range; f32 holds magnitudes up to %g, use f64 for more", number, math.MaxFloat32)
 		}
 		return float32(number), nil
 	case ColumnBits:

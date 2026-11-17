@@ -15,6 +15,9 @@ uses protocol 3 (CQL); see the engine's
 ### Changed
 - A user without a password returns `ErrConnection` before dialing, with the URI form to use, instead of failing at the server with `AUTH_FAILED`.
 - URI errors name the expected form `chunk://user:password@host:4242/` and the `chunk://` and `chunks://` schemes, and an unknown column points to `Describe`.
+- `CreateUser` and `SetPassword` refuse an empty password with `ErrProtocol` before sending a request, since a user without a password cannot log in.
+- URI errors show the URI with its password replaced by `xxxxx`, and a URI parse error no longer wraps the parse error, which repeated the raw URI.
+- An out-of-range integer or `f32` value error names the range of the column type.
 
 ### Documentation
 - The README runs the world example with `go run github.com/chunkdb/chunkdb-go/v2/examples/world@latest`, without a clone, and shows its `Migrate` call.

@@ -105,7 +105,7 @@ Each ordinary connection occupies one server worker; size the pool accordingly.
 Use `errors.Is` for classification and `errors.As` for typed details.
 `Error` carries Phase, Command, ServerCode, and ServerMessage; specialized errors add structured fields.
 `MigrationError` wraps the failed step's cause.
-Common first-run errors end with a next step: the URI form, `chunk://` versus `chunks://`, or `Describe` for an unknown column.
+Common first-run errors end with a next step: the URI form, `chunk://` versus `chunks://`, `Describe` for an unknown column, or the range of a column type.
 A table hidden by permissions returns `CodeNoTable`.
 
 ## Session negotiation

@@ -125,3 +125,30 @@ func TestUnknownColumnGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConnectionGuidanceUserWithoutPasswordKeepsTLS(t *testing.T) {
+	for _, opts := range []Options{{URI: "chunks://admin@127.0.0.1:4242/"}, {User: "admin", TLS: true}} {
+		_, err := NewClient(opts)
+		if !errors.Is(err, ErrConnection) || !strings.Contains(err.Error(), "chunks://admin:PASSWORD@host:4242/") {
+			t.Errorf("NewClient(%+v) = %v", opts, err)
+		}
+	}
+}
+
+func TestValueRangeGuidance(t *testing.T) {
+	cases := map[ColumnType]struct {
+		value any
+		want  string
+	}{
+		TypeUint(8):  {300, "300 is out of range; u8 holds 0 to 255"},
+		TypeUint(64): {-1, "-1 is out of range; u64 holds 0 to 18446744073709551615"},
+		TypeInt(8):   {-129, "-129 is out of range; i8 holds -128 to 127"},
+		TypeF32():    {1e39, "f32 holds magnitudes up to 3.4028234663852886e+38, use f64 for more"},
+	}
+	for columnType, c := range cases {
+		_, err := normalize("tile", columnType, c.value)
+		if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("normalize(%v, %v) = %v, want %q", columnType, c.value, err, c.want)
+		}
+	}
+}

@@ -84,7 +84,7 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 		return resolvedOptions{}, connectionErrorf("", nil, "invalid user name %q: names are [a-z_][a-z0-9_]*", user)
 	}
 	if user != "" && password == "" {
-		return resolvedOptions{}, connectionErrorf("", nil, "user %s has no password; put it in the URI, chunk://%s:PASSWORD@host:4242/, or set Options.Password", user, user)
+		return resolvedOptions{}, connectionErrorf("", nil, "user %s has no password; put it in the URI, %s://%s:PASSWORD@host:4242/, or set Options.Password", user, scheme, user)
 	}
 
 	iterations := cmp.Or(opts.VerifierIterations, DefaultVerifierIterations)

@@ -172,3 +172,21 @@ func TestClientPermissionDeniedIsTyped(t *testing.T) {
 		t.Fatal("NO_TABLE matches ErrPermissionDenied")
 	}
 }
+
+func TestClientUserStatementsRefuseEmptyPassword(t *testing.T) {
+	server := newFakeServer(t, withHello(usersHandler))
+	client := newTestClient(t, server, nil)
+	ctx := t.Context()
+	before := len(server.commands())
+	for name, run := range map[string]func() error{
+		"CreateUser":  func() error { return client.CreateUser(ctx, "bot", "", CreateUserOptions{}) },
+		"SetPassword": func() error { return client.SetPassword(ctx, "bot", "") },
+	} {
+		if err := run(); !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "empty password") {
+			t.Errorf("%s with an empty password = %v", name, err)
+		}
+	}
+	if got := len(server.commands()); got != before {
+		t.Fatalf("sent %d statements, want none", got-before)
+	}
+}

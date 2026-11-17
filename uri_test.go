@@ -158,3 +158,27 @@ func TestParseURIErrorsGiveNextStep(t *testing.T) {
 		}
 	}
 }
+
+func TestParseURIErrorsHidePassword(t *testing.T) {
+	cases := map[string]string{
+		"admin:secret@127.0.0.1:4242":           "admin:xxxxx@127.0.0.1:4242",
+		"chunk://admin:se%cret@127.0.0.1:4242/": "chunk://admin:xxxxx@127.0.0.1:4242/",
+		"chunk://admin:p/secret@host:4242/":     "",
+		"chunk://admin:se cret@host:4242/":      "chunk://admin:xxxxx@host:4242/",
+	}
+	for raw, shown := range cases {
+		_, err := ParseURI(raw)
+		if err == nil {
+			t.Errorf("ParseURI(%q) succeeded", raw)
+			continue
+		}
+		for e := error(err); e != nil; e = errors.Unwrap(e) {
+			if strings.Contains(e.Error(), "secret") || strings.Contains(e.Error(), "cret") {
+				t.Errorf("ParseURI(%q) error shows the password: %v", raw, e)
+			}
+		}
+		if shown != "" && !strings.Contains(err.Error(), shown) {
+			t.Errorf("ParseURI(%q) = %v, want it to show %q", raw, err, shown)
+		}
+	}
+}

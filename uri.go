@@ -30,11 +30,12 @@ type URI struct {
 // escapes let them hold ':', '@' or '/'.
 func ParseURI(raw string) (URI, error) {
 	if !strings.Contains(raw, "://") {
-		return URI{}, connectionErrorf("", nil, "invalid chunk URI: %s has no scheme; add chunk:// (or chunks:// for TLS), for example %s", raw, uriForm)
+		return URI{}, connectionErrorf("", nil, "invalid chunk URI: %s has no scheme; add chunk:// (or chunks:// for TLS), for example %s", redactURI(raw), uriForm)
 	}
 	parsed, err := neturl.Parse(raw)
 	if err != nil {
-		return URI{}, connectionErrorf("", err, "invalid chunk URI: %s; use the form %s and percent-encode reserved characters in the user and password", raw, uriForm)
+		// The parse error repeats the raw URI, so it is not kept as the cause.
+		return URI{}, connectionErrorf("", nil, "invalid chunk URI: %s; use the form %s and percent-encode reserved characters in the user and password", redactURI(raw), uriForm)
 	}
 
 	scheme := parsed.Scheme
@@ -131,4 +132,22 @@ func TableFromPath(path string) (string, error) {
 // Address is the host:port dial target.
 func (u URI) Address() string {
 	return net.JoinHostPort(u.Host, strconv.Itoa(u.Port))
+}
+
+// redactURI replaces the password in raw with xxxxx, so that an error can
+// show the URI. Everything before the last '@' is taken as the userinfo.
+func redactURI(raw string) string {
+	prefix, rest := "", raw
+	if i := strings.Index(raw, "://"); i >= 0 {
+		prefix, rest = raw[:i+3], raw[i+3:]
+	}
+	at := strings.LastIndex(rest, "@")
+	if at < 0 {
+		return raw
+	}
+	user, _, hasPassword := strings.Cut(rest[:at], ":")
+	if !hasPassword {
+		return raw
+	}
+	return prefix + user + ":xxxxx" + rest[at:]
 }
