@@ -334,9 +334,12 @@ func TestIntegrationServerInfo(t *testing.T) {
 	if info == nil || info.Protocol != 3 || info.ServerVersion == "" {
 		t.Fatalf("got %+v", info)
 	}
-	if info.MaxLineBytes != 65536 || info.MaxParameters != 65535 || info.MaxAreaChunks != 256 ||
+	if info.MaxLineBytes != 65536 || info.MaxParameters != 65535 || info.MaxAreaChunks != 4096 ||
 		info.MaxResponseBytes != 64<<20 || info.MaxScanLimit != 1024 {
 		t.Fatalf("got limits %+v", info)
+	}
+	if info.Limits.TxnMaxWrittenChunks != 1024 || info.Limits.TxnMaxReadChunks != 8192 {
+		t.Fatalf("unexpected transaction limits: %+v", info.Limits)
 	}
 	if err := client.Ping(t.Context()); err != nil {
 		t.Fatalf("Ping: %v", err)
@@ -671,7 +674,7 @@ func TestIntegrationAreasAndScans(t *testing.T) {
 	if err != nil || len(around) != 3 || len(around[0].Chunk.Columns) != 1 {
 		t.Fatalf("GetAreaAround: %+v, %v", around, err)
 	}
-	if _, err := client.GetArea(ctx, "", 0, 0, 300, 0); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.GetArea(ctx, "", 0, 0, int64(client.ServerInfo().MaxAreaChunks), 0); !isServerCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT for a too large area", err)
 	}
 
