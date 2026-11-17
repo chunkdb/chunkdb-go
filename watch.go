@@ -228,6 +228,11 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		return nil, err
 	}
 	w.delivered = w.start
+	// A DESCRIBE without an epoch cannot prove ownership; the stream's first
+	// epoch owns the projected IDs, so later DESCRIBEs reuse them after renames.
+	if w.columnNames != nil && w.columnEpoch == "" {
+		w.columnEpoch = w.start.Epoch
+	}
 	return w, nil
 }
 

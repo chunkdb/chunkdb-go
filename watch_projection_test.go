@@ -164,3 +164,80 @@ func TestWatchProjectionEpochBinding(t *testing.T) {
 		})
 	}
 }
+
+func TestWatchProjectionKeepsIDsAcrossDescribes(t *testing.T) {
+	for _, mode := range []string{"start_race", "legacy_describe"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			legacy := mode == "legacy_describe"
+			streamEpoch := replacementWatchEpoch
+			if legacy {
+				streamEpoch = watchEpoch
+			}
+			var describes atomic.Int32
+			server := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+				switch verbOf(command) {
+				case "DESCRIBE":
+					// start_race: the seed is from the replaced epoch, then the
+					// stream epoch is described twice, the second time after a rename.
+					// legacy_describe: no DESCRIBE reply carries an epoch.
+					epoch, version := watchEpoch, int64(1)
+					columns := []string{fakeColumn(1, "id", "u8", false, false, respNull)}
+					switch describes.Add(1) {
+					case 2:
+						epoch = replacementWatchEpoch
+						columns = []string{fakeColumn(1, "unused", "u8", false, false, respNull), fakeColumn(2, "id", "u8", false, false, respNull)}
+					case 3:
+						epoch, version = replacementWatchEpoch, 2
+						columns = []string{fakeColumn(1, "unused", "u8", false, false, respNull), fakeColumn(2, "renamed", "u8", false, false, respNull)}
+					}
+					if legacy {
+						if describes.Load() > 1 {
+							version = 2
+							columns = []string{fakeColumn(1, "renamed", "u8", false, false, respNull)}
+						}
+						writeRaw(cn, describeReply("world", version, columns))
+						return
+					}
+					writeRaw(cn, strings.Replace(describeReply("world", version, columns), "%6\r\n", "%10\r\n", 1)+
+						respBulk("epoch")+respBulk(epoch)+respBulk("revision")+respInt(10)+
+						respBulk("dims")+respInt(2)+respBulk("chunk_columns")+respArray())
+				case "WATCH":
+					// No schema push binds the IDs; only DESCRIBE supplies them.
+					change := func(revision, version, value int64) string {
+						return push(respBulk("change"), respBulk(streamEpoch), respInt(revision), respInt(123), respNull, respInt(version),
+							respArray(respArray(respInt(0), respInt(0), respNull, respArray(respInt(value)))), respNull, respNull, respArray())
+					}
+					frames := respMap("epoch", respBulk(streamEpoch), "revision", respInt(10))
+					if !legacy {
+						frames += change(11, 1, 7)
+					}
+					writeRaw(cn, frames+change(12, 2, 8))
+				case "UNWATCH":
+					writeSimple(cn, "OK")
+				}
+			}))
+			c := newTestClient(t, server, nil)
+			w, err := c.Watch(ctx, "world", WatchOptions{Columns: []string{"id"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+			wants := []Record{{"id": uint64(7)}, {"renamed": uint64(8)}}
+			if legacy {
+				wants = wants[1:]
+			}
+			for _, want := range wants {
+				event, err := w.Next(ctx)
+				change, ok := event.(*ChangeEvent)
+				if err != nil || !ok || len(change.Blocks) != 1 || !reflect.DeepEqual(change.Blocks[0].After, want) {
+					t.Fatal("projection after DESCRIBE", want, event, err)
+				}
+			}
+			if want := int32(len(wants) + 1); describes.Load() != want {
+				t.Fatal("DESCRIBE count", describes.Load(), want)
+			}
+		})
+	}
+}
