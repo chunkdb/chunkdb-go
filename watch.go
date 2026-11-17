@@ -649,8 +649,10 @@ func (w *Watch) Ack(ctx context.Context, revision uint64) error {
 		return deadline.err()
 	}
 	cn := w.conn
-	cn.writeMu.Lock()
-	defer cn.writeMu.Unlock()
+	if !cn.lockWrite(deadline.ctx) {
+		return interruptionError()
+	}
+	defer cn.unlockWrite()
 	if err := cn.terminalError(); err != nil {
 		return err
 	}
