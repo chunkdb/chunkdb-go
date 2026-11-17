@@ -17,10 +17,8 @@ go get github.com/chunkdb/chunkdb-go/v2
 Start a server with [Quick start](https://github.com/chunkdb/chunkdb/blob/main/docs/QUICK_START.md), then run:
 
 ```bash
-git clone https://github.com/chunkdb/chunkdb-go.git
-cd chunkdb-go
-export CHUNKDB_URI='chunk://admin:your-password@127.0.0.1:4242/'
-go run ./examples/world
+export CHUNKDB_URI="chunk://admin:$CHUNKDB_PASSWORD@127.0.0.1:4242/"
+go run github.com/chunkdb/chunkdb-go/v2/examples/world@latest
 ```
 
 ```output
@@ -30,9 +28,17 @@ block (0,0): tile=1 label=grass
 change (0,0): tile=2 label=water
 ```
 
-Use your administrator password and URI-escape reserved characters.
-The example creates its table; a fresh server has no tables.
-Run it again and the schema step prints `skipped`.
+`CHUNKDB_PASSWORD` holds the administrator password from Quick start; URI-escape reserved characters in other passwords.
+The [example](examples/world/main.go) creates its table with a named migration, writes 16 blocks, reads them back and watches one change:
+
+```go
+results, err := client.Migrate(ctx, []chunkdb.Migration{{
+	Name: "world_go_schema", Statement: "CREATE TABLE world_go (tile u8, label text(16)) CHUNK 2 x 2",
+}})
+```
+
+A rerun skips the applied migration and prints `schema: skipped`.
+See [Operations](docs/OPERATIONS.md) for migration rules.
 
 ## Data layout
 
