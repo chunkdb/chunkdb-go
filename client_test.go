@@ -1348,7 +1348,7 @@ func TestConnectReportsDialFailure(t *testing.T) {
 	address := listener.Addr().String()
 	_ = listener.Close()
 
-	_, err = Connect(t.Context(), Options{URI: "chunk://tok@" + address + "/"})
+	_, err = Connect(t.Context(), Options{URI: "chunk://tok:secret@" + address + "/"})
 	if !errors.Is(err, ErrConnection) {
 		t.Fatalf("got %v, want ErrConnection", err)
 	}

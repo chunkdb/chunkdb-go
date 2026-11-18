@@ -431,7 +431,7 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 		for i, columnName := range names {
 			column, ok := schema.Column(columnName)
 			if !ok {
-				return Reply{}, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s", name, columnName), local: true}
+				return Reply{}, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s; Describe lists its columns", name, columnName), local: true}
 			}
 			value, err := normalize(columnName, column.Type, values[columnName])
 			if err != nil {

@@ -46,10 +46,14 @@ type CreateUserOptions struct {
 // CreateUser creates a user with password. The client computes the user's
 // SCRAM verifier ([ComputeVerifier], [Options.VerifierIterations]) and sends
 // only that; the server never receives the password. It needs MANAGES USERS.
+// An empty password returns an [ErrProtocol] error before a request is sent.
 func (c *Client) CreateUser(ctx context.Context, name, password string, opts CreateUserOptions) error {
 	const command = "CREATE USER"
 	if err := checkNames(command, "user", name); err != nil {
 		return err
+	}
+	if password == "" {
+		return requestErrorf(command, "empty password; a user logs in with a password")
 	}
 	verifier, err := ComputeVerifier(password, c.opts.verifierIterations)
 	if err != nil {
@@ -68,10 +72,14 @@ func (c *Client) CreateUser(ctx context.Context, name, password string, opts Cre
 // SetPassword changes the password of a user, sending a new verifier as
 // [Client.CreateUser] does. A user may change their own password; another
 // user's needs MANAGES USERS. Connections already logged in stay logged in.
+// An empty password returns an [ErrProtocol] error before a request is sent.
 func (c *Client) SetPassword(ctx context.Context, name, password string) error {
 	const command = "ALTER USER"
 	if err := checkNames(command, "user", name); err != nil {
 		return err
+	}
+	if password == "" {
+		return requestErrorf(command, "empty password; a user logs in with a password")
 	}
 	verifier, err := ComputeVerifier(password, c.opts.verifierIterations)
 	if err != nil {

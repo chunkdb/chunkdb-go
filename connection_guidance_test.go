@@ -99,3 +99,56 @@ func TestTypedServerErrorsPreserveGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConnectionGuidanceUserWithoutPassword(t *testing.T) {
+	for _, opts := range []Options{{URI: "chunk://admin@127.0.0.1:4242/"}, {User: "admin"}} {
+		_, err := NewClient(opts)
+		if !errors.Is(err, ErrConnection) || !strings.Contains(err.Error(), "user admin has no password") || !strings.Contains(err.Error(), "chunk://admin:PASSWORD@host:4242/") {
+			t.Errorf("NewClient(%+v) = %v", opts, err)
+		}
+	}
+}
+
+func TestUnknownColumnGuidance(t *testing.T) {
+	server := newFakeServer(t, withHello(genericHandler))
+	client := newTestClient(t, server, nil)
+	_, err := client.SetBlock(t.Context(), "world", 0, 0, Record{"colour": 1})
+	if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "table world has no column colour; Describe lists its columns") {
+		t.Fatal(err)
+	}
+	schema := worldSchema()
+	form, err := EncodeChunk(schema, NewChunk(schema))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeChunk(schema, form, "colour"); err == nil || !strings.Contains(err.Error(), "has no column colour; Describe lists its columns") {
+		t.Fatal(err)
+	}
+}
+
+func TestConnectionGuidanceUserWithoutPasswordKeepsTLS(t *testing.T) {
+	for _, opts := range []Options{{URI: "chunks://admin@127.0.0.1:4242/"}, {User: "admin", TLS: true}} {
+		_, err := NewClient(opts)
+		if !errors.Is(err, ErrConnection) || !strings.Contains(err.Error(), "chunks://admin:PASSWORD@host:4242/") {
+			t.Errorf("NewClient(%+v) = %v", opts, err)
+		}
+	}
+}
+
+func TestValueRangeGuidance(t *testing.T) {
+	cases := map[ColumnType]struct {
+		value any
+		want  string
+	}{
+		TypeUint(8):  {300, "300 is out of range; u8 holds 0 to 255"},
+		TypeUint(64): {-1, "-1 is out of range; u64 holds 0 to 18446744073709551615"},
+		TypeInt(8):   {-129, "-129 is out of range; i8 holds -128 to 127"},
+		TypeF32():    {1e39, "f32 holds magnitudes up to 3.4028234663852886e+38, use f64 for more"},
+	}
+	for columnType, c := range cases {
+		_, err := normalize("tile", columnType, c.value)
+		if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("normalize(%v, %v) = %v, want %q", columnType, c.value, err, c.want)
+		}
+	}
+}
