@@ -1140,7 +1140,7 @@ func TestClientReconnectsAfterAClosingErrorReply(t *testing.T) {
 		genericHandler(s, conn, statement)
 	}))
 	client := newTestClient(t, server, nil)
-	if _, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world nope = $1", []byte{1}); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world nope = $1", []byte{1}); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
 	if err := client.Ping(t.Context()); err != nil {

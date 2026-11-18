@@ -110,7 +110,7 @@ func TestIntegrationWatch(t *testing.T) {
 			for {
 				event, err := fresh.Next(ctx)
 				if err != nil {
-					if !isServerCode(err, CodeNoTable) {
+					if !IsCode(err, CodeNoTable) {
 						t.Fatal("waiting for NO_TABLE after drop", err)
 					}
 					break

@@ -24,7 +24,7 @@ func TestIntegrationChunkModelThreeDimensions(t *testing.T) {
 			if chunk, err := c.GetChunk3D(t.Context(), "", 0, 0, 0); err != nil || chunk != nil {
 				t.Fatal(chunk, err)
 			}
-			if _, err := c.SetBlock3D(t.Context(), "", 0, 0, 0, Record{"n": 7}); !isServerCode(err, CodeInvalidArgument) {
+			if _, err := c.SetBlock3D(t.Context(), "", 0, 0, 0, Record{"n": 7}); !IsCode(err, CodeInvalidArgument) {
 				t.Fatal("first block write lacks required metadata", err)
 			}
 			initial, err := c.SetChunkMetadata3D(t.Context(), "", 0, 0, 0, Record{"owner": 1, "label": "base"}, IfAbsent())

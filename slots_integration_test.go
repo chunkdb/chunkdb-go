@@ -32,7 +32,7 @@ func TestIntegrationSlotsResume(t *testing.T) {
 			if w.Start() != (Position{listed[0].Epoch, listed[0].Acked}) {
 				t.Fatal(w.Start(), listed)
 			}
-			if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !isServerCode(err, CodeSlotBusy) {
+			if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !IsCode(err, CodeSlotBusy) {
 				t.Fatal(err)
 			}
 			first, err := c.SetBlock(t.Context(), "slotted", 0, 0, Record{"v": 1})
@@ -147,14 +147,14 @@ func TestIntegrationSlotLost(t *testing.T) {
 			break
 		}
 	}
-	if !isServerCode(err, CodeSlotLost) {
+	if !IsCode(err, CodeSlotLost) {
 		t.Fatal(err)
 	}
 	listed, err := c.Slots(t.Context(), "slotted")
 	if err != nil || len(listed) != 1 || !listed[0].Lost {
 		t.Fatal(listed, err)
 	}
-	if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !isServerCode(err, CodeSlotLost) {
+	if _, err := c.Watch(t.Context(), "slotted", WatchOptions{Slot: "consumer"}); !IsCode(err, CodeSlotLost) {
 		t.Fatal(err)
 	}
 }

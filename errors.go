@@ -432,8 +432,9 @@ func closedError(command string) *Error {
 	return newError(KindConnection, PhaseConnect, command, "client is closed", ErrClosed)
 }
 
-// isServerCode reports whether err is a server error with the given code.
-func isServerCode(err error, code string) bool {
+// IsCode reports whether err is, or wraps, a server error with the given code,
+// for example [CodeNoTable]. It matches every code, typed or not.
+func IsCode(err error, code string) bool {
 	var typed *Error
 	return errors.As(err, &typed) && typed.ServerCode == code
 }
