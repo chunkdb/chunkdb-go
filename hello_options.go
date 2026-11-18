@@ -38,9 +38,9 @@ func sessionOptions(options map[string]any) (map[string]any, error) {
 				return nil, requestErrorf("HELLO", "client_name requires UTF-8 text")
 			}
 		case "statement_timeout_ms":
-			negative, _, ok := integerOf(value)
-			if !ok || negative {
-				return nil, requestErrorf("HELLO", "statement_timeout_ms requires nonnegative milliseconds")
+			negative, magnitude, ok := integerOf(value)
+			if !ok || negative || magnitude > 86400000 {
+				return nil, requestErrorf("HELLO", "statement_timeout_ms requires milliseconds from 0 through 86400000")
 			}
 		case "default_tag":
 			data, ok := value.([]byte)
@@ -149,7 +149,7 @@ func parseHelloExtensions(reply Reply, info *ServerInfo) error {
 					return bad(name)
 				}
 			case "statement_timeout_ms":
-				if _, ok := pair.Value.Uint64(); !ok {
+				if n, ok := pair.Value.Uint64(); !ok || n > 86400000 {
 					return bad(name)
 				}
 			case "default_tag":

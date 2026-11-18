@@ -91,9 +91,8 @@ type serverConfig struct {
 	dataDir string
 	// authNone starts the server without users (--auth none).
 	authNone bool
-	// workers sizes the server's worker pool. A worker is occupied for as long
-	// as a client connection is open, so a test that keeps N connections alive
-	// needs at least N workers.
+	// workers sizes the server's worker pool. A worker runs one statement at a
+	// time; idle connections do not occupy one.
 	workers int
 	// args are further server flags.
 	args []string

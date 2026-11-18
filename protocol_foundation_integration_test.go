@@ -16,8 +16,15 @@ func TestIntegrationFoundationMetadata(t *testing.T) {
 		o.SessionOptions = map[string]any{"client_name": "metadata-check", "statement_timeout_ms": uint64(0), "default_tag": []byte{}}
 	})
 	info := c.ServerInfo()
-	if info.ConnectionID == 0 || !info.Supports("protocol_foundation") || !info.Supports("read_metadata") || info.NotApplied["statement_timeout_ms"] != "implementation_pending" || info.NotApplied["default_tag"] != "implementation_pending" {
+	if info.ConnectionID == 0 || !info.Supports("protocol_foundation") || !info.Supports("read_metadata") || info.NotApplied["default_tag"] != "implementation_pending" {
 		t.Fatal(info)
+	}
+	if info.Supports("statement_timeout") {
+		if value, ok := info.Options["statement_timeout_ms"].Uint64(); !ok || value != 0 {
+			t.Fatal(info.Options)
+		}
+	} else if info.NotApplied["statement_timeout_ms"] != "implementation_pending" {
+		t.Fatal(info.NotApplied)
 	}
 	if string(info.Options["client_name"].Bulk) != "metadata-check" {
 		t.Fatal(info.Options)
