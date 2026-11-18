@@ -87,9 +87,9 @@ const (
 	// cannot take.
 	CodeInvalidArgument = "INVALID_ARGUMENT"
 	// CodeOutOfRange: a size or value is beyond a server limit. It covers a
-	// reply over the response limit (GET AREA, GET BLOCK, SHOW CONNECTIONS; the
-	// last has reason=response_limit), a chunk too large for any page
-	// (reason=area_entry_too_large), a slot change or schema event larger than
+	// reply over the response limit (GET AREA, GET BLOCK, SCAN CHUNKS ... WITH
+	// DATA, SHOW CONNECTIONS; the last has reason=response_limit), a chunk too
+	// large for any page (reason=area_entry_too_large), a slot change or schema event larger than
 	// the table's feed_buffer_bytes, an integer outside the 128-bit range or a
 	// value its column does not hold, and a migration ledger over its limits.
 	CodeOutOfRange = "OUT_OF_RANGE"
