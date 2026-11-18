@@ -57,6 +57,8 @@ uses protocol 3 (CQL); see the engine's
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ### Fixed
+- WATCH with `Columns` decodes changes with the requested block columns in their requested order, keeps complete chunk metadata and follows column renames; the first change no longer fails with `row does not match schema columns`. A name the table does not have is refused before WATCH is sent.
+- `Do` refreshes the cached schema of the named table after `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF EXISTS`, including inside MIGRATE; typed reads no longer decode a recreated table with the columns of the dropped one.
 - `ParseColumnType`, DESCRIBE replies and table definitions refuse a `text(max)` or `bytes(max)` size or a chunk or large-chunk dimension above 2147483647 on every platform; on 32-bit platforms such a value, a chunk form entry header or a HELLO limit above the largest `int` used to wrap and is now refused.
 - Bind WATCH layouts to their described epoch and schema version so table replacement cannot reuse another table's cached columns. (#69).
 - Return nil without an error for never-written typed and raw chunk reads, including pools and transactions; retain versioned empty forms. (#73).
@@ -64,6 +66,7 @@ uses protocol 3 (CQL); see the engine's
 - Typed permission and schema mismatch errors retain server guidance without including it in right or table fields
 - Slot ACK validation uses the last returned change or initial position and lets the server validate decreasing revisions, including retries after rejected ACKs
 - Closing during an ACK write reports the interrupted write or connection error instead of a timeout caused by Close; recoverable ACK rejections received while closing are discarded
+- Cancelling a request or reaching CommandTimeout interrupts a request write blocked on a server that stopped reading, and drops the connection; a call waiting for its turn to write behind it returns when its own context ends
 
 ## 1.1.0 - 2026-09-03
 

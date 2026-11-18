@@ -300,7 +300,7 @@ func TestWatchAckInterruptedWrite(t *testing.T) {
 			w := &Watch{client: c, slot: "consumer", start: Position{watchEpoch, 10}, delivered: Position{watchEpoch, 10}, controlGate: make(chan struct{}, 1), closing: make(chan struct{}), done: make(chan struct{})}
 			w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 			defer w.ackCancel()
-			w.conn = &conn{client: c, netConn: observed, writer: bufio.NewWriter(observed), watch: w}
+			w.conn = &conn{client: c, netConn: observed, writer: bufio.NewWriter(observed), writeTurn: make(chan struct{}, 1), watch: w}
 			c.active = w.conn
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()

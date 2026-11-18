@@ -87,6 +87,8 @@ func (s *testServer) uriAs(user, password string) string {
 
 type serverConfig struct {
 	tls bool
+	// dataDir selects an existing directory, for example a read-only backup.
+	dataDir string
 	// authNone starts the server without users (--auth none).
 	authNone bool
 	// workers sizes the server's worker pool. A worker is occupied for as long
@@ -114,9 +116,13 @@ func startServer(t *testing.T, config serverConfig) *testServer {
 		workers = 2
 	}
 
+	dataDir := config.dataDir
+	if dataDir == "" {
+		dataDir = t.TempDir()
+	}
 	args := []string{
 		"--listen-uri", base,
-		"--data-dir", t.TempDir(),
+		"--data-dir", dataDir,
 		"--durability", "relaxed",
 		"--workers", strconv.Itoa(workers),
 		"--log-level", "warn",
@@ -1721,5 +1727,50 @@ func TestIntegrationPoolTransaction(t *testing.T) {
 	}
 	if got, err := pool.GetBlock(ctx, "", 0, 0, "id"); err != nil || got["id"] != uint64(1) {
 		t.Fatalf("got %v, %v", got, err)
+	}
+}
+
+func TestIntegrationDoGuardedTableStatementsForgetSchema(t *testing.T) {
+	server := startServer(t, serverConfig{})
+	client := connectIntegration(t, server, nil)
+	ctx := t.Context()
+
+	do := func(statement string) {
+		t.Helper()
+		if _, err := client.Do(ctx, statement); err != nil {
+			t.Fatalf("Do %q: %v", statement, err)
+		}
+	}
+	read := func() any {
+		t.Helper()
+		record, err := client.GetBlock(ctx, "guarded", 0, 0)
+		if err != nil {
+			t.Fatalf("GetBlock: %v", err)
+		}
+		return record["v"]
+	}
+
+	do("CREATE TABLE IF NOT EXISTS guarded (v u8) CHUNK 2 x 2")
+	do("SET BLOCK 0 0 IN guarded v = 7")
+	if got := read(); got != uint64(7) {
+		t.Fatalf("got %#v, want uint64(7)", got)
+	}
+	do("DROP TABLE IF EXISTS guarded")
+	do("CREATE TABLE IF NOT EXISTS guarded (v i8) CHUNK 2 x 2")
+	do("SET BLOCK 0 0 IN guarded v = 7")
+	if got := read(); got != int64(7) {
+		t.Fatalf("got %#v, want int64(7) from the recreated table", got)
+	}
+
+	// Another client drops the table, so only the guarded CREATE on this
+	// client can clear its cached schema.
+	other := connectIntegration(t, server, nil)
+	if _, err := other.Do(ctx, "DROP TABLE guarded"); err != nil {
+		t.Fatalf("Do DROP TABLE on the other client: %v", err)
+	}
+	do("CREATE TABLE IF NOT EXISTS guarded (v u8) CHUNK 2 x 2")
+	do("SET BLOCK 0 0 IN guarded v = 9")
+	if got := read(); got != uint64(9) {
+		t.Fatalf("got %#v, want uint64(9) after the guarded CREATE", got)
 	}
 }

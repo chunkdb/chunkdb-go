@@ -406,10 +406,11 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 	}
 
 	established := &conn{
-		client:  c,
-		netConn: netConn,
-		reader:  bufio.NewReader(netConn),
-		writer:  bufio.NewWriter(netConn),
+		client:    c,
+		netConn:   netConn,
+		reader:    bufio.NewReader(netConn),
+		writer:    bufio.NewWriter(netConn),
+		writeTurn: make(chan struct{}, 1),
 	}
 	go established.readLoop()
 
@@ -727,15 +728,18 @@ type result struct {
 // conn is one established socket plus the goroutine reading its responses.
 //
 // The protocol has no request identifiers, so responses are matched to requests
-// strictly in order: the queue is appended to under writeMu, together with the
-// write itself, and drained in the same order by readLoop.
+// strictly in order: the queue is appended to while holding the write turn,
+// together with the write itself, and drained in the same order by readLoop.
 type conn struct {
 	client  *Client
 	netConn net.Conn
 	reader  *bufio.Reader
 	writer  *bufio.Writer
 
-	writeMu sync.Mutex
+	// writeTurn holds one token while a request is written. It is a channel
+	// rather than a mutex so that a caller waiting behind a stalled write can
+	// give up when its context ends.
+	writeTurn chan struct{}
 
 	mu           sync.Mutex
 	queue        []*pending
@@ -754,12 +758,14 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaRep
 		waiter.limits = limits[0]
 	}
 
-	cn.writeMu.Lock()
+	if !cn.lockWrite(deadline.ctx) {
+		return Reply{}, deadline.err()
+	}
 	cn.mu.Lock()
 	if cn.failed {
 		err := cn.termErr
 		cn.mu.Unlock()
-		cn.writeMu.Unlock()
+		cn.unlockWrite()
 		// Detach defensively: a caller holding a reference to a connection that
 		// died must not keep the client pinned to it.
 		cn.client.detach(cn)
@@ -768,14 +774,31 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaRep
 	cn.queue = append(cn.queue, waiter)
 	cn.mu.Unlock()
 
+	// A peer that stops reading blocks the write once the socket buffers are
+	// full. The end of the call's context expires the write deadline, so the
+	// write returns and the partly sent request drops the connection.
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(deadline.ctx, func() {
+		_ = cn.netConn.SetWriteDeadline(time.Now())
+		close(interrupted)
+	})
 	_, err := cn.writer.Write(wire)
 	if err == nil {
 		err = cn.writer.Flush()
 	}
-	cn.writeMu.Unlock()
+	if !stop() {
+		<-interrupted
+		_ = cn.netConn.SetWriteDeadline(time.Time{})
+	}
+	cn.unlockWrite()
 
 	if err != nil {
-		wrapped := newError(KindConnection, PhaseRequest, deadline.command, "write request: "+err.Error(), err)
+		var wrapped error
+		if deadline.ctx.Err() != nil {
+			wrapped = deadline.err()
+		} else {
+			wrapped = newError(KindConnection, PhaseRequest, deadline.command, "write request: "+err.Error(), err)
+		}
 		_ = cn.shutdown(wrapped)
 		return Reply{}, wrapped
 	}
@@ -795,6 +818,26 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaRep
 		return Reply{}, err
 	}
 }
+
+// lockWrite takes the write turn, or reports false when ctx ends while another
+// request is being written. A free turn is always taken, so a request whose
+// context already ended is still handled like any cancelled in-flight request;
+// only a caller that gave up waiting has sent nothing and keeps the connection.
+func (cn *conn) lockWrite(ctx context.Context) bool {
+	select {
+	case cn.writeTurn <- struct{}{}:
+		return true
+	default:
+	}
+	select {
+	case cn.writeTurn <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (cn *conn) unlockWrite() { <-cn.writeTurn }
 
 func (cn *conn) readLoop() {
 	for {

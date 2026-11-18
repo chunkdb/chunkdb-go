@@ -143,6 +143,10 @@ func (w *Watch) eventSchema(ctx context.Context, epoch string, version uint64) (
 	if schema.Epoch != "" && schema.Epoch != epoch {
 		return nil, protocolErrorf("WATCH", "schema epoch %s unavailable (DESCRIBE returned %s); resume or rebuild state", epoch, schema.Epoch)
 	}
+	schema, err = w.projectSchema(schema, epoch)
+	if err != nil {
+		return nil, err
+	}
 	w.cacheSchema(schema)
 	return schema, nil
 }
@@ -180,6 +184,7 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 		if err != nil {
 			return nil, err
 		}
+		w.bindProjectionSchema(pos.Epoch, columns)
 		w.cacheSchema(&Schema{Epoch: pos.Epoch, Version: version, Dims: int(dims), Columns: columns, ChunkColumns: chunkColumns})
 		return &SchemaEvent{Position: pos, Version: version, Dims: int(dims), Columns: cloneColumns(columns), ChunkColumns: cloneColumns(chunkColumns)}, nil
 	}
