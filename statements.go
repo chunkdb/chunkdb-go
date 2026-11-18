@@ -17,7 +17,7 @@ import (
 // Server rejections return [Error] or a specialized permission, version, schema, or conflict error.
 //
 // BACKUP paths refer to the server's filesystem.
-// CREATE, ALTER, and DROP TABLE invalidate the table's cached schema, including inside MIGRATE.
+// CREATE, ALTER, and DROP TABLE, with or without IF NOT EXISTS or IF EXISTS, invalidate the table's cached schema, including inside MIGRATE.
 func (c *Client) Do(ctx context.Context, statement string, params ...[]byte) (Reply, error) {
 	if table, ok := tableStatementTarget(statement); ok {
 		defer c.forgetSchema(table)
@@ -27,14 +27,14 @@ func (c *Client) Do(ctx context.Context, statement string, params ...[]byte) (Re
 
 // call runs one statement: it reserves a pipeline slot, sends the statement
 // with its parameters, and returns the reply.
-func (c *Client) call(ctx context.Context, statement string, params [][]byte) (Reply, error) {
+func (c *Client) call(ctx context.Context, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	command := commandOf(statement)
 	release, err := c.acquireSlot(ctx, command)
 	if err != nil {
 		return Reply{}, err
 	}
 	defer release()
-	return c.exec(ctx, command, statement, params)
+	return c.exec(ctx, command, statement, params, options...)
 }
 
 // commandOf names a statement for errors: its verb, and the object for verbs
@@ -54,7 +54,7 @@ func commandOf(statement string) string {
 }
 
 // tableStatementTarget returns the table a CREATE, ALTER or DROP TABLE
-// statement names.
+// statement names, after an optional IF NOT EXISTS or IF EXISTS guard.
 func tableStatementTarget(statement string) (string, bool) {
 	fields := strings.Fields(statement)
 	if len(fields) >= 5 && strings.EqualFold(fields[0], "MIGRATE") {
@@ -63,12 +63,25 @@ func tableStatementTarget(statement string) (string, bool) {
 	if len(fields) < 3 || !strings.EqualFold(fields[1], "TABLE") {
 		return "", false
 	}
+	var guard []string
 	switch strings.ToUpper(fields[0]) {
-	case "CREATE", "ALTER", "DROP":
-		name, _, _ := strings.Cut(fields[2], "(")
-		return name, name != ""
+	case "CREATE":
+		guard = []string{"IF", "NOT", "EXISTS"}
+	case "DROP":
+		guard = []string{"IF", "EXISTS"}
+	case "ALTER":
+	default:
+		return "", false
 	}
-	return "", false
+	fields = fields[2:]
+	if len(guard) > 0 && strings.EqualFold(fields[0], guard[0]) {
+		if len(fields) <= len(guard) || !slices.EqualFunc(fields[:len(guard)], guard, strings.EqualFold) {
+			return "", false
+		}
+		fields = fields[len(guard):]
+	}
+	name, _, _ := strings.Cut(fields[0], "(")
+	return name, name != ""
 }
 
 // annotate names the command in a client-side error that has none.
@@ -186,7 +199,8 @@ func (e *staleSchemaError) Unwrap() error { return e.err }
 // they encode and decode values with: a [Client], or a [Tx], which sends on
 // its transaction's connection and cannot ask DESCRIBE inside it.
 type session interface {
-	call(ctx context.Context, statement string, params [][]byte) (Reply, error)
+	areaInfo(ctx context.Context) (*ServerInfo, error)
+	call(ctx context.Context, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error)
 	tableName(command, table string) (string, error)
 	// schemaOf returns the schema of table, and whether it was fetched from
 	// the server for this call.
@@ -417,7 +431,7 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 		for i, columnName := range names {
 			column, ok := schema.Column(columnName)
 			if !ok {
-				return Reply{}, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s", name, columnName), local: true}
+				return Reply{}, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s; Describe lists its columns", name, columnName), local: true}
 			}
 			value, err := normalize(columnName, column.Type, values[columnName])
 			if err != nil {
@@ -700,50 +714,59 @@ func getAreaWithSchema(ctx context.Context, s session, table, area string, withM
 		if withMetadata {
 			clause = " WITH SCHEMA"
 		}
-		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil)
+		var responseControl *areaResponseControl
+		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withMetadata, response: &responseControl})
 		if err != nil {
 			if isNoColumn(err) {
 				return AreaRead{}, &staleSchemaError{err: err}
 			}
 			return AreaRead{}, err
 		}
-		result := AreaRead{}
-		if withMetadata {
-			if reply.Kind != ReplyArray || len(reply.Array) < 2 {
-				return AreaRead{}, protocolErrorf(command, "invalid schema envelope")
+		return decodeAreaResponse(responseControl, func() (AreaRead, error) {
+			result := AreaRead{}
+			if withMetadata {
+				if reply.Kind != ReplyArray || len(reply.Array) < 2 {
+					return AreaRead{}, protocolErrorf(command, "invalid schema envelope")
+				}
+				version, ok := reply.Array[0].Uint64()
+				if !ok {
+					return AreaRead{}, protocolErrorf(command, "invalid schema version")
+				}
+				result.SchemaVersion = version
+				if version != schema.Version {
+					return AreaRead{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
+				}
+				reply = reply.Array[1]
 			}
-			version, ok := reply.Array[0].Uint64()
-			if !ok {
-				return AreaRead{}, protocolErrorf(command, "invalid schema version")
+			if reply.Kind != ReplyArray {
+				return AreaRead{}, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
 			}
-			result.SchemaVersion = version
-			if version != schema.Version {
-				return AreaRead{}, &staleSchemaError{err: protocolErrorf(command, "schema version changed during read")}
-			}
-			reply = reply.Array[1]
-		}
-		if reply.Kind != ReplyArray {
-			return AreaRead{}, protocolErrorf(command, "expected an array, got a reply of kind %d", reply.Kind)
-		}
-		chunks := make([]AreaChunk, 0, len(reply.Array))
-		for _, item := range reply.Array {
-			if item.Kind != ReplyArray || len(item.Array) < 3 {
-				return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
-			}
-			cx, okX := item.Array[0].Int64()
-			cy, okY := item.Array[1].Int64()
-			form, err := expectBulk(item.Array[2], command)
-			if !okX || !okY || err != nil {
-				return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
-			}
-			chunk, err := decodeOrStale(schema, form, names)
-			if err != nil {
+			if err := checkAreaDecodedCells(schema, indexes, len(reply.Array)); err != nil {
 				return AreaRead{}, err
 			}
-			chunks = append(chunks, AreaChunk{CX: cx, CY: cy, Chunk: chunk})
-		}
-		result.Chunks = chunks
-		return result, nil
+			chunks := make([]AreaChunk, 0, len(reply.Array))
+			for _, item := range reply.Array {
+				if err := responseControl.checkpoint(); err != nil {
+					return AreaRead{}, err
+				}
+				if item.Kind != ReplyArray || len(item.Array) < 3 {
+					return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
+				}
+				cx, okX := item.Array[0].Int64()
+				cy, okY := item.Array[1].Int64()
+				form, err := expectBulk(item.Array[2], command)
+				if !okX || !okY || err != nil {
+					return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
+				}
+				chunk, err := decodeAreaChunk(schema, form, names)
+				if err != nil {
+					return AreaRead{}, err
+				}
+				chunks = append(chunks, AreaChunk{CX: cx, CY: cy, Chunk: chunk})
+			}
+			result.Chunks = chunks
+			return result, nil
+		})
 	})
 	return chunks, annotate(command, err)
 }

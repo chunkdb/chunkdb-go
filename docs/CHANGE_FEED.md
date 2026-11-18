@@ -50,7 +50,9 @@ tile: 6
 - Watch returns when the subscription is ready; later writes are observable.
 - Area bounds are inclusive chunk coordinates; you need READ on the table.
 - Area3D supplies all six bounds for a three-dimensional table and cannot be combined with Area.
-- `ChangeEvent.Blocks` has complete Before and After records; nil means absence, while a nil field means NULL.
+- `ChangeEvent.Blocks` has Before and After records; nil means absence, while a nil field means NULL.
+- Columns selects block fields in its declared order; chunk metadata remains complete. A name the table does not have is refused before WATCH is sent.
+- Projections follow column IDs within an epoch; a replacement table resolves the requested names again unless a schema event supplies its projection.
 - A revision orders committed changes within a table; timestamps can move backwards.
 - An epoch identifies the table's lifetime and changes when you drop and recreate it.
 - Save `event.GetPosition()` after applying the event; resume with `WatchOptions.After`.

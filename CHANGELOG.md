@@ -12,7 +12,15 @@ uses protocol 3 (CQL); see the engine's
 - Logins over TLS are bound to their connection (SCRAM-SHA-256-PLUS with `tls-exporter` on TLS 1.3 and `tls-server-end-point` on TLS 1.2), so a login relayed by something that ends TLS fails with `AUTH_FAILED reason=channel_binding`. `Options.ChannelBinding` takes `ChannelBindingAuto` (the default), `ChannelBindingOff` and `ChannelBindingRequire`; `CreateUserOptions.RequiresChannelBinding`, `Client.SetRequiresChannelBinding` and `User.RequiresChannelBinding` manage users who log in only bound. An `AUTH_REQUIRED` reply with a reason, such as from a server started with `--auth-channel-binding require`, is reported as the server's error rather than as an older server (chunkdb/chunkdb#162).
 - `SlotOptions.Owner` creates a slot for a named user with `CREATE SLOT ... OWNER`, and `Slot.Owner` reports the owner from SHOW SLOTS when the server shows it.
 
+### Changed
+- A user without a password returns `ErrConnection` before dialing, with the URI form to use, instead of failing at the server with `AUTH_FAILED`.
+- URI errors name the expected form `chunk://user:password@host:4242/` and the `chunk://` and `chunks://` schemes, and an unknown column points to `Describe`.
+- `CreateUser` and `SetPassword` refuse an empty password with `ErrProtocol` before sending a request, since a user without a password cannot log in.
+- URI errors show the URI with its password replaced by `xxxxx`, and a URI parse error no longer wraps the parse error, which repeated the raw URI.
+- An out-of-range integer or `f32` value error names the range of the column type.
+
 ### Documentation
+- The README runs the world example with `go run github.com/chunkdb/chunkdb-go/v2/examples/world@latest`, without a clone, and shows its `Migrate` call.
 - A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.
 - Shorten user guides and check their Go examples against a real server.
 - Use timestamped backup names and link to the server's resync and ACK persistence guidance.
@@ -28,6 +36,7 @@ uses protocol 3 (CQL); see the engine's
 - Chunk forms carry the schema version after the chunk version (`Chunk.SchemaVersion`); `SetChunk` re-encodes once on `SCHEMA_MISMATCH`, which is a `*SchemaMismatchError` matching `ErrSchemaMismatch`
 
 ### Added
+- Add explicit area pages with schema metadata and exact cursors, negotiated reply budgets during parsing, and aggregate typed-area decode bounds ([chunkdb#136](https://github.com/chunkdb/chunkdb/issues/136)).
 - Add three-dimensional helpers, chunk metadata, checked chunk forms, partial block-column writes, and retained-deletion scans ([chunkdb#133](https://github.com/chunkdb/chunkdb/issues/133)).
 - Add typed connection listing, cancellation and termination helpers, and checked server statement timeout negotiation. ([chunkdb#137](https://github.com/chunkdb/chunkdb/issues/137)).
 - Negotiate protocol capabilities and session options; preserve exact big numbers and structured errors; add read metadata, extensible feed events, persisted slot filters, takeover, ACK deadlines and explicit storage feature activation/status. Require explicit table selection and preserve unknown read-only frontiers as nullable metadata. (#69).
@@ -49,6 +58,8 @@ uses protocol 3 (CQL); see the engine's
 - The client drops the connection after the error replies on which the server closes it; the next plain call reconnects even while socket teardown is still in progress. Transaction statements remain on the connection that began the transaction
 
 ### Fixed
+- WATCH with `Columns` decodes changes with the requested block columns in their requested order, keeps complete chunk metadata and follows column renames; the first change no longer fails with `row does not match schema columns`. A name the table does not have is refused before WATCH is sent.
+- `Do` refreshes the cached schema of the named table after `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF EXISTS`, including inside MIGRATE; typed reads no longer decode a recreated table with the columns of the dropped one.
 - `ParseColumnType`, DESCRIBE replies and table definitions refuse a `text(max)` or `bytes(max)` size or a chunk or large-chunk dimension above 2147483647 on every platform; on 32-bit platforms such a value, a chunk form entry header or a HELLO limit above the largest `int` used to wrap and is now refused.
 - Bind WATCH layouts to their described epoch and schema version so table replacement cannot reuse another table's cached columns. (#69).
 - Return nil without an error for never-written typed and raw chunk reads, including pools and transactions; retain versioned empty forms. (#73).
@@ -56,6 +67,7 @@ uses protocol 3 (CQL); see the engine's
 - Typed permission and schema mismatch errors retain server guidance without including it in right or table fields
 - Slot ACK validation uses the last returned change or initial position and lets the server validate decreasing revisions, including retries after rejected ACKs
 - Closing during an ACK write reports the interrupted write or connection error instead of a timeout caused by Close; recoverable ACK rejections received while closing are discarded
+- Cancelling a request or reaching CommandTimeout interrupts a request write blocked on a server that stopped reading, and drops the connection; a call waiting for its turn to write behind it returns when its own context ends
 
 ## 1.1.0 - 2026-09-03
 

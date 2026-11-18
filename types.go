@@ -44,8 +44,9 @@ type Options struct {
 	// Zero means [DefaultTimeout]; a negative value disables the
 	// client-side deadline and leaves cancellation to the caller's context.
 	ConnectTimeout time.Duration
-	// CommandTimeout bounds waiting for one reply. Zero means
-	// [DefaultTimeout]; a negative value disables the client-side deadline.
+	// CommandTimeout bounds sending one request and waiting for its reply.
+	// Zero means [DefaultTimeout]; a negative value disables the client-side
+	// deadline.
 	CommandTimeout time.Duration
 
 	// TLS forces a TLS transport. A chunks:// URI enables it as well.

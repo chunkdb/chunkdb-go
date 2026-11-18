@@ -83,6 +83,9 @@ func resolveOptions(opts Options) (resolvedOptions, error) {
 	if user != "" && !isName(user) {
 		return resolvedOptions{}, connectionErrorf("", nil, "invalid user name %q: names are [a-z_][a-z0-9_]*", user)
 	}
+	if user != "" && password == "" {
+		return resolvedOptions{}, connectionErrorf("", nil, "user %s has no password; put it in the URI, %s://%s:PASSWORD@host:4242/, or set Options.Password", user, scheme, user)
+	}
 
 	iterations := cmp.Or(opts.VerifierIterations, DefaultVerifierIterations)
 	if iterations < DefaultVerifierIterations {
@@ -403,10 +406,11 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 	}
 
 	established := &conn{
-		client:  c,
-		netConn: netConn,
-		reader:  bufio.NewReader(netConn),
-		writer:  bufio.NewWriter(netConn),
+		client:    c,
+		netConn:   netConn,
+		reader:    bufio.NewReader(netConn),
+		writer:    bufio.NewWriter(netConn),
+		writeTurn: make(chan struct{}, 1),
 	}
 	go established.readLoop()
 
@@ -611,15 +615,23 @@ func (c *Client) commandDeadline(ctx context.Context, command string) callDeadli
 }
 
 func (d callDeadline) err() *Error {
-	if d.parent.Err() != nil {
-		return timeoutErrorf(d.command, d.parent.Err(), "%s", d.parent.Err())
+	parentErr := d.parent.Err()
+	if end, exists := d.parent.Deadline(); parentErr == nil && exists && !time.Now().Before(end) {
+		parentErr = context.DeadlineExceeded
 	}
-	return timeoutErrorf(d.command, d.ctx.Err(), "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
+	if parentErr != nil {
+		return timeoutErrorf(d.command, parentErr, "%s", parentErr)
+	}
+	cause := d.ctx.Err()
+	if cause == nil {
+		cause = context.DeadlineExceeded
+	}
+	return timeoutErrorf(d.command, cause, "command timeout after %s; check server availability or increase CommandTimeout; a sent write may have an unknown outcome", d.timeout)
 }
 
 // exec runs one statement on the live connection. The caller must already
 // hold a pipeline slot.
-func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte) (Reply, error) {
+func (c *Client) exec(ctx context.Context, command, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	established, err := c.connection(ctx)
 	if err != nil {
 		return Reply{}, err
@@ -627,7 +639,7 @@ func (c *Client) exec(ctx context.Context, command, statement string, params [][
 	if err := checkLimits(established.info, command, statement, params); err != nil {
 		return Reply{}, err
 	}
-	return c.execOn(ctx, established, command, statement, params)
+	return c.execOn(ctx, established, command, statement, params, options...)
 }
 
 // checkLimits refuses a statement the server's HELLO limits do not admit.
@@ -645,16 +657,34 @@ func checkLimits(info *ServerInfo, command, statement string, params [][]byte) e
 	return nil
 }
 
-func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte) (Reply, error) {
+func (c *Client) execOn(ctx context.Context, established *conn, command, statement string, params [][]byte, options ...areaReplyOptions) (Reply, error) {
 	wire, err := encodeRequest(command, statement, params)
 	if err != nil {
 		return Reply{}, err
 	}
+	var limits *areaReplyLimits
+	var responseTarget **areaResponseControl
+	if isAreaReadStatement(statement) {
+		if len(options) == 0 {
+			options = []areaReplyOptions{rawAreaReplyOptions(statement)}
+		}
+		limits, err = limitsForArea(established.info, options)
+		if err != nil {
+			return Reply{}, err
+		}
+		responseTarget = limits.response
+		limits.response = nil
+	}
 
 	deadline := c.commandDeadline(ctx, command)
-	defer deadline.cancel()
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			deadline.cancel()
+		}
+	}()
 
-	reply, err := established.roundTrip(deadline, wire)
+	reply, err := established.roundTrip(deadline, wire, limits)
 	if err != nil {
 		return Reply{}, err
 	}
@@ -676,6 +706,10 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 		}
 		return Reply{}, replyError(phase, command, reply)
 	}
+	if responseTarget != nil {
+		*responseTarget = &areaResponseControl{connection: established, deadline: deadline}
+		handedOff = true
+	}
 	return reply, nil
 }
 
@@ -683,6 +717,7 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 type pending struct {
 	command string
 	ch      chan result
+	limits  *areaReplyLimits
 }
 
 type result struct {
@@ -693,15 +728,18 @@ type result struct {
 // conn is one established socket plus the goroutine reading its responses.
 //
 // The protocol has no request identifiers, so responses are matched to requests
-// strictly in order: the queue is appended to under writeMu, together with the
-// write itself, and drained in the same order by readLoop.
+// strictly in order: the queue is appended to while holding the write turn,
+// together with the write itself, and drained in the same order by readLoop.
 type conn struct {
 	client  *Client
 	netConn net.Conn
 	reader  *bufio.Reader
 	writer  *bufio.Writer
 
-	writeMu sync.Mutex
+	// writeTurn holds one token while a request is written. It is a channel
+	// rather than a mutex so that a caller waiting behind a stalled write can
+	// give up when its context ends.
+	writeTurn chan struct{}
 
 	mu           sync.Mutex
 	queue        []*pending
@@ -714,15 +752,20 @@ type conn struct {
 	info *ServerInfo
 }
 
-func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
+func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaReplyLimits) (Reply, error) {
 	waiter := &pending{command: deadline.command, ch: make(chan result, 1)}
+	if len(limits) != 0 {
+		waiter.limits = limits[0]
+	}
 
-	cn.writeMu.Lock()
+	if !cn.lockWrite(deadline.ctx) {
+		return Reply{}, deadline.err()
+	}
 	cn.mu.Lock()
 	if cn.failed {
 		err := cn.termErr
 		cn.mu.Unlock()
-		cn.writeMu.Unlock()
+		cn.unlockWrite()
 		// Detach defensively: a caller holding a reference to a connection that
 		// died must not keep the client pinned to it.
 		cn.client.detach(cn)
@@ -731,14 +774,31 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
 	cn.queue = append(cn.queue, waiter)
 	cn.mu.Unlock()
 
+	// A peer that stops reading blocks the write once the socket buffers are
+	// full. The end of the call's context expires the write deadline, so the
+	// write returns and the partly sent request drops the connection.
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(deadline.ctx, func() {
+		_ = cn.netConn.SetWriteDeadline(time.Now())
+		close(interrupted)
+	})
 	_, err := cn.writer.Write(wire)
 	if err == nil {
 		err = cn.writer.Flush()
 	}
-	cn.writeMu.Unlock()
+	if !stop() {
+		<-interrupted
+		_ = cn.netConn.SetWriteDeadline(time.Time{})
+	}
+	cn.unlockWrite()
 
 	if err != nil {
-		wrapped := newError(KindConnection, PhaseRequest, deadline.command, "write request: "+err.Error(), err)
+		var wrapped error
+		if deadline.ctx.Err() != nil {
+			wrapped = deadline.err()
+		} else {
+			wrapped = newError(KindConnection, PhaseRequest, deadline.command, "write request: "+err.Error(), err)
+		}
 		_ = cn.shutdown(wrapped)
 		return Reply{}, wrapped
 	}
@@ -759,9 +819,40 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte) (Reply, error) {
 	}
 }
 
+// lockWrite takes the write turn, or reports false when ctx ends while another
+// request is being written. A free turn is always taken, so a request whose
+// context already ended is still handled like any cancelled in-flight request;
+// only a caller that gave up waiting has sent nothing and keeps the connection.
+func (cn *conn) lockWrite(ctx context.Context) bool {
+	select {
+	case cn.writeTurn <- struct{}{}:
+		return true
+	default:
+	}
+	select {
+	case cn.writeTurn <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (cn *conn) unlockWrite() { <-cn.writeTurn }
+
 func (cn *conn) readLoop() {
 	for {
-		reply, err := readReply(cn.reader)
+		// Wait for bytes before selecting the head: it is queued before its request is written.
+		if _, err := cn.reader.Peek(1); err != nil {
+			_ = cn.shutdown(cn.readError(err))
+			return
+		}
+		cn.mu.Lock()
+		var limits *areaReplyLimits
+		if len(cn.queue) != 0 {
+			limits = cn.queue[0].limits
+		}
+		cn.mu.Unlock()
+		reply, err := readReplyLimited(cn.reader, limits)
 		if err != nil {
 			_ = cn.shutdown(cn.readError(err))
 			return

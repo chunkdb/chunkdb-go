@@ -103,7 +103,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DCHUNKDB_BUILD_TESTS=OFF \
             -DCHUNKDB_WITH_TLS=ON
-          cmake --build chunkdb/build-js-tests --parallel --target chunkdb_server
+          cmake --build chunkdb/build-js-tests --parallel 3 --target chunkdb_server
 
       - name: Integration tests
         env:

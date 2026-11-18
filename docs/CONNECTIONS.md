@@ -36,6 +36,7 @@ connected
 | Explicit Host, Port, User, Password | Nonempty values override URI values. |
 | No credentials | Requires a server started with `--auth none`. |
 
+A user needs a password: a user without one returns `ErrConnection` before dialing.
 Selecting a table does not create it; a fresh server has no tables.
 Without a selected table, table methods return a local error before sending a data request.
 URI-escape reserved password characters, or supply unescaped credentials through `Options`.
@@ -45,7 +46,7 @@ Use TLS over an untrusted network because authentication does not encrypt subseq
 ## Timeouts and retries
 
 - `NewClient` connects on its first request; `Connect` and `ConnectURI` connect immediately.
-- ConnectTimeout bounds dialing and TLS; CommandTimeout bounds authentication and statement replies.
+- ConnectTimeout bounds dialing and TLS; CommandTimeout bounds authentication, sending each statement and its reply.
 - Both default to five seconds; negative values leave deadlines to the context.
 - A Client supports concurrent use; PipelineDepth defaults to one request at a time.
 - Failed requests are never replayed; the next ordinary request reconnects after transport failure.
@@ -104,6 +105,7 @@ Idle connections do not reserve server workers.
 Use `errors.Is` for classification and `errors.As` for typed details.
 `Error` carries Phase, Command, ServerCode, and ServerMessage; specialized errors add structured fields.
 `MigrationError` wraps the failed step's cause.
+Common first-run errors end with a next step: the URI form, `chunk://` versus `chunks://`, `Describe` for an unknown column, or the range of a column type.
 A table hidden by permissions returns `CodeNoTable`.
 
 ## Session negotiation

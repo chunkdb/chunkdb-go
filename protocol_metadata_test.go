@@ -139,7 +139,7 @@ func TestFoundationChunksApplicationDeliveryAck(t *testing.T) {
 	w := &Watch{client: c, slot: "consumer", start: Position{watchEpoch, 10}, delivered: Position{watchEpoch, 10}, schemas: map[watchSchemaKey][]Column{{watchEpoch, 1}: {{ID: 1, Name: "id", Type: TypeUint(8)}}}, pushes: make(chan Reply, 5), closing: make(chan struct{}), done: make(chan struct{}), nextGate: make(chan struct{}, 1), controlGate: make(chan struct{}, 1)}
 	w.ackContext, w.ackCancel = context.WithCancel(context.Background())
 	defer w.ackCancel()
-	w.conn = &conn{client: c, netConn: left, writer: bufio.NewWriter(left)}
+	w.conn = &conn{client: c, netConn: left, writer: bufio.NewWriter(left), writeTurn: make(chan struct{}, 1)}
 	frames := []string{
 		push(respBulk("chunks"), respBulk(watchEpoch), respInt(11), respInt(123), respNull, respInt(1), respArray(respArray(respInt(0), respInt(0), respInt(11), respBulk("form"), respNull)), respNull, respNull, respNull),
 		push(respBulk("catalog"), respBulk(watchEpoch), respInt(12), respInt(123), respNull, respArray(), respNull),
