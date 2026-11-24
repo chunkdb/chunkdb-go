@@ -268,9 +268,13 @@ func (e *SchemaMismatchError) Unwrap() error { return e.Err }
 // A table the user has no right on at all is reported as one that does not
 // exist ([CodeNoTable]), not as this error.
 type PermissionDeniedError struct {
-	// Right is the right the statement needs: "READ", "WRITE", "ADMIN" or
-	// "MANAGES USERS".
+	// Right is the right the statement needs as the server names it: "READ",
+	// "WRITE", "ADMIN", "MANAGES USERS", or alternatives such as "MONITOR or
+	// ADMIN".
 	Right string
+	// Rights lists the rights of which any one would do, such as MONITOR and
+	// ADMIN for "MONITOR or ADMIN on *".
+	Rights []string
 	// Table is the table the right is needed on, "*" for every table, and
 	// empty for MANAGES USERS.
 	Table string
@@ -393,7 +397,7 @@ func replyError(phase Phase, command string, reply Reply) error {
 		if value, ok := keys["table"]; ok {
 			table = value
 		}
-		return &PermissionDeniedError{Right: right, Table: table, Err: base}
+		return &PermissionDeniedError{Right: right, Table: table, Rights: strings.Split(right, " or "), Err: base}
 	}
 	if reply.Code == CodeConflict && command != "MIGRATE" {
 		// "<reason> <message>".
