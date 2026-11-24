@@ -16,12 +16,22 @@ import (
 type AreaPageOptions struct {
 	Limit uint64
 	After *ChunkCoord
+	// Scale and Reduction read each chunk downsampled: every Scale blocks on
+	// each axis become one sample whose values Reduction picks from the
+	// group's present blocks; a sample is present when one of them is.
+	// Scale must divide every chunk side; the chunks then have Scale and
+	// Reduction set. Zero and "" read full chunks. Needs the area_scale
+	// feature.
+	Scale     int
+	Reduction Reduction
 }
 
 // AreaPageOptions3D selects one bounded three-dimensional area page.
 type AreaPageOptions3D struct {
-	Limit uint64
-	After *ChunkCoord3D
+	Limit     uint64
+	After     *ChunkCoord3D
+	Scale     int
+	Reduction Reduction
 }
 
 // AreaPage contains populated chunks and an unfinished page's continuation cursor.
@@ -47,6 +57,8 @@ type areaPageRequest struct {
 	radius      *uint64
 	after       *[3]int64
 	limit       uint64
+	scale       int
+	reduction   Reduction
 }
 
 type areaResponseControl struct {
@@ -88,7 +100,7 @@ func decodeAreaResponse[T any](control *areaResponseControl, decode func() (T, e
 	return value, err
 }
 
-func decodeAreaChunk(schema *Schema, data []byte, names []string) (*Chunk, error) {
+func decodeAreaChunk(schema *Schema, data []byte, names []string, scale int, reduction Reduction) (*Chunk, error) {
 	form, err := parseSectionedForm(data, math.MaxUint32, false)
 	if err != nil {
 		return nil, err
@@ -96,7 +108,11 @@ func decodeAreaChunk(schema *Schema, data []byte, names []string) (*Chunk, error
 	if form.header.schema != schema.Version {
 		return nil, &staleSchemaError{err: protocolErrorf("GET AREA", "chunk form schema version changed during read")}
 	}
-	return decodeSectionedChunk(schema, data, names...)
+	chunk, err := decodeChunkForm(schema, data, scale != 0, names)
+	if err == nil && (chunk.Scale != scale || chunk.Reduction != reduction) {
+		return nil, protocolErrorf("GET AREA", "chunk form has scale %d USING %s, not the requested %d USING %s", chunk.Scale, chunk.Reduction, scale, reduction)
+	}
+	return chunk, err
 }
 
 func copyAreaPageOptions(options AreaPageOptions) AreaPageOptions {
@@ -115,7 +131,7 @@ func copyAreaPageOptions3D(options AreaPageOptions3D) AreaPageOptions3D {
 }
 
 func areaPage2D(x0, y0, x1, y1 int64, radius *int64, options AreaPageOptions) areaPageRequest {
-	request := areaPageRequest{dims: 2, first: [3]int64{x0, y0}, last: [3]int64{x1, y1}, limit: options.Limit}
+	request := areaPageRequest{dims: 2, first: [3]int64{x0, y0}, last: [3]int64{x1, y1}, limit: options.Limit, scale: options.Scale, reduction: options.Reduction}
 	if radius != nil {
 		r := uint64(*radius)
 		request.radius = &r
@@ -127,7 +143,7 @@ func areaPage2D(x0, y0, x1, y1 int64, radius *int64, options AreaPageOptions) ar
 	return request
 }
 func areaPage3D(x0, y0, z0, x1, y1, z1 int64, radius *int64, options AreaPageOptions3D) areaPageRequest {
-	request := areaPageRequest{dims: 3, first: [3]int64{x0, y0, z0}, last: [3]int64{x1, y1, z1}, limit: options.Limit}
+	request := areaPageRequest{dims: 3, first: [3]int64{x0, y0, z0}, last: [3]int64{x1, y1, z1}, limit: options.Limit, scale: options.Scale, reduction: options.Reduction}
 	if radius != nil {
 		r := uint64(*radius)
 		request.radius = &r
@@ -391,8 +407,15 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 	if err != nil {
 		return AreaPage3D{}, err
 	}
+	scale, err := scaleClause(request.scale, request.reduction)
+	if err != nil {
+		return AreaPage3D{}, err
+	}
 	if !info.Supports("area_paging") {
 		return AreaPage3D{}, requestErrorf("GET AREA", "the server does not support area_paging")
+	}
+	if scale != "" && !info.Supports("area_scale") {
+		return AreaPage3D{}, requestErrorf("GET AREA", "the server does not support area_scale")
 	}
 	limits, err := limitsForArea(info, nil)
 	if err != nil {
@@ -422,7 +445,7 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 		if request.after != nil {
 			statement += " AFTER " + areaPointText(*request.after, request.dims)
 		}
-		statement += " WITH SCHEMA"
+		statement += " WITH SCHEMA" + scale
 		var responseControl *areaResponseControl
 		reply, err := s.call(ctx, statement, nil, areaReplyOptions{knownShape: true, page: true, withSchema: true, limit: limit, response: &responseControl})
 		if err != nil {
@@ -458,7 +481,7 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 					return AreaPage3D{}, err
 				}
 				point, _ := areaReplyPoint(Reply{Kind: ReplyArray, Array: row.Array[:request.dims]}, request.dims)
-				chunk, err := decodeAreaChunk(schema, row.Array[request.dims].Bulk, names)
+				chunk, err := decodeAreaChunk(schema, row.Array[request.dims].Bulk, names, request.scale, request.reduction)
 				if err != nil {
 					return AreaPage3D{}, err
 				}

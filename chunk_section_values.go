@@ -83,6 +83,12 @@ func decodeMetadataValue(column Column, raw []byte, null bool) (any, error) {
 
 // Decode the checked section contract for every active dimension.
 func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chunk, error) {
+	return decodeChunkForm(schema, data, false, columns)
+}
+
+// decodeChunkForm decodes a form; only a downsampled read (scaled) takes
+// section 7, whose samples replace the blocks.
+func decodeChunkForm(schema *Schema, data []byte, scaled bool, columns []string) (*Chunk, error) {
 	count, depth, err := sectionedGeometry(schema)
 	if err != nil {
 		return nil, err
@@ -93,6 +99,21 @@ func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chun
 	}
 	bad := func(what string) (*Chunk, error) {
 		return nil, protocolErrorf("", "chunk form of table %s: %s", schema.Table, what)
+	}
+	scale, reduction, err := formScale(form, schema, depth)
+	if err != nil {
+		return nil, err
+	}
+	if (scale != 0) != scaled {
+		return bad("scale section differs from the request")
+	}
+	width, height := schema.ChunkWidth, schema.ChunkHeight
+	if scale != 0 {
+		width, height = width/scale, height/scale
+		if schema.Dims == 3 {
+			depth /= scale
+		}
+		count = width * height * depth
 	}
 	if form.header.schema != schema.Version {
 		return bad("schema version mismatch")
@@ -177,7 +198,7 @@ func decodeSectionedChunk(schema *Schema, data []byte, columns ...string) (*Chun
 	}
 	chunk := &Chunk{Version: form.header.version, SchemaVersion: form.header.schema, CommitTimeMS: form.header.commitTime,
 		Projected: form.header.flags&chunkFormProjected != 0, Private: form.header.flags&chunkFormPrivate != 0,
-		Width: schema.ChunkWidth, Height: schema.ChunkHeight, Depth: depth,
+		Width: width, Height: height, Depth: depth, Scale: scale, Reduction: reduction,
 		Present: make([]bool, count), Columns: make(map[string][]any, len(indexes))}
 	presence := form.section(sectionPresence)
 	for i := range count {

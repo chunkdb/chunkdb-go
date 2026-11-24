@@ -34,6 +34,12 @@ type Chunk struct {
 	Private bool
 	// Metadata holds the values of the table's chunk columns.
 	Metadata Record
+	// Scale and Reduction describe a downsampled form from a SCALE area read:
+	// each block is a sample of Scale blocks on each axis, so Width, Height
+	// and Depth are the samples on each axis. Scale is zero for a full form;
+	// SET CHUNK refuses a downsampled chunk.
+	Scale     int
+	Reduction Reduction
 	// UnknownSections retains opaque transport sections from a read.
 	// EncodeChunk refuses them instead of silently republishing unknown data.
 	UnknownSections map[uint16][]byte
