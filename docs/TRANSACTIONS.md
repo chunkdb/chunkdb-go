@@ -41,6 +41,7 @@ committed: true
 - `Transaction` returns the shared version of written chunks, or zero when nothing changes.
 - A conflict applies no writes and retries the callback up to five times after the first attempt.
 - `TxRetries(n)` changes that retry limit.
+- `TxReadOnly()` sends BEGIN READ ONLY: the transaction reads one snapshot without a read set, so it is not bounded by `--txn-max-read-chunks` and cannot conflict, and the server refuses its writes.
 - Keep external effects outside the callback because it can run again.
 - Return statement errors; other callback errors roll back without retrying.
 
