@@ -12,9 +12,14 @@ func (s *Schema) ChunkColumn(name string) (Column, bool) {
 	return Column{}, false
 }
 
-// AddChunkColumn adds a field to the row attached to every chunk.
-func (c *Client) AddChunkColumn(ctx context.Context, table string, column ColumnDef) error {
+// AddChunkColumn adds a field to the row attached to every chunk. With
+// [IfNotExists] an existing field of that name is left as it is.
+func (c *Client) AddChunkColumn(ctx context.Context, table string, column ColumnDef, guard ...Guard) error {
 	name, err := c.tableName("ALTER TABLE", table)
+	if err != nil {
+		return err
+	}
+	clause, err := guardClause("ALTER TABLE", IfNotExists, guard)
 	if err != nil {
 		return err
 	}
@@ -22,19 +27,24 @@ func (c *Client) AddChunkColumn(ctx context.Context, table string, column Column
 	if err != nil {
 		return annotate("ALTER TABLE", err)
 	}
-	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" ADD CHUNK COLUMN "+definition)
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" ADD CHUNK COLUMN"+clause+" "+definition)
 }
 
-// DropChunkColumn removes a chunk field and its values.
-func (c *Client) DropChunkColumn(ctx context.Context, table, column string) error {
+// DropChunkColumn removes a chunk field and its values. With [IfExists] an
+// absent field is not an error.
+func (c *Client) DropChunkColumn(ctx context.Context, table, column string, guard ...Guard) error {
 	name, err := c.tableName("ALTER TABLE", table)
+	if err != nil {
+		return err
+	}
+	clause, err := guardClause("ALTER TABLE", IfExists, guard)
 	if err != nil {
 		return err
 	}
 	if err := checkNames("ALTER TABLE", "column", column); err != nil {
 		return err
 	}
-	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" DROP CHUNK COLUMN "+column)
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" DROP CHUNK COLUMN"+clause+" "+column)
 }
 
 // RenameChunkColumn changes a chunk field's name while preserving its ID.
@@ -50,13 +60,13 @@ func (c *Client) RenameChunkColumn(ctx context.Context, table, oldName, newName 
 }
 
 // AddChunkColumn runs Client.AddChunkColumn on a leased client.
-func (p *Pool) AddChunkColumn(ctx context.Context, table string, column ColumnDef) error {
-	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.AddChunkColumn(ctx, table, column) })
+func (p *Pool) AddChunkColumn(ctx context.Context, table string, column ColumnDef, guard ...Guard) error {
+	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.AddChunkColumn(ctx, table, column, guard...) })
 }
 
 // DropChunkColumn runs Client.DropChunkColumn on a leased client.
-func (p *Pool) DropChunkColumn(ctx context.Context, table, column string) error {
-	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.DropChunkColumn(ctx, table, column) })
+func (p *Pool) DropChunkColumn(ctx context.Context, table, column string, guard ...Guard) error {
+	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.DropChunkColumn(ctx, table, column, guard...) })
 }
 
 // RenameChunkColumn runs Client.RenameChunkColumn on a leased client.

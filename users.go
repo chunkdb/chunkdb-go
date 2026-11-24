@@ -64,9 +64,14 @@ type CreateUserOptions struct {
 // SCRAM verifier ([ComputeVerifier], [Options.VerifierIterations]) and sends
 // only that; the server never receives the password. It needs MANAGES USERS.
 // An empty password returns an [ErrProtocol] error before a request is sent.
-func (c *Client) CreateUser(ctx context.Context, name, password string, opts CreateUserOptions) error {
+// With [IfNotExists] an existing user is left as it is, password included.
+func (c *Client) CreateUser(ctx context.Context, name, password string, opts CreateUserOptions, guard ...Guard) error {
 	const command = "CREATE USER"
 	if err := checkNames(command, "user", name); err != nil {
+		return err
+	}
+	clause, err := guardClause(command, IfNotExists, guard)
+	if err != nil {
 		return err
 	}
 	if password == "" {
@@ -76,7 +81,7 @@ func (c *Client) CreateUser(ctx context.Context, name, password string, opts Cre
 	if err != nil {
 		return annotate(command, err)
 	}
-	statement := "CREATE USER " + name + " VERIFIER $1"
+	statement := "CREATE USER" + clause + " " + name + " VERIFIER $1"
 	if opts.ManagesUsers {
 		statement += " MANAGES USERS"
 	}
@@ -164,11 +169,16 @@ func (c *Client) SetUserLimits(ctx context.Context, name string, limits UserLimi
 }
 
 // DropUser drops a user. The last user who manages users cannot be dropped.
-func (c *Client) DropUser(ctx context.Context, name string) error {
+// With [IfExists] an absent user is not an error.
+func (c *Client) DropUser(ctx context.Context, name string, guard ...Guard) error {
 	if err := checkNames("DROP USER", "user", name); err != nil {
 		return err
 	}
-	return c.userStatement(ctx, "DROP USER "+name, nil)
+	clause, err := guardClause("DROP USER", IfExists, guard)
+	if err != nil {
+		return err
+	}
+	return c.userStatement(ctx, "DROP USER"+clause+" "+name, nil)
 }
 
 // Grant gives user right on table: a table name, a prefix such as

@@ -214,6 +214,8 @@ Standalone encoding uses the supplied schema's configured budget.
 | `RenameTable` | Rename a table; its specific grants move to the new name. |
 | `SetTableOption` | Change runtime options; chunk geometry stays fixed. |
 
+Pass `chunkdb.IfNotExists` to `CreateTable`, `AddColumn` and `AddChunkColumn`, or `chunkdb.IfExists` to `DropTable`, `DropColumn` and `DropChunkColumn`, to skip an object that already exists or is absent; the server does not compare definitions.
+
 Scans across several requests do not share a snapshot.
 The option-based scan helpers return Epoch, nullable Position, and RetainedDeletionFloor with each page.
 Pass a saved Epoch to bind subsequent pages to the same table lifetime.
