@@ -2,6 +2,7 @@ package chunkdb
 
 import (
 	"context"
+	"strings"
 )
 
 // Right is a user's right on a table. Rights are ordered: [RightAdmin]
@@ -16,6 +17,14 @@ const (
 	// RightAdmin also alters and drops the table; on [AllTables] it creates
 	// tables and reads metrics.
 	RightAdmin Right = "ADMIN"
+	// RightMonitor reads server status: SHOW METRICS, SHOW STATUS, every
+	// user's connections, and table stats and slots of every table. It is a
+	// server right, granted on [AllTables] only, as are the next two.
+	RightMonitor Right = "MONITOR"
+	// RightBackup takes backups.
+	RightBackup Right = "BACKUP"
+	// RightReplication follows the change feed of every table for replication.
+	RightReplication Right = "REPLICATION"
 )
 
 // AllTables in [Client.Grant] and [Client.Revoke] stands for every table,
@@ -29,8 +38,15 @@ type User struct {
 	// RequiresChannelBinding reports that the user logs in only with a login
 	// bound to its TLS connection; false from a server that does not show it.
 	RequiresChannelBinding bool
-	// Grants maps a table name, or [AllTables], to the user's right on it.
+	// Grants maps a table name, a prefix such as "tenant1_*", or [AllTables]
+	// to the user's right on it.
 	Grants map[string]Right
+	// ServerRights are the user's server rights: [RightMonitor],
+	// [RightBackup] and [RightReplication].
+	ServerRights []Right
+	// Verifiers is 2 between [Client.AddVerifier] and
+	// [Client.DropOldVerifier], else 1; 0 from a server that does not show it.
+	Verifiers int
 }
 
 // CreateUserOptions configure [Client.CreateUser].
@@ -123,8 +139,11 @@ func (c *Client) DropUser(ctx context.Context, name string) error {
 	return c.userStatement(ctx, "DROP USER "+name, nil)
 }
 
-// Grant gives user right on table: a table name, [AllTables], or "" for the
-// client's default table. A grant on a table goes when the table is dropped.
+// Grant gives user right on table: a table name, a prefix such as
+// "tenant1_*" for every table whose name starts with it, [AllTables], or ""
+// for the client's default table. A grant on a table goes when the table is
+// dropped; prefix and [AllTables] grants stay. [RightMonitor], [RightBackup]
+// and [RightReplication] are granted on [AllTables] only.
 func (c *Client) Grant(ctx context.Context, right Right, table, user string) error {
 	return c.rightStatement(ctx, "GRANT", right, table, "TO", user)
 }
@@ -171,6 +190,24 @@ func (c *Client) Users(ctx context.Context) ([]User, error) {
 			}
 			user.Grants[string(grant.Key.Bulk)] = Right(grant.Value.Bulk)
 		}
+		if rights, ok := item.Lookup("server_rights"); ok {
+			if rights.Kind != ReplyArray {
+				return nil, protocolErrorf(command, "server_rights of user %s is not a list", user.Name)
+			}
+			for _, right := range rights.Array {
+				if right.Kind != ReplyBulk {
+					return nil, protocolErrorf(command, "server_rights of user %s holds a non-text right", user.Name)
+				}
+				user.ServerRights = append(user.ServerRights, Right(right.Bulk))
+			}
+		}
+		if verifiers, ok := item.Lookup("verifiers"); ok {
+			n, valid := verifiers.Uint64()
+			if !valid || n < 1 || n > 2 {
+				return nil, protocolErrorf(command, "verifiers of user %s is not 1 or 2", user.Name)
+			}
+			user.Verifiers = int(n)
+		}
 		users = append(users, user)
 	}
 	return users, nil
@@ -179,10 +216,18 @@ func (c *Client) Users(ctx context.Context) ([]User, error) {
 func (c *Client) rightStatement(ctx context.Context, verb string, right Right, table, preposition, user string) error {
 	switch right {
 	case RightRead, RightWrite, RightAdmin:
+	case RightMonitor, RightBackup, RightReplication:
+		if table != AllTables {
+			return requestErrorf(verb, "%s is a server right, granted on * only", right)
+		}
 	default:
-		return requestErrorf(verb, "unknown right %q: rights are READ, WRITE and ADMIN", right)
+		return requestErrorf(verb, "unknown right %q: rights are READ, WRITE, ADMIN, MONITOR, BACKUP and REPLICATION", right)
 	}
-	if table != AllTables {
+	if prefix, ok := strings.CutSuffix(table, "*"); ok && prefix != "" {
+		if err := checkNames(verb, "table prefix", prefix); err != nil {
+			return err
+		}
+	} else if table != AllTables {
 		var err error
 		if table, err = c.tableName(verb, table); err != nil {
 			return err
