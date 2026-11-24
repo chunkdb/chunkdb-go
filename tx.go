@@ -290,20 +290,30 @@ func (tx *Tx) GetBlock(ctx context.Context, table string, x, y int64, columns ..
 }
 
 // SetBlock writes block (x, y) like [Client.SetBlock]; the write applies at
-// COMMIT.
-func (tx *Tx) SetBlock(ctx context.Context, table string, x, y int64, values Record) error {
+// COMMIT. It takes [If] and [WithArgs]; a condition reads the transaction's
+// view. [IfVersion] and [IfAbsent] are refused, because COMMIT checks every
+// chunk the transaction read or wrote.
+func (tx *Tx) SetBlock(ctx context.Context, table string, x, y int64, values Record, opts ...WriteOption) error {
+	clause, err := txBlockClause("SET BLOCK", opts)
+	if err != nil {
+		return err
+	}
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := setBlock(ctx, tx, table, x, y, values, blockClause{})
+	reply, err := setBlock(ctx, tx, table, x, y, values, clause)
 	return expectNoVersion(reply, err, "SET BLOCK")
 }
 
 // DeleteBlock deletes block (x, y) like [Client.DeleteBlock]; the delete
-// applies at COMMIT.
-func (tx *Tx) DeleteBlock(ctx context.Context, table string, x, y int64) error {
+// applies at COMMIT. It takes [If] and [WithArgs] as [Tx.SetBlock] does.
+func (tx *Tx) DeleteBlock(ctx context.Context, table string, x, y int64, opts ...WriteOption) error {
+	clause, err := txBlockClause("DELETE BLOCK", opts)
+	if err != nil {
+		return err
+	}
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := deleteBlock(ctx, tx, table, x, y, blockClause{})
+	reply, err := deleteBlock(ctx, tx, table, x, y, clause)
 	return expectNoVersion(reply, err, "DELETE BLOCK")
 }
 

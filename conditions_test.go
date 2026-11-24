@@ -99,3 +99,27 @@ func TestDecodeFilteredScanPage(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestExprOnlyInSetBlockValues(t *testing.T) {
+	if _, err := normalize("label", TypeText(16), Expr("label")); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("a text column took an Expr: %v", err)
+	}
+	schema := &Schema{Table: "t", Columns: []Column{{Name: "label", Type: TypeText(16)}}}
+	if _, err := encodeArgs("SET BLOCK", schema, []Arg{{"label", Expr("label")}}); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("an argument took an Expr: %v", err)
+	}
+	if _, err := normalizedFormValue(schema.Columns[0], Expr("label")); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("a chunk block took an Expr: %v", err)
+	}
+}
+
+func TestTxBlockClause(t *testing.T) {
+	if clause, err := txBlockClause("SET BLOCK", []WriteOption{If("a = $1"), WithArgs(Arg{"a", 1})}); err != nil || clause.text != " IF a = $1" {
+		t.Fatalf("%+v %v", clause, err)
+	}
+	for _, opt := range []WriteOption{IfVersion(1), IfAbsent()} {
+		if _, err := txBlockClause("SET BLOCK", []WriteOption{opt}); !errors.Is(err, ErrProtocol) {
+			t.Fatal(err)
+		}
+	}
+}

@@ -22,18 +22,26 @@ func (tx *Tx) GetBlock3DWithMetadata(ctx context.Context, table string, x, y, z 
 }
 
 // SetBlock3D stages a three-dimensional block update for COMMIT.
-func (tx *Tx) SetBlock3D(ctx context.Context, table string, x, y, z int64, values Record) error {
+func (tx *Tx) SetBlock3D(ctx context.Context, table string, x, y, z int64, values Record, opts ...WriteOption) error {
+	clause, err := txBlockClause("SET BLOCK", opts)
+	if err != nil {
+		return err
+	}
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := setBlock(ctx, tx, table, x, y, values, blockClause{}, z)
+	reply, err := setBlock(ctx, tx, table, x, y, values, clause, z)
 	return expectNoVersion(reply, err, "SET BLOCK")
 }
 
 // DeleteBlock3D stages removal of one three-dimensional block.
-func (tx *Tx) DeleteBlock3D(ctx context.Context, table string, x, y, z int64) error {
+func (tx *Tx) DeleteBlock3D(ctx context.Context, table string, x, y, z int64, opts ...WriteOption) error {
+	clause, err := txBlockClause("DELETE BLOCK", opts)
+	if err != nil {
+		return err
+	}
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := deleteBlock(ctx, tx, table, x, y, blockClause{}, z)
+	reply, err := deleteBlock(ctx, tx, table, x, y, clause, z)
 	return expectNoVersion(reply, err, "DELETE BLOCK")
 }
 

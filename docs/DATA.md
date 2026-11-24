@@ -38,25 +38,40 @@ conditional write: applied
 
 ## Conditions and computed values
 
+<!-- go-example: ExampleClient_SetBlock_condition -->
 ```go
-_, err = client.SetBlock(ctx, "world_go", 0, 0,
-	chunkdb.Record{"tile": chunkdb.Expr("tile + $1")},
-	chunkdb.If("tile < $2"),
-	chunkdb.WithArgs(chunkdb.Arg{Column: "tile", Value: 1}, chunkdb.Arg{Column: "tile", Value: 10}))
-if chunkdb.IsCode(err, chunkdb.CodeConditionFailed) {
-	fmt.Println("tile is already at the limit")
-} else if err != nil {
+if _, err := client.SetBlock(ctx, "world_go", 9, 9, chunkdb.Record{"tile": 9}); err != nil {
 	log.Fatal(err)
 }
+for range 2 {
+	_, err := client.SetBlock(ctx, "world_go", 9, 9,
+		chunkdb.Record{"tile": chunkdb.Expr("tile + $1")},
+		chunkdb.If("tile < $2"),
+		chunkdb.WithArgs(chunkdb.Arg{Column: "tile", Value: 1}, chunkdb.Arg{Column: "tile", Value: 10}))
+	if chunkdb.IsCode(err, chunkdb.CodeConditionFailed) {
+		fmt.Println("tile is already at the limit")
+	} else if err != nil {
+		log.Fatal(err)
+	} else {
+		fmt.Println("tile raised")
+	}
+}
+```
+
+```output
+tile raised
+tile is already at the limit
 ```
 
 - `Expr` values and `If` conditions are evaluated by the server against the block as it is when the write applies; see the server's [Expressions](https://github.com/chunkdb/chunkdb/blob/main/docs/reference/EXPRESSIONS.md) reference.
 - `WithArgs` gives the `$n` parameters: the first `Arg` is `$1`; plain record values are numbered after them.
 - Each `$n` appears once in the statement; to use a value twice, pass it as two arguments.
 - Each `Arg` is encoded with the type of its `Column`, the column it meets on the server; name a chunk column as `chunk.name`.
+- An argument compared with a position or `NOW()` only, as in `POS_X > $1`, has no column to take its type from; compare a column instead, or write the value into the condition.
 - A false or NULL condition writes nothing and returns server code `CONDITION_FAILED`, with the chunk's version in `Metadata.Current`.
 - A computed value outside its column returns `OUT_OF_RANGE`; `If` excludes `IfVersion`.
-- `DeleteBlock` and the 3D writes take `If` and `WithArgs` too; `Tx` writes take `Expr` values only.
+- `DeleteBlock`, the 3D writes and `Tx` block writes take `If` and `WithArgs` too; a transaction refuses `IfVersion`.
+- `Expr` is taken only as a `SetBlock` value; chunk forms, chunk columns and arguments refuse it.
 
 ## Chunks and areas
 

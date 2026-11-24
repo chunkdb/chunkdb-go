@@ -443,6 +443,9 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 				statement.WriteString(", ")
 			}
 			if expr, ok := values[columnName].(Expr); ok {
+				if strings.TrimSpace(string(expr)) == "" {
+					return Reply{}, requestErrorf(command, "the computed value of column %s is empty", columnName)
+				}
 				statement.WriteString(columnName + " = " + string(expr))
 				continue
 			}

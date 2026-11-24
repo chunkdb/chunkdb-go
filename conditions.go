@@ -119,3 +119,13 @@ func conditionArgs(where *Condition) []Arg {
 	}
 	return where.Args
 }
+
+// txBlockClause is blockWriteClause for a transaction, which takes no IF
+// VERSION or IF ABSENT.
+func txBlockClause(command string, opts []WriteOption) (blockClause, error) {
+	options := resolveWriteOptions(opts)
+	if options.ifVersion != nil || options.ifAbsent {
+		return blockClause{}, requestErrorf(command, "a transaction takes no IfVersion or IfAbsent: COMMIT checks every chunk it read or wrote")
+	}
+	return blockWriteClause(command, opts)
+}
