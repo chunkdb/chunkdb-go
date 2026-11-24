@@ -14,6 +14,11 @@ type TableStats struct {
 	Dims                  int
 	Tombstones            uint64
 	RetainedDeletionFloor uint64
+	// Chunks counts populated chunks and LoadedChunks those in the chunk
+	// cache; Files and DiskBytes count the files under the table's directory;
+	// Slots counts durable slots and Watches open watches. They are zero for
+	// servers that do not report them.
+	Chunks, LoadedChunks, Files, DiskBytes, Slots, Watches uint64
 	// Fields retains the raw map, including unknown fields.
 	Fields map[string]Reply
 }
@@ -75,6 +80,14 @@ func parseTableStats(reply Reply) (TableStats, error) {
 	}
 	if stats.RetainedDeletionFloor, err = fieldUint64(command, fields, "retained_deletion_floor"); err != nil {
 		return TableStats{}, err
+	}
+	for key, target := range map[string]*uint64{"chunks": &stats.Chunks, "loaded_chunks": &stats.LoadedChunks, "files": &stats.Files, "disk_bytes": &stats.DiskBytes, "slots": &stats.Slots, "watches": &stats.Watches} {
+		if _, exists := fields[key]; !exists {
+			continue
+		}
+		if *target, err = fieldUint64(command, fields, key); err != nil {
+			return TableStats{}, err
+		}
 	}
 	return stats, nil
 }

@@ -136,6 +136,9 @@ func encodeSectionedChunkForm(schema *Schema, chunk *Chunk, includeMetadata bool
 	if chunk == nil {
 		return bad("nil chunk")
 	}
+	if chunk.Scale != 0 {
+		return bad("a downsampled chunk cannot be written")
+	}
 	chunkDepth := chunk.Depth
 	if chunkDepth == 0 && schema.Dims != 3 {
 		chunkDepth = 1
