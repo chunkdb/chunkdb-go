@@ -107,7 +107,7 @@ func TestChunkModelScanRejectsBrokenPageProgressAndIdentity(t *testing.T) {
 			if test.name == "ordinary tombstone" {
 				selectedSince = nil
 			}
-			if _, err := decodeScanPage(schema, test.reply, 3, test.after, 1, selectedSince, test.data, nil, test.epoch); !errors.Is(err, ErrProtocol) {
+			if _, err := decodeScanPage(schema, test.reply, 3, test.after, 1, selectedSince, test.data, nil, test.epoch, false); !errors.Is(err, ErrProtocol) {
 				t.Fatalf("accepted broken page: %v", err)
 			}
 		})

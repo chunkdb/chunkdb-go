@@ -34,7 +34,7 @@ func (c *Client) GetBlock3DWithMetadata(ctx context.Context, table string, x, y,
 
 // SetBlock3D updates one block and returns its producing chunk version.
 func (c *Client) SetBlock3D(ctx context.Context, table string, x, y, z int64, values Record, opts ...WriteOption) (uint64, error) {
-	clause, err := writeClause("SET BLOCK", opts, false)
+	clause, err := blockWriteClause("SET BLOCK", opts)
 	if err != nil {
 		return 0, err
 	}
@@ -47,7 +47,7 @@ func (c *Client) SetBlock3D(ctx context.Context, table string, x, y, z int64, va
 
 // DeleteBlock3D removes one block and returns its producing chunk version.
 func (c *Client) DeleteBlock3D(ctx context.Context, table string, x, y, z int64, opts ...WriteOption) (uint64, error) {
-	clause, err := writeClause("DELETE BLOCK", opts, false)
+	clause, err := blockWriteClause("DELETE BLOCK", opts)
 	if err != nil {
 		return 0, err
 	}

@@ -294,7 +294,7 @@ func (tx *Tx) GetBlock(ctx context.Context, table string, x, y int64, columns ..
 func (tx *Tx) SetBlock(ctx context.Context, table string, x, y int64, values Record) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := setBlock(ctx, tx, table, x, y, values, "")
+	reply, err := setBlock(ctx, tx, table, x, y, values, blockClause{})
 	return expectNoVersion(reply, err, "SET BLOCK")
 }
 
@@ -303,7 +303,7 @@ func (tx *Tx) SetBlock(ctx context.Context, table string, x, y int64, values Rec
 func (tx *Tx) DeleteBlock(ctx context.Context, table string, x, y int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := deleteBlock(ctx, tx, table, x, y, "")
+	reply, err := deleteBlock(ctx, tx, table, x, y, blockClause{})
 	return expectNoVersion(reply, err, "DELETE BLOCK")
 }
 

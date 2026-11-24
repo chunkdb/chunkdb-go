@@ -37,12 +37,12 @@ func TestAggregateStatement(t *testing.T) {
 		{ChunkSelector{Around: &Around{0, 0, 2}}, false, "AGGREGATE AREA AROUND 0 0 RADIUS 2 FROM t COUNT(*), SUM(h)"},
 		{ChunkSelector{Around3D: &Around3D{0, 0, 1, 2}}, true, "AGGREGATE AREA AROUND 0 0 1 RADIUS 2 FROM t COUNT(*), SUM(h) BY CHUNK"},
 	} {
-		got, err := aggregateStatement("t", tc.selector, []AggregateFunction{CountAll(), SumOf("h")}, tc.byChunk)
+		got, err := aggregateStatement("t", tc.selector, []AggregateFunction{CountAll(), SumOf("h")}, nil, tc.byChunk)
 		if err != nil || got != tc.want {
 			t.Fatalf("got %q, %v; want %q", got, err, tc.want)
 		}
 	}
-	got, _ := aggregateStatement("t", ChunkSelector{Chunk: &ChunkCoord{}}, []AggregateFunction{MinOf("a"), MaxOf("b"), AvgOf("c")}, false)
+	got, _ := aggregateStatement("t", ChunkSelector{Chunk: &ChunkCoord{}}, []AggregateFunction{MinOf("a"), MaxOf("b"), AvgOf("c")}, nil, false)
 	if got != "AGGREGATE CHUNK 0 0 FROM t MIN(a), MAX(b), AVG(c)" {
 		t.Fatal(got)
 	}
@@ -58,7 +58,7 @@ func TestAggregateStatement(t *testing.T) {
 		{ChunkSelector{Chunk: &ChunkCoord{}}, []AggregateFunction{SumOf("Bad Name")}},
 		{ChunkSelector{Chunk: &ChunkCoord{}}, []AggregateFunction{{Op: "MEDIAN", Column: "h"}}},
 	} {
-		if _, err := aggregateStatement("t", bad.selector, bad.functions, false); !errors.Is(err, ErrProtocol) {
+		if _, err := aggregateStatement("t", bad.selector, bad.functions, nil, false); !errors.Is(err, ErrProtocol) {
 			t.Fatalf("%+v: %v", bad, err)
 		}
 	}

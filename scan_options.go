@@ -9,9 +9,15 @@ import (
 
 // ScanOptions selects a two-dimensional page and optional retained changes.
 type ScanOptions struct {
-	After    *ChunkCoord
-	Limit    int
-	Since    *uint64
+	After *ChunkCoord
+	Limit int
+	Since *uint64
+	// Where keeps only the blocks for which the condition is true. Without
+	// Since, only chunks with a matching block are listed; with Since,
+	// which then needs WithData, a changed chunk without a match has a nil
+	// Chunk and Deleted true. A page can hold fewer chunks than Limit, or
+	// none: continue after the page's After.
+	Where    *Condition
 	WithData bool
 	Columns  []string
 	// Epoch binds a resumed scan to a previously returned table lifetime.
@@ -23,6 +29,7 @@ type ScanOptions3D struct {
 	After    *ChunkCoord3D
 	Limit    int
 	Since    *uint64
+	Where    *Condition
 	WithData bool
 	Columns  []string
 	Epoch    string
@@ -48,8 +55,12 @@ type ScannedChunk3D struct {
 // ChunkScanPage includes the table lifetime and completed frontier of a page.
 // Position is nil when a read-only server cannot establish its frontier.
 type ChunkScanPage struct {
-	Chunks                []ScannedChunk
-	More                  bool
+	Chunks []ScannedChunk
+	More   bool
+	// After is the last chunk a page with Where visited, kept or not; pass it
+	// as the next page's After while More is true. It is nil without Where
+	// and when More is false.
+	After                 *ChunkCoord
 	Epoch                 string
 	Position              *uint64
 	RetainedDeletionFloor uint64
@@ -59,6 +70,7 @@ type ChunkScanPage struct {
 type ChunkScanPage3D struct {
 	Chunks                []ScannedChunk3D
 	More                  bool
+	After                 *ChunkCoord3D
 	Epoch                 string
 	Position              *uint64
 	RetainedDeletionFloor uint64
@@ -77,11 +89,11 @@ func (c *Client) ScanChunksWithOptions(ctx context.Context, table string, opts S
 	if opts.After != nil {
 		after = []int64{opts.After.CX, opts.After.CY}
 	}
-	page, err := scanChunksChecked(ctx, c, table, 2, after, opts.Limit, opts.Since, opts.WithData, opts.Columns, opts.Epoch)
+	page, err := scanChunksChecked(ctx, c, table, 2, after, opts.Limit, opts.Since, opts.WithData, opts.Columns, opts.Epoch, opts.Where)
 	if err != nil {
 		return ChunkScanPage{}, err
 	}
-	result := ChunkScanPage{More: page.More, Epoch: page.Epoch, Position: page.Position, RetainedDeletionFloor: page.RetainedDeletionFloor,
+	result := ChunkScanPage{More: page.More, After: coord2D(page.After), Epoch: page.Epoch, Position: page.Position, RetainedDeletionFloor: page.RetainedDeletionFloor,
 		Chunks: make([]ScannedChunk, 0, len(page.Chunks))}
 	for _, chunk := range page.Chunks {
 		result.Chunks = append(result.Chunks, ScannedChunk{CX: chunk.CX, CY: chunk.CY, Version: chunk.Version, Chunk: chunk.Chunk, Deleted: chunk.Deleted})
@@ -95,7 +107,7 @@ func (c *Client) ScanChunks3DWithOptions(ctx context.Context, table string, opts
 	if opts.After != nil {
 		after = []int64{opts.After.CX, opts.After.CY, opts.After.CZ}
 	}
-	return scanChunksChecked(ctx, c, table, 3, after, opts.Limit, opts.Since, opts.WithData, opts.Columns, opts.Epoch)
+	return scanChunksChecked(ctx, c, table, 3, after, opts.Limit, opts.Since, opts.WithData, opts.Columns, opts.Epoch, opts.Where)
 }
 
 // ScanChunks3D lists populated chunks in ascending x, then y, then z order.
@@ -111,7 +123,7 @@ func (c *Client) ScanChunks3D(ctx context.Context, table string, after *ChunkCoo
 	return result, nil
 }
 
-func scanChunksChecked(ctx context.Context, s session, table string, dims int, after []int64, limit int, since *uint64, data bool, columns []string, expectedEpoch string) (ChunkScanPage3D, error) {
+func scanChunksChecked(ctx context.Context, s session, table string, dims int, after []int64, limit int, since *uint64, data bool, columns []string, expectedEpoch string, where *Condition) (ChunkScanPage3D, error) {
 	const command = "SCAN CHUNKS"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -122,6 +134,13 @@ func scanChunksChecked(ctx context.Context, s session, table string, dims int, a
 	}
 	if err := checkNames(command, "column", columns...); err != nil {
 		return ChunkScanPage3D{}, err
+	}
+	filter, err := conditionText(command, where)
+	if err != nil {
+		return ChunkScanPage3D{}, err
+	}
+	if where != nil && since != nil && !data {
+		return ChunkScanPage3D{}, requestErrorf(command, "WHERE with SINCE needs WITH DATA")
 	}
 	if expectedEpoch != "" && !validEpoch(expectedEpoch) {
 		return ChunkScanPage3D{}, requestErrorf(command, "invalid table epoch")
@@ -150,19 +169,27 @@ func scanChunksChecked(ctx context.Context, s session, table string, dims int, a
 		if limit > 0 {
 			statement += " LIMIT " + strconv.Itoa(limit)
 		}
-		if data {
-			statement += " WITH DATA" + columnsClause(columns)
-		}
-		reply, err := s.call(ctx, statement, nil)
+		statement += filter
+		params, err := encodeArgs(command, schema, conditionArgs(where))
 		if err != nil {
 			return ChunkScanPage3D{}, err
 		}
-		return decodeScanPage(schema, reply, dims, after, limit, since, data, columns, expectedEpoch)
+		if data {
+			statement += " WITH DATA" + columnsClause(columns)
+		}
+		reply, err := s.call(ctx, statement, params)
+		if isWrongSize(err) || isNoColumn(err) {
+			return ChunkScanPage3D{}, &staleSchemaError{err: err}
+		}
+		if err != nil {
+			return ChunkScanPage3D{}, err
+		}
+		return decodeScanPage(schema, reply, dims, after, limit, since, data, columns, expectedEpoch, where != nil)
 	})
 	return page, annotate(command, err)
 }
 
-func decodeScanPage(schema *Schema, reply Reply, dims int, after []int64, limit int, since *uint64, data bool, columns []string, expectedEpoch string) (ChunkScanPage3D, error) {
+func decodeScanPage(schema *Schema, reply Reply, dims int, after []int64, limit int, since *uint64, data bool, columns []string, expectedEpoch string, filtered bool) (ChunkScanPage3D, error) {
 	bad := func(what string) (ChunkScanPage3D, error) {
 		return ChunkScanPage3D{}, protocolErrorf("SCAN CHUNKS", "%s", what)
 	}
@@ -247,6 +274,26 @@ func decodeScanPage(schema *Schema, reply Reply, dims int, after []int64, limit 
 		}
 		page.Chunks = append(page.Chunks, entry)
 	}
+	if filtered {
+		next, ok := reply.Lookup("after")
+		if !ok {
+			return bad("expected after in a filtered scan")
+		}
+		if next.Kind != ReplyNull {
+			point, valid := scanPoint(next, dims)
+			if !valid || (after != nil && !scanPointLess(after, point)) || (previous != nil && scanPointLess(point, previous)) {
+				return bad("invalid after coordinate")
+			}
+			page.After = &ChunkCoord3D{CX: point[0], CY: point[1]}
+			if dims == 3 {
+				page.After.CZ = point[2]
+			}
+		}
+		if page.More != (page.After != nil) {
+			return bad("after and more disagree")
+		}
+		return page, nil
+	}
 	if page.More && len(page.Chunks) == 0 {
 		return bad("empty page reports more")
 	}
@@ -317,4 +364,26 @@ func (c *Client) AllChunks3D(ctx context.Context, table string, limit int) iter.
 // AllChunks3D walks every three-dimensional page using leased clients.
 func (p *Pool) AllChunks3D(ctx context.Context, table string, limit int) iter.Seq2[ChunkCoord3D, error] {
 	return allChunks3D(ctx, table, limit, p.ScanChunks3DWithOptions)
+}
+
+func scanPoint(r Reply, dims int) ([]int64, bool) {
+	if r.Kind != ReplyArray || len(r.Array) != dims {
+		return nil, false
+	}
+	point := make([]int64, dims)
+	for i := range point {
+		n, ok := r.Array[i].Int64()
+		if !ok {
+			return nil, false
+		}
+		point[i] = n
+	}
+	return point, true
+}
+
+func coord2D(point *ChunkCoord3D) *ChunkCoord {
+	if point == nil {
+		return nil
+	}
+	return &ChunkCoord{CX: point.CX, CY: point.CY}
 }

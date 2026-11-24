@@ -25,7 +25,7 @@ func (tx *Tx) GetBlock3DWithMetadata(ctx context.Context, table string, x, y, z 
 func (tx *Tx) SetBlock3D(ctx context.Context, table string, x, y, z int64, values Record) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := setBlock(ctx, tx, table, x, y, values, "", z)
+	reply, err := setBlock(ctx, tx, table, x, y, values, blockClause{}, z)
 	return expectNoVersion(reply, err, "SET BLOCK")
 }
 
@@ -33,7 +33,7 @@ func (tx *Tx) SetBlock3D(ctx context.Context, table string, x, y, z int64, value
 func (tx *Tx) DeleteBlock3D(ctx context.Context, table string, x, y, z int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	reply, err := deleteBlock(ctx, tx, table, x, y, "", z)
+	reply, err := deleteBlock(ctx, tx, table, x, y, blockClause{}, z)
 	return expectNoVersion(reply, err, "DELETE BLOCK")
 }
 
