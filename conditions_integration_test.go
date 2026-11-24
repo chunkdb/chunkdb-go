@@ -23,7 +23,7 @@ func TestIntegrationConditionsAndComputedValues(t *testing.T) {
 	if block, err := c.GetBlock(ctx, "wallet", 0, 0); err != nil || block["coins"] != uint64(8) {
 		t.Fatalf("%v %v", block, err)
 	}
-	_, err = c.SetBlock(ctx, "wallet", 0, 0, Record{"coins": Expr("coins - $1")}, If("coins >= $1"), WithArgs(Arg{"coins", 10}))
+	_, err = c.SetBlock(ctx, "wallet", 0, 0, Record{"coins": Expr("coins - $1")}, If("coins >= $2"), WithArgs(Arg{"coins", 10}, Arg{"coins", 10}))
 	var refused *Error
 	if !errors.As(err, &refused) || refused.ServerCode != CodeConditionFailed || refused.Metadata.Current == nil || *refused.Metadata.Current != version {
 		t.Fatalf("condition not refused: %v", err)

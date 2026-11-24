@@ -52,6 +52,7 @@ if chunkdb.IsCode(err, chunkdb.CodeConditionFailed) {
 
 - `Expr` values and `If` conditions are evaluated by the server against the block as it is when the write applies; see the server's [Expressions](https://github.com/chunkdb/chunkdb/blob/main/docs/reference/EXPRESSIONS.md) reference.
 - `WithArgs` gives the `$n` parameters: the first `Arg` is `$1`; plain record values are numbered after them.
+- Each `$n` appears once in the statement; to use a value twice, pass it as two arguments.
 - Each `Arg` is encoded with the type of its `Column`, the column it meets on the server; name a chunk column as `chunk.name`.
 - A false or NULL condition writes nothing and returns server code `CONDITION_FAILED`, with the chunk's version in `Metadata.Current`.
 - A computed value outside its column returns `OUT_OF_RANGE`; `If` excludes `IfVersion`.

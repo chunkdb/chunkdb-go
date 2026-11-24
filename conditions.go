@@ -41,7 +41,8 @@ func If(condition string) WriteOption {
 
 // WithArgs gives the $n parameters of a block write's [If] condition and
 // [Expr] values: args[0] is $1. The written plain values are numbered after
-// them.
+// them. Each $n appears once in the statement, so a value used twice is
+// passed as two arguments.
 func WithArgs(args ...Arg) WriteOption {
 	return func(o *writeOptions) { o.args = append(o.args, args...) }
 }
