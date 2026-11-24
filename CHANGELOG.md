@@ -9,6 +9,9 @@ uses protocol 3 (CQL); see the engine's
 ## Unreleased
 
 ### Added
+- `Aggregate` and `AggregateByChunk` run AGGREGATE over a `ChunkSelector` (chunk, area or ball, 2D or 3D) with `CountAll`, `SumOf`, `MinOf`, `MaxOf` and `AvgOf`; integers outside the int64 range decode as `*big.Int` (chunkdb/chunkdb#151).
+- `WatchOptions.Areas` and `WatchOptions.Areas3D` watch several areas in one WATCH (chunkdb/chunkdb#151).
+- `TableStats`, `CompactTombstones`, `SwapTables`, `RecoverTable`, `Migrations`, `Backup`, `RestoreTable` and `ReloadTLS` run SHOW TABLE STATS, COMPACT TOMBSTONES, SWAP TABLES, RECOVER TABLE, SHOW MIGRATIONS, BACKUP TO, RESTORE TABLE and RELOAD TLS with typed replies (chunkdb/chunkdb#151).
 - `IsCode(err, code)` reports whether an error is a server error with a given code; a test decodes every server code (chunkdb/chunkdb#151).
 - Logins over TLS are bound to their connection (SCRAM-SHA-256-PLUS with `tls-exporter` on TLS 1.3 and `tls-server-end-point` on TLS 1.2), so a login relayed by something that ends TLS fails with `AUTH_FAILED reason=channel_binding`. `Options.ChannelBinding` takes `ChannelBindingAuto` (the default), `ChannelBindingOff` and `ChannelBindingRequire`; `CreateUserOptions.RequiresChannelBinding`, `Client.SetRequiresChannelBinding` and `User.RequiresChannelBinding` manage users who log in only bound. An `AUTH_REQUIRED` reply with a reason, such as from a server started with `--auth-channel-binding require`, is reported as the server's error rather than as an older server (chunkdb/chunkdb#162).
 - `SlotOptions.Owner` creates a slot for a named user with `CREATE SLOT ... OWNER`, and `Slot.Owner` reports the owner from SHOW SLOTS when the server shows it.

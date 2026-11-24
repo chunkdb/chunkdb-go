@@ -50,13 +50,13 @@ A revision orders committed changes within a table's change feed.
 
 ## Guides
 
-- [Data](docs/DATA.md): blocks, chunks, areas, scans, and schemas.
+- [Data](docs/DATA.md): blocks, chunks, areas, aggregates, scans, and schemas.
 - [Values](docs/VALUES.md): column types, NULL, and parameters.
 - [Transactions](docs/TRANSACTIONS.md): publish several writes together.
 - [Users](docs/USERS.md): grant table access.
 - [Change feed](docs/CHANGE_FEED.md) and [Slots](docs/SLOTS.md): live changes and durable consumers.
 - [Journal example](examples/journal/main.go): store every slot change and schema description in a file before acknowledging it; see [Event journal](https://github.com/chunkdb/chunkdb/blob/main/docs/EVENT_JOURNAL.md) for rebuilds and retention.
-- [Operations](docs/OPERATIONS.md): migrations, backup, durability, and metrics.
+- [Operations](docs/OPERATIONS.md): migrations, backup and restore, table maintenance, durability, and metrics.
 - [Connections](docs/CONNECTIONS.md): authentication, TLS, channel binding, pooling, timeouts, and errors.
 
 The [package reference](https://pkg.go.dev/github.com/chunkdb/chunkdb-go/v2) lists exported methods and types.
