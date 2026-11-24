@@ -10,6 +10,7 @@ uses protocol 3 (CQL); see the engine's
 
 ### Added
 - `Schema.Fenced` reports the reason DESCRIBE gives for a fenced table, and `ConnectionInfo.Progress` the files and bytes a running RESTORE TABLE copied; a downsampled chunk no longer lists its scale section in `UnknownSections` (chunkdb/chunkdb#151).
+- `WatchCatalog` on the client and the pool runs WATCH CATALOG when the server reports `watch_catalog`; `CatalogEvent` entries decode their data with `TableSchema`, `UserData` and `SlotData`, and a `ResyncEvent` on that stream means rebuilding the catalog from the next event; `RotatePassword` adds a second password for the logged-in user with the salt and iterations its login received; `SetUserLimits` runs ALTER USER ... LIMIT; the `AddCheck` documentation notes that its condition is CQL text that must not be built from untrusted input (chunkdb/chunkdb#151).
 - `SetBlockReturning` and `DeleteBlockReturning` (and 3D forms) send RETURNING and decode `{applied, version, rows}`; `TxReadOnly` runs BEGIN READ ONLY; `SetColumnDefault`, `DropColumnDefault`, `SetColumnNull`, `SetColumnRequired`, `AddCheck`, `DropCheck` and `RenameTable` run the ALTER TABLE forms, and `Schema.Checks` lists CHECK constraints (chunkdb/chunkdb#151).
 - `ComputeVerifierWithSalt`, `ParseVerifier`, `AddVerifier` and `DropOldVerifier` rotate a password with two verifiers; `User` reports `Verifiers` and `ServerRights`; `RightMonitor`, `RightBackup` and `RightReplication` are server rights; `Grant` and `Revoke` take prefixes such as `tenant1_*`; `PermissionDeniedError.Rights` lists alternatives such as MONITOR or ADMIN (chunkdb/chunkdb#151).
 - `ServerStatus` reports `Version`, `UptimeMS`, `ReadOnly`, table `State` and `Reason`, and `Fenced`; `TableStats` reports `Chunks`, `LoadedChunks`, `Files`, `DiskBytes`, `Slots` and `Watches`; `Slot` reports `Revision`, `LagRevisions` and `Attached`, and `SlotsWithPrefix` runs SHOW SLOTS ... PREFIX (chunkdb/chunkdb#151).
@@ -37,6 +38,7 @@ uses protocol 3 (CQL); see the engine's
 - An out-of-range integer or `f32` value error names the range of the column type.
 
 ### Documentation
+- Follow the server's rights: `Status` needs MONITOR or ADMIN on `*`, backups take BACKUP or MANAGES USERS, SHOW MIGRATIONS lists the records within your rights, MONITOR lists every connection and REPLICATION gates no statement; `RATE_LIMITED` also names `auth_ban`, and `RESYNC_REQUIRED` after COMPACT TOMBSTONES answers scans with `Since` (chunkdb/chunkdb#151).
 - CONNECTIONS.md: a TLS proxy that opens its own TLS connection to the server gets `AUTH_FAILED` with reason `channel_binding`, and one that forwards plain TCP gets `INVALID_ARGUMENT`. (#40)
 - The README runs the world example with `go run github.com/chunkdb/chunkdb-go/v2/examples/world@latest`, without a clone, and shows its `Migrate` call.
 - A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.

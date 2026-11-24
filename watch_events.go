@@ -39,14 +39,19 @@ type ChunksEvent struct {
 
 func (e *ChunksEvent) GetPosition() Position { return e.Position }
 
-// CatalogChange preserves catalog-specific data without assuming a schema.
+// CatalogChange is one entry of a [CatalogEvent]: Kind is table, user or
+// slot, Action is create, alter or drop, Table names the table of a slot and
+// is nil otherwise, and Data is the object after the change, a null reply for
+// a drop. [CatalogChange.TableSchema], [CatalogChange.UserData] and
+// [CatalogChange.SlotData] decode Data.
 type CatalogChange struct {
 	Kind, Action, Name, Table *string
 	Data                      Reply
 }
 
-// CatalogEvent is the reserved catalog envelope. Its decoding does not imply
-// that the server implements WATCH CATALOG; check negotiated capabilities.
+// CatalogEvent is one event of [Client.WatchCatalog]. User names the user
+// whose statement sent it, and is nil in a whole-catalog event and for a watch
+// without MANAGES USERS; Txn is nil.
 type CatalogEvent struct {
 	Position     Position
 	CommitTimeMs uint64
@@ -161,6 +166,9 @@ func (w *Watch) decode(ctx context.Context, r Reply) (Event, error) {
 	}
 	a := r.Array
 	kind := string(a[0].Bulk)
+	if w.catalog && kind != "catalog" && kind != "progress" && kind != "resync" {
+		return bad()
+	}
 	if kind == "schema" && len(a) >= 2 && a[1].Kind == ReplyMap {
 		payload := a[1]
 		pos, err := parsePositionMap(payload)

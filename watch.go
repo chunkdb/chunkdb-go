@@ -93,7 +93,9 @@ type SchemaEvent struct {
 
 func (e *SchemaEvent) GetPosition() Position { return e.Position }
 
-// ResyncEvent asks the consumer to re-read state on another connection.
+// ResyncEvent asks the consumer to re-read state on another connection. On a
+// [Client.WatchCatalog] stream it means: discard the catalog and rebuild it
+// from the next event, which holds the whole catalog.
 type ResyncEvent struct {
 	Position     Position
 	ParentEpoch  *string
@@ -134,6 +136,8 @@ type Watch struct {
 	ackCancel      context.CancelFunc
 	ackMu          sync.Mutex
 	delivered      Position
+	// catalog marks a WATCH CATALOG stream, which has no table schema.
+	catalog bool
 }
 
 // Watch opens a stream with the client's endpoint, TLS options and login.
@@ -243,7 +247,10 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 }
 
 func (c *Client) copyOptions() *Client {
-	return &Client{opts: c.opts, slots: make(chan struct{}, c.opts.pipelineDepth), dialGate: make(chan struct{}, 1), txGate: make(chan struct{}, 1), schemas: make(map[string]*Schema)}
+	c.loginMu.Lock()
+	opts := c.opts
+	c.loginMu.Unlock()
+	return &Client{opts: opts, slots: make(chan struct{}, opts.pipelineDepth), dialGate: make(chan struct{}, 1), txGate: make(chan struct{}, 1), schemas: make(map[string]*Schema)}
 }
 
 // Watch opens a dedicated connection without consuming a pool lease.

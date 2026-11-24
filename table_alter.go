@@ -76,7 +76,8 @@ func (c *Client) SetColumnRequired(ctx context.Context, table, column string, re
 // AddCheck adds a CHECK constraint (ALTER TABLE ... ADD CHECK) to table, named
 // name or by the server when name is empty. It is refused when a present
 // block makes the condition false; later writes that would are refused with
-// [CodeCheckFailed].
+// [CodeCheckFailed]. The condition is CQL text sent as it is, not a
+// parameter: never build it from untrusted input.
 func (c *Client) AddCheck(ctx context.Context, table, name, condition string) error {
 	const command = "ALTER TABLE"
 	tableName, err := c.tableName(command, table)

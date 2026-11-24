@@ -78,6 +78,41 @@ func (c *Client) AddVerifier(ctx context.Context, user, verifier string) error {
 	return c.userStatement(ctx, "ALTER USER "+user+" ADD VERIFIER $1", []byte(verifier))
 }
 
+// RotatePassword gives the user this client logs in as a second password
+// (ALTER USER ... ADD VERIFIER). It computes the verifier with the salt and
+// iterations its login received, so no verifier text is needed, and logs in
+// with newPassword from then on. Both passwords log in until
+// [Client.DropOldVerifier]: move every other client, pool and watch to the
+// new password first. A client without a user is refused, and so is a user
+// that already has two verifiers.
+func (c *Client) RotatePassword(ctx context.Context, newPassword string) error {
+	const command = "ALTER USER"
+	user := c.opts.uri.User
+	if user == "" {
+		return requestErrorf(command, "RotatePassword needs a client that logs in as a user")
+	}
+	if newPassword == "" {
+		return requestErrorf(command, "empty password; a user logs in with a password")
+	}
+	if _, err := c.connection(ctx); err != nil {
+		return err
+	}
+	c.loginMu.Lock()
+	salt, iterations := c.loginSalt, c.loginIterations
+	c.loginMu.Unlock()
+	verifier, err := ComputeVerifierWithSalt(newPassword, salt, iterations)
+	if err != nil {
+		return annotate(command, err)
+	}
+	if err := c.userStatement(ctx, "ALTER USER "+user+" ADD VERIFIER $1", []byte(verifier)); err != nil {
+		return err
+	}
+	c.loginMu.Lock()
+	c.opts.uri.Password = newPassword
+	c.loginMu.Unlock()
+	return nil
+}
+
 // DropOldVerifier removes the older of user's two verifiers (ALTER USER ...
 // DROP OLD VERIFIER), so only the password of the added one logs in. On a
 // user with one verifier it changes nothing.

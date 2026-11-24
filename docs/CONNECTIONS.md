@@ -132,12 +132,12 @@ Options not implemented by the server appear in NotApplied with `implementation_
 `Client.Cancel(ctx, id)` cancels a target's current statement; false includes idle statements and work past its decision boundary.
 `Client.KillConnection(ctx, id)` closes the target safely; killing the calling connection is acknowledged before it closes.
 IDs are exact uint64 values and are not reused during a server run.
-The current user can control connections belonging to the same live user identity; ADMIN on `*` also permits other connections.
+The current user can control connections belonging to the same live user identity; ADMIN on `*` also permits other connections, and MONITOR lists every connection.
 Check `info.Supports("connection_controls")` before using these methods against a server without the capability.
 The pool exposes all three methods; use `WithClient` when actions must originate from one specific connection.
 Control an in-flight request from a separate client connection; pooled controls require an available lease and follow the leased client's request ordering.
 `CANCELLED` and `TIMEOUT` with `applied=false` report that the statement did not apply.
-`RATE_LIMITED` identifies `max_connections` or `statements_per_sec` in its reason and can include `retry_after_ms`.
+`RATE_LIMITED` names `max_connections`, `statements_per_sec` or `auth_ban` (repeated failed logins from the address) in its reason and includes `retry_after_ms`.
 
 `Error.ServerKeys` preserves structured keys, including unknown keys and opaque malformed escapes.
 `Error.Metadata` exposes checked numeric fields; `Error.RetryClass` depends only on ServerCode, except `unknown_outcome` on a lost reply.

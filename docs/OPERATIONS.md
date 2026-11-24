@@ -43,12 +43,12 @@ notes_label skipped
 | Statement | CREATE/ALTER/DROP TABLE, GRANT/REVOKE, or CREATE/DROP SLOT. |
 | Input | No parameters, CR, LF, or NUL; the inner statement's rights apply. |
 | Server | One process, read-write mode; no enclosing transaction. |
-| `SHOW MIGRATIONS` | Requires MANAGES USERS unless authentication is disabled. |
+| `SHOW MIGRATIONS` | Lists the records within your rights; the applying user shows only with MANAGES USERS. |
 
 ## Online backup
 
 Backup is disabled unless you start the server with `--backup-dir <path>`.
-Use a client with MANAGES USERS, or a server with authentication disabled.
+Use a client with BACKUP or MANAGES USERS, or a server with authentication disabled.
 
 <!-- go-example: ExampleClient_Do_backup -->
 ```go
@@ -79,7 +79,7 @@ Restore never replaces a table; `SwapTables(ctx, a, b)` then exchanges the two n
 
 - `Migrations` lists applied migrations within your rights; `User` is empty without MANAGES USERS.
 - `TableStats` returns the epoch, completed revision (nil on a read-only server), dimensions, retained tombstones and retained-deletion floor, and the counts `Chunks`, `LoadedChunks`, `Files`, `DiskBytes`, `Slots` and `Watches`; `Files` and `DiskBytes` list the table's directory, so their cost grows with its file count.
-- `CompactTombstones(ctx, table, before)` forgets retained tombstones below revision `before` and returns the new floor; watches that resume below it receive `RESYNC_REQUIRED`.
+- `CompactTombstones(ctx, table, before)` forgets retained tombstones below revision `before` and returns the new floor; a scan whose `Since` lies below it receives `RESYNC_REQUIRED`.
 - `RecoverTable` returns a fenced table to service.
 - `ReloadTLS` makes new connections use the certificate and key files read again; open connections keep theirs.
 
@@ -118,6 +118,6 @@ Unknown names return `INVALID_ARGUMENT reason=unknown_feature`.
 
 `Status(ctx)` reports enabled directory and table storage features and raw Compat, ReadOnlyCompat and Incompat masks.
 It also reports the server `Version`, `UptimeMS` and `ReadOnly`, each table's `State` (`ok` or `fenced`) and fence `Reason`, and in `Fenced` the fenced tables whose features cannot be read.
-It requires ADMIN on `*` and exposes ActivationPending from the protected activation state.
+It requires MONITOR or ADMIN on `*` and exposes ActivationPending from the protected activation state.
 Unknown names and fields remain available; these storage features are separate from HELLO capabilities.
 A recovery error is returned when an unhealthy server cannot provide a truthful snapshot.

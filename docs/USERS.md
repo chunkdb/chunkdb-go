@@ -44,13 +44,14 @@ Use TLS over an untrusted network.
 | `RightAdmin` | Includes `RightWrite`, which includes `RightRead`. |
 | `AllTables` | Grants a right on all tables, including future tables. |
 | Prefix grant | `Grant(ctx, right, "tenant1_*", user)` covers every table whose name starts with `tenant1_`, future tables included; it stays when a table is dropped. |
-| `RightMonitor`, `RightBackup`, `RightReplication` | Server rights, granted on `AllTables` only: MONITOR reads metrics, status, every connection and every table's stats and slots; BACKUP takes backups; REPLICATION follows every table's feed. `User.ServerRights` lists them. |
+| `RightMonitor`, `RightBackup`, `RightReplication` | Server rights, granted on `AllTables` only: MONITOR reads metrics, status, every connection, every table's stats and slots, and the catalog watch; BACKUP takes backups and restores a table under a name it has ADMIN on; REPLICATION is stored and listed, and no statement requires it. `User.ServerRights` lists them. |
 | Table-specific grant | Disappears when that table is dropped. |
 | `Revoke` | Removes the named right and rights above it. |
 | MANAGES USERS | Permits user administration and grants, independently of table rights. |
 | `SetManagesUsers`, `DropUser`, `Users` | Require MANAGES USERS. |
 | `SetPassword` | Changes your password; another user's requires MANAGES USERS. |
 | `RequiresChannelBinding`, `SetRequiresChannelBinding` | The user logs in only with a login bound to its TLS connection; an unbound login fails like a wrong password. |
+| `SetUserLimits` | Sets `MaxConnections` and `StatementsPerSec` (ALTER USER ... LIMIT); a nil field keeps its limit and zero disables it. Requires MANAGES USERS. |
 
 ## Rotate a password
 
@@ -77,6 +78,8 @@ if err := client.DropOldVerifier(ctx, "bot"); err != nil {
 
 `User.Verifiers` is 2 between `AddVerifier` and `DropOldVerifier`.
 `ComputeVerifier` picks a new salt, so its verifiers fit `SetPassword` but not `AddVerifier`.
+A client logged in as the user can call `client.RotatePassword(ctx, "new-password")` instead: it computes the verifier with the salt and iterations its login received, runs ADD VERIFIER, and logs in with the new password from then on.
+Run `DropOldVerifier` once every other client, pool and watch has moved.
 
 The last manager cannot be dropped or lose that capability.
 Already authenticated connections remain logged in after password changes.
