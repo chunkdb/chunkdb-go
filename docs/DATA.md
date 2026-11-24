@@ -36,6 +36,43 @@ conditional write: applied
 - `IfVersion` checks the whole chunk, including other blocks; rejection returns `VersionMismatchError`.
 - `DeleteBlock` removes a block and returns the new chunk version.
 
+## Conditions and computed values
+
+<!-- go-example: ExampleClient_SetBlock_condition -->
+```go
+if _, err := client.SetBlock(ctx, "world_go", 9, 9, chunkdb.Record{"tile": 9}); err != nil {
+	log.Fatal(err)
+}
+for range 2 {
+	_, err := client.SetBlock(ctx, "world_go", 9, 9,
+		chunkdb.Record{"tile": chunkdb.Expr("tile + $1")},
+		chunkdb.If("tile < $2"),
+		chunkdb.WithArgs(chunkdb.Arg{Column: "tile", Value: 1}, chunkdb.Arg{Column: "tile", Value: 10}))
+	if chunkdb.IsCode(err, chunkdb.CodeConditionFailed) {
+		fmt.Println("tile is already at the limit")
+	} else if err != nil {
+		log.Fatal(err)
+	} else {
+		fmt.Println("tile raised")
+	}
+}
+```
+
+```output
+tile raised
+tile is already at the limit
+```
+
+- `Expr` values and `If` conditions are evaluated by the server against the block as it is when the write applies; see the server's [Expressions](https://github.com/chunkdb/chunkdb/blob/main/docs/reference/EXPRESSIONS.md) reference.
+- `WithArgs` gives the `$n` parameters: the first `Arg` is `$1`; plain record values are numbered after them.
+- Each `$n` appears once in the statement; to use a value twice, pass it as two arguments.
+- Each `Arg` is encoded with the type of its `Column`, the column it meets on the server; name a chunk column as `chunk.name`.
+- An argument compared with a position or `NOW()` only, as in `POS_X > $1`, has no column to take its type from; compare a column instead, or write the value into the condition.
+- A false or NULL condition writes nothing and returns server code `CONDITION_FAILED`, with the chunk's version in `Metadata.Current`.
+- A computed value outside its column returns `OUT_OF_RANGE`; `If` excludes `IfVersion`.
+- `DeleteBlock`, the 3D writes and `Tx` block writes take `If` and `WithArgs` too; a transaction refuses `IfVersion`.
+- `Expr` is taken only as a `SetBlock` value; chunk forms, chunk columns and arguments refuse it.
+
 ## Chunks and areas
 
 <!-- go-example: ExampleClient_GetChunk -->
@@ -112,6 +149,7 @@ fmt.Println("blocks:", count)
 - A value is `nil` when no block has one, `int64`, `*big.Int` for integers outside the int64 range, or `float64`.
 - `AggregateByChunk` returns one `AggregateRow` per chunk with a present block, in coordinate order; `CZ` is zero for 2D tables.
 - A selector covers at most `max_area_chunks` chunk cells; split larger areas and combine COUNT, SUM, MIN and MAX in your code.
+- `AggregateWhere` and `AggregateByChunkWhere` count only the present blocks for which a `Condition` is true, such as `chunkdb.Where("tile > $1", chunkdb.Arg{Column: "tile", Value: 2})`; a chunk without a matching block has no row.
 
 ## Three-dimensional tables
 
@@ -177,6 +215,8 @@ History below RetainedDeletionFloor returns RESYNC_REQUIRED with reason=history_
 WithData supplies decoded forms, and Deleted distinguishes a tombstone from a live form.
 Deleted is nil without WithData, because version-only entries do not report whether they were deleted.
 Columns requires WithData and preserves complete chunk metadata.
+Where keeps only matching blocks: a page can hold fewer chunks than Limit, or none, so continue after the page's After while More is true.
+With Since, Where needs WithData, and a changed chunk without a matching block reports Deleted.
 Ordinary scans omit tombstones, while GET CHUNK still returns their retained empty form and version.
 The client refreshes schemas after its own table changes and when a typed write detects stale column sizes.
 `SetChunk` re-encodes once after a schema mismatch; `SetChunkRaw` returns `SchemaMismatchError`.

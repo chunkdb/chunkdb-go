@@ -257,6 +257,9 @@ func normalize(column string, t ColumnType, v any) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
+	if _, ok := v.(Expr); ok {
+		return nil, requestErrorf("", "column %s: a computed value (Expr) is taken only by SetBlock values", column)
+	}
 	fail := func(format string, args ...any) (any, error) {
 		return nil, valueError(column, t, format, args...)
 	}

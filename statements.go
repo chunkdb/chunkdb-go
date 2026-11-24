@@ -109,6 +109,9 @@ func (c *Client) tableName(command, table string) (string, error) {
 
 func writeClause(command string, opts []WriteOption, chunk bool) (string, error) {
 	options := resolveWriteOptions(opts)
+	if chunk && (options.condition != nil || len(options.args) > 0) {
+		return "", requestErrorf(command, "an IF condition and parameters need a block write")
+	}
 	if options.ifAbsent {
 		if !chunk || options.ifVersion != nil {
 			return "", requestErrorf(command, "IF ABSENT needs a chunk write without IF VERSION")
@@ -398,7 +401,7 @@ func getBlockWithOptions(ctx context.Context, s session, table string, x, y int6
 // answer BAD_REQUEST and close the connection; that write fails, and the next
 // statement uses a fresh schema.
 func (c *Client) SetBlock(ctx context.Context, table string, x, y int64, values Record, opts ...WriteOption) (uint64, error) {
-	clause, err := writeClause("SET BLOCK", opts, false)
+	clause, err := blockWriteClause("SET BLOCK", opts)
 	if err != nil {
 		return 0, err
 	}
@@ -411,7 +414,7 @@ func (c *Client) SetBlock(ctx context.Context, table string, x, y int64, values 
 
 // setBlock sends SET BLOCK with the clause after the assignments, and returns
 // its reply.
-func setBlock(ctx context.Context, s session, table string, x, y int64, values Record, clause string, z ...int64) (Reply, error) {
+func setBlock(ctx context.Context, s session, table string, x, y int64, values Record, clause blockClause, z ...int64) (Reply, error) {
 	const command = "SET BLOCK"
 	name, err := s.tableName(command, table)
 	if err != nil {
@@ -427,11 +430,24 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
 		var statement strings.Builder
 		statement.WriteString("SET BLOCK " + coordinatePoint(x, y, z...) + " IN " + name + " ")
-		params := make([][]byte, 0, len(names))
+		params, err := encodeArgs(command, schema, clause.args)
+		if err != nil {
+			return Reply{}, err
+		}
 		for i, columnName := range names {
 			column, ok := schema.Column(columnName)
 			if !ok {
 				return Reply{}, &staleSchemaError{err: requestErrorf(command, "table %s has no column %s; Describe lists its columns", name, columnName), local: true}
+			}
+			if i > 0 {
+				statement.WriteString(", ")
+			}
+			if expr, ok := values[columnName].(Expr); ok {
+				if strings.TrimSpace(string(expr)) == "" {
+					return Reply{}, requestErrorf(command, "the computed value of column %s is empty", columnName)
+				}
+				statement.WriteString(columnName + " = " + string(expr))
+				continue
 			}
 			value, err := normalize(columnName, column.Type, values[columnName])
 			if err != nil {
@@ -445,12 +461,9 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 				param = encodeNormalized(value)
 			}
 			params = append(params, param)
-			if i > 0 {
-				statement.WriteString(", ")
-			}
-			statement.WriteString(columnName + " = $" + strconv.Itoa(i+1))
+			statement.WriteString(columnName + " = $" + strconv.Itoa(len(params)))
 		}
-		statement.WriteString(clause)
+		statement.WriteString(clause.text)
 		reply, err := s.call(ctx, statement.String(), params)
 		if err != nil {
 			if isWrongSize(err) || isNoColumn(err) {
@@ -472,7 +485,7 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 // DeleteBlock deletes block (x, y) of table ("" is the default table) and
 // returns the chunk's version after it.
 func (c *Client) DeleteBlock(ctx context.Context, table string, x, y int64, opts ...WriteOption) (uint64, error) {
-	clause, err := writeClause("DELETE BLOCK", opts, false)
+	clause, err := blockWriteClause("DELETE BLOCK", opts)
 	if err != nil {
 		return 0, err
 	}
@@ -483,12 +496,28 @@ func (c *Client) DeleteBlock(ctx context.Context, table string, x, y int64, opts
 	return versionOf(reply, "DELETE BLOCK")
 }
 
-func deleteBlock(ctx context.Context, s session, table string, x, y int64, clause string, z ...int64) (Reply, error) {
-	name, err := s.tableName("DELETE BLOCK", table)
+func deleteBlock(ctx context.Context, s session, table string, x, y int64, clause blockClause, z ...int64) (Reply, error) {
+	const command = "DELETE BLOCK"
+	name, err := s.tableName(command, table)
 	if err != nil {
 		return Reply{}, err
 	}
-	return s.call(ctx, "DELETE BLOCK "+coordinatePoint(x, y, z...)+" FROM "+name+clause, nil)
+	statement := "DELETE BLOCK " + coordinatePoint(x, y, z...) + " FROM " + name + clause.text
+	if len(clause.args) == 0 {
+		return s.call(ctx, statement, nil)
+	}
+	reply, err := withSchema(ctx, s, name, func(schema *Schema) (Reply, error) {
+		params, err := encodeArgs(command, schema, clause.args)
+		if err != nil {
+			return Reply{}, err
+		}
+		reply, err := s.call(ctx, statement, params)
+		if isWrongSize(err) || isNoColumn(err) {
+			return Reply{}, &staleSchemaError{err: err}
+		}
+		return reply, err
+	})
+	return reply, annotate(command, err)
 }
 
 // GetChunk reads chunk (cx, cy) of table ("" is the default table), decoded

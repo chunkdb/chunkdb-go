@@ -141,6 +141,8 @@ type WriteOption func(*writeOptions)
 type writeOptions struct {
 	ifVersion *uint64
 	ifAbsent  bool
+	condition *string
+	args      []Arg
 }
 
 // IfVersion makes a write conditional: it applies only while the chunk is

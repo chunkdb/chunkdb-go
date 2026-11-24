@@ -9,6 +9,8 @@ uses protocol 3 (CQL); see the engine's
 ## Unreleased
 
 ### Added
+- `If` and `WithArgs` write options and `Expr` values run SET BLOCK and DELETE BLOCK with an IF condition and computed values, on the client, the pool and in transactions; a false condition returns `CONDITION_FAILED` (chunkdb/chunkdb#151).
+- `AggregateWhere`, `AggregateByChunkWhere` and `ScanOptions.Where` filter AGGREGATE and SCAN CHUNKS with a `Condition` and typed `$n` parameters; filtered scan pages report `After` (chunkdb/chunkdb#151).
 - `Aggregate` and `AggregateByChunk` run AGGREGATE over a `ChunkSelector` (chunk, area or ball, 2D or 3D) with `CountAll`, `SumOf`, `MinOf`, `MaxOf` and `AvgOf`; integers outside the int64 range decode as `*big.Int` (chunkdb/chunkdb#151).
 - `WatchOptions.Areas` and `WatchOptions.Areas3D` watch several areas in one WATCH (chunkdb/chunkdb#151).
 - `TableStats`, `CompactTombstones`, `SwapTables`, `RecoverTable`, `Migrations`, `Backup`, `RestoreTable` and `ReloadTLS` run SHOW TABLE STATS, COMPACT TOMBSTONES, SWAP TABLES, RECOVER TABLE, SHOW MIGRATIONS, BACKUP TO, RESTORE TABLE and RELOAD TLS with typed replies (chunkdb/chunkdb#151).

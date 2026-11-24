@@ -329,18 +329,19 @@ func ExampleClient_FlushWAL() {
 }
 
 var documentationExamples = map[string]func(){
-	"ExampleClient_SetBlock":    ExampleClient_SetBlock,
-	"ExampleClient_GetChunk":    ExampleClient_GetChunk,
-	"ExampleClient_Transaction": ExampleClient_Transaction,
-	"ExampleClient_Watch":       ExampleClient_Watch,
-	"ExampleClient_CreateSlot":  ExampleClient_CreateSlot,
-	"ExampleConnect":            ExampleConnect,
-	"ExampleConnectPool":        ExampleConnectPool,
-	"ExampleClient_CreateUser":  ExampleClient_CreateUser,
-	"ExampleParseBits":          ExampleParseBits,
-	"ExampleClient_Migrate":     ExampleClient_Migrate,
-	"ExampleClient_Do_backup":   ExampleClient_Do_backup,
-	"ExampleClient_FlushWAL":    ExampleClient_FlushWAL,
+	"ExampleClient_SetBlock":           ExampleClient_SetBlock,
+	"ExampleClient_SetBlock_condition": ExampleClient_SetBlock_condition,
+	"ExampleClient_GetChunk":           ExampleClient_GetChunk,
+	"ExampleClient_Transaction":        ExampleClient_Transaction,
+	"ExampleClient_Watch":              ExampleClient_Watch,
+	"ExampleClient_CreateSlot":         ExampleClient_CreateSlot,
+	"ExampleConnect":                   ExampleConnect,
+	"ExampleConnectPool":               ExampleConnectPool,
+	"ExampleClient_CreateUser":         ExampleClient_CreateUser,
+	"ExampleParseBits":                 ExampleParseBits,
+	"ExampleClient_Migrate":            ExampleClient_Migrate,
+	"ExampleClient_Do_backup":          ExampleClient_Do_backup,
+	"ExampleClient_FlushWAL":           ExampleClient_FlushWAL,
 }
 
 func TestDocumentationExampleProcess(t *testing.T) {
@@ -353,4 +354,28 @@ func TestDocumentationExampleProcess(t *testing.T) {
 		t.Fatal(fmt.Sprintf("unknown documentation example %q", name))
 	}
 	example()
+}
+
+// ExampleClient_SetBlock_condition is checked against docs/DATA.md by the integration runner.
+func ExampleClient_SetBlock_condition() {
+	ctx, client, close := documentationClient()
+	defer close()
+	// docs:begin ExampleClient_SetBlock_condition
+	if _, err := client.SetBlock(ctx, "world_go", 9, 9, chunkdb.Record{"tile": 9}); err != nil {
+		log.Fatal(err)
+	}
+	for range 2 {
+		_, err := client.SetBlock(ctx, "world_go", 9, 9,
+			chunkdb.Record{"tile": chunkdb.Expr("tile + $1")},
+			chunkdb.If("tile < $2"),
+			chunkdb.WithArgs(chunkdb.Arg{Column: "tile", Value: 1}, chunkdb.Arg{Column: "tile", Value: 10}))
+		if chunkdb.IsCode(err, chunkdb.CodeConditionFailed) {
+			fmt.Println("tile is already at the limit")
+		} else if err != nil {
+			log.Fatal(err)
+		} else {
+			fmt.Println("tile raised")
+		}
+	}
+	// docs:end ExampleClient_SetBlock_condition
 }

@@ -122,9 +122,9 @@ type AggregateRow struct {
 	Values     []any
 }
 
-func aggregateStatement(table string, selector ChunkSelector, functions []AggregateFunction, byChunk bool) (string, error) {
+func aggregateStatement(table string, selector ChunkSelector, functions []AggregateFunction, where *Condition, byChunk bool) (string, error) {
 	const command = "AGGREGATE"
-	where, err := selector.clause(command)
+	selectorText, err := selector.clause(command)
 	if err != nil {
 		return "", err
 	}
@@ -148,7 +148,11 @@ func aggregateStatement(table string, selector ChunkSelector, functions []Aggreg
 			return "", requestErrorf(command, "unknown function %q", f.Op)
 		}
 	}
-	statement := command + " " + where + " FROM " + table + " " + strings.Join(parts, ", ")
+	filter, err := conditionText(command, where)
+	if err != nil {
+		return "", err
+	}
+	statement := command + " " + selectorText + " FROM " + table + " " + strings.Join(parts, ", ") + filter
 	if byChunk {
 		statement += " BY CHUNK"
 	}
@@ -236,15 +240,13 @@ func (s ChunkSelector) dims() int {
 // Aggregate counts and summarizes the present blocks of the selected chunks
 // with AGGREGATE. Each function appears at most once; it requires READ.
 func (c *Client) Aggregate(ctx context.Context, table string, selector ChunkSelector, functions ...AggregateFunction) (AggregateResult, error) {
-	name, err := c.tableName("AGGREGATE", table)
-	if err != nil {
-		return AggregateResult{}, err
-	}
-	statement, err := aggregateStatement(name, selector, functions, false)
-	if err != nil {
-		return AggregateResult{}, err
-	}
-	reply, err := c.call(ctx, statement, nil)
+	return c.AggregateWhere(ctx, table, selector, nil, functions...)
+}
+
+// AggregateWhere is [Client.Aggregate] over only the present blocks for which
+// where is true; nil aggregates every present block.
+func (c *Client) AggregateWhere(ctx context.Context, table string, selector ChunkSelector, where *Condition, functions ...AggregateFunction) (AggregateResult, error) {
+	reply, err := aggregate(ctx, c, table, selector, functions, where, false)
 	if err != nil {
 		return AggregateResult{}, err
 	}
@@ -254,19 +256,59 @@ func (c *Client) Aggregate(ctx context.Context, table string, selector ChunkSele
 // AggregateByChunk runs AGGREGATE ... BY CHUNK: one row for each selected
 // chunk with a present block, in coordinate order.
 func (c *Client) AggregateByChunk(ctx context.Context, table string, selector ChunkSelector, functions ...AggregateFunction) ([]AggregateRow, error) {
-	name, err := c.tableName("AGGREGATE", table)
-	if err != nil {
-		return nil, err
-	}
-	statement, err := aggregateStatement(name, selector, functions, true)
-	if err != nil {
-		return nil, err
-	}
-	reply, err := c.call(ctx, statement, nil)
+	return c.AggregateByChunkWhere(ctx, table, selector, nil, functions...)
+}
+
+// AggregateByChunkWhere is [Client.AggregateByChunk] over only the present
+// blocks for which where is true: a chunk without a matching block has no row.
+func (c *Client) AggregateByChunkWhere(ctx context.Context, table string, selector ChunkSelector, where *Condition, functions ...AggregateFunction) ([]AggregateRow, error) {
+	reply, err := aggregate(ctx, c, table, selector, functions, where, true)
 	if err != nil {
 		return nil, err
 	}
 	return parseAggregateRows(reply, selector.dims(), len(functions))
+}
+
+func aggregate(ctx context.Context, c *Client, table string, selector ChunkSelector, functions []AggregateFunction, where *Condition, byChunk bool) (Reply, error) {
+	const command = "AGGREGATE"
+	name, err := c.tableName(command, table)
+	if err != nil {
+		return Reply{}, err
+	}
+	statement, err := aggregateStatement(name, selector, functions, where, byChunk)
+	if err != nil {
+		return Reply{}, err
+	}
+	args := conditionArgs(where)
+	if len(args) == 0 {
+		return c.call(ctx, statement, nil)
+	}
+	reply, err := withSchema(ctx, c, name, func(schema *Schema) (Reply, error) {
+		params, err := encodeArgs(command, schema, args)
+		if err != nil {
+			return Reply{}, err
+		}
+		reply, err := c.call(ctx, statement, params)
+		if isWrongSize(err) || isNoColumn(err) {
+			return Reply{}, &staleSchemaError{err: err}
+		}
+		return reply, err
+	})
+	return reply, annotate(command, err)
+}
+
+// AggregateWhere runs [Client.AggregateWhere] on a leased client.
+func (p *Pool) AggregateWhere(ctx context.Context, table string, selector ChunkSelector, where *Condition, functions ...AggregateFunction) (AggregateResult, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) (AggregateResult, error) {
+		return c.AggregateWhere(ctx, table, selector, where, functions...)
+	})
+}
+
+// AggregateByChunkWhere runs [Client.AggregateByChunkWhere] on a leased client.
+func (p *Pool) AggregateByChunkWhere(ctx context.Context, table string, selector ChunkSelector, where *Condition, functions ...AggregateFunction) ([]AggregateRow, error) {
+	return withPooledTableClient(ctx, p, table, func(ctx context.Context, c *Client) ([]AggregateRow, error) {
+		return c.AggregateByChunkWhere(ctx, table, selector, where, functions...)
+	})
 }
 
 // Aggregate runs [Client.Aggregate] on a leased client.

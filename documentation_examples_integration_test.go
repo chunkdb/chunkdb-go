@@ -13,18 +13,19 @@ import (
 )
 
 var documentationExampleNames = map[string]bool{
-	"ExampleClient_SetBlock":    true,
-	"ExampleClient_GetChunk":    true,
-	"ExampleClient_Transaction": true,
-	"ExampleClient_Watch":       true,
-	"ExampleClient_CreateSlot":  true,
-	"ExampleConnect":            true,
-	"ExampleConnectPool":        true,
-	"ExampleClient_CreateUser":  true,
-	"ExampleParseBits":          true,
-	"ExampleClient_Migrate":     true,
-	"ExampleClient_Do_backup":   true,
-	"ExampleClient_FlushWAL":    true,
+	"ExampleClient_SetBlock":           true,
+	"ExampleClient_SetBlock_condition": true,
+	"ExampleClient_GetChunk":           true,
+	"ExampleClient_Transaction":        true,
+	"ExampleClient_Watch":              true,
+	"ExampleClient_CreateSlot":         true,
+	"ExampleConnect":                   true,
+	"ExampleConnectPool":               true,
+	"ExampleClient_CreateUser":         true,
+	"ExampleParseBits":                 true,
+	"ExampleClient_Migrate":            true,
+	"ExampleClient_Do_backup":          true,
+	"ExampleClient_FlushWAL":           true,
 }
 
 // Examples without Output comments compile under go test. This test executes
