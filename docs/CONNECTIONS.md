@@ -60,7 +60,8 @@ Use TLS over an untrusted network because authentication does not encrypt subseq
 Use `TLSInsecure` only for local testing.
 
 Over TLS the client binds each login to its connection: `Options.ChannelBinding` is `ChannelBindingAuto` by default, which uses `tls-exporter` on TLS 1.3 and `tls-server-end-point` on TLS 1.2.
-A bound login fails when something between the client and the server ends TLS, even when the client trusts that party's certificate: the error matches `ErrAuth`, with `CodeAuthFailed` and `Metadata.Reason` `channel_binding`.
+A bound login fails when something between the client and the server ends TLS, even when the client trusts that party's certificate.
+A proxy that opens its own TLS connection to the server gets an error that matches `ErrAuth`, with `CodeAuthFailed` and `Metadata.Reason` `channel_binding`; a proxy that forwards plain TCP to the server gets `CodeInvalidArgument`.
 Set `ChannelBindingOff` when TLS ends at a load balancer or proxy in front of the server.
 Set `ChannelBindingRequire` to refuse, before connecting, a client without TLS or without a user.
 On TLS 1.2 a server certificate signed with Ed25519 cannot be bound and the client fails with `ErrTLS`; use TLS 1.3 or turn channel binding off.

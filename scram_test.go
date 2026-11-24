@@ -55,6 +55,8 @@ func TestScramRejectsBadServerFirst(t *testing.T) {
 		"empty salt":       "r=rOprNGfwEbeRWgbNEkqOabc,s=,i=4096",
 		"bad iterations":   "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=x",
 		"too few rounds":   "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4095",
+		"too many rounds":  "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001",
+		"huge rounds":      "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4294967296",
 		"negative rounds":  "r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=-4096",
 		"mandatory extras": "m=ext,r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
 	} {

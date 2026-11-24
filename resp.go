@@ -225,6 +225,11 @@ func readReplyAtLimited(r *bufio.Reader, depth int, budget *replyBudget, shape r
 		return Reply{Kind: ReplySimple, Text: line}, nil
 
 	case '-':
+		// An error answers a whole statement; inside an array or map it is
+		// not data.
+		if depth != 0 {
+			return Reply{}, protocolErrorf("", "error inside an aggregate reply: %q", line)
+		}
 		code, message := splitErrorLine(line)
 		keys, message := parseErrorKeys(message)
 		return Reply{Kind: ReplyError, Code: code, Message: message, Keys: keys}, nil

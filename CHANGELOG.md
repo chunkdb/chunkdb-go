@@ -19,6 +19,8 @@ uses protocol 3 (CQL); see the engine's
 - `SlotOptions.Owner` creates a slot for a named user with `CREATE SLOT ... OWNER`, and `Slot.Owner` reports the owner from SHOW SLOTS when the server shows it.
 
 ### Changed
+- A login refuses a SCRAM server-first message whose iteration count is outside 4096 to 1000000, the range a chunkdb server issues, with `ErrProtocol`. (#40)
+- An error reply nested inside an array or map is refused with `ErrProtocol` instead of being returned as data. (#40)
 - A user without a password returns `ErrConnection` before dialing, with the URI form to use, instead of failing at the server with `AUTH_FAILED`.
 - URI errors name the expected form `chunk://user:password@host:4242/` and the `chunk://` and `chunks://` schemes, and an unknown column points to `Describe`.
 - `CreateUser` and `SetPassword` refuse an empty password with `ErrProtocol` before sending a request, since a user without a password cannot log in.
@@ -26,6 +28,7 @@ uses protocol 3 (CQL); see the engine's
 - An out-of-range integer or `f32` value error names the range of the column type.
 
 ### Documentation
+- CONNECTIONS.md: a TLS proxy that opens its own TLS connection to the server gets `AUTH_FAILED` with reason `channel_binding`, and one that forwards plain TCP gets `INVALID_ARGUMENT`. (#40)
 - The README runs the world example with `go run github.com/chunkdb/chunkdb-go/v2/examples/world@latest`, without a clone, and shows its `Migrate` call.
 - A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.
 - Shorten user guides and check their Go examples against a real server.
