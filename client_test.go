@@ -1130,18 +1130,20 @@ func TestClientInFlightRequestsFailWhenConnectionDrops(t *testing.T) {
 	}
 }
 
+// BAD_REQUEST is a closing reply by its code alone, so the client drops the
+// connection before returning it, whether or not it has seen the EOF yet.
 func TestClientReconnectsAfterAClosingErrorReply(t *testing.T) {
 	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, statement string) {
 		if commandOf(statement) == "SET BLOCK" {
-			writeServerError(conn, "ERR INVALID_ARGUMENT the table has no column nope")
+			writeServerError(conn, "ERR BAD_REQUEST reason=bad_request request line too long")
 			_ = conn.Close()
 			return
 		}
 		genericHandler(s, conn, statement)
 	}))
 	client := newTestClient(t, server, nil)
-	if _, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world nope = $1", []byte{1}); !IsCode(err, CodeInvalidArgument) {
-		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
+	if _, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world nope = $1", []byte{1}); !IsCode(err, CodeBadRequest) {
+		t.Fatalf("got %v, want BAD_REQUEST", err)
 	}
 	if err := client.Ping(t.Context()); err != nil {
 		t.Fatalf("Ping after closing error: %v", err)
