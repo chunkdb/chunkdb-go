@@ -14,6 +14,15 @@ type ConnectionInfo struct {
 	Peer      string
 	State     string
 	Statement *string
+	// Progress reports the copy of a running RESTORE TABLE; nil for any other
+	// statement, while the restore checks the backup, and from servers that do
+	// not report it.
+	Progress *RestoreProgress
+}
+
+// RestoreProgress counts the files and bytes a running RESTORE TABLE copied.
+type RestoreProgress struct {
+	FilesDone, FilesTotal, BytesDone, BytesTotal uint64
 }
 
 // ShowConnections lists connections owned by the current user incarnation.
@@ -66,6 +75,20 @@ func parseConnections(reply Reply) ([]ConnectionInfo, error) {
 				return nil, bad()
 			}
 			*field.target = string(value.Bulk)
+		}
+		if progress, exists := item.Lookup("progress"); exists && progress.Kind != ReplyNull {
+			if progress.Kind != ReplyMap {
+				return nil, bad()
+			}
+			connection.Progress = &RestoreProgress{}
+			for key, target := range map[string]*uint64{"files_done": &connection.Progress.FilesDone, "files_total": &connection.Progress.FilesTotal, "bytes_done": &connection.Progress.BytesDone, "bytes_total": &connection.Progress.BytesTotal} {
+				value, exists := progress.Lookup(key)
+				n, ok := value.Uint64()
+				if !exists || !ok {
+					return nil, bad()
+				}
+				*target = n
+			}
 		}
 		connections = append(connections, connection)
 	}
