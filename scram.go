@@ -16,6 +16,10 @@ import (
 // server accepts.
 const DefaultVerifierIterations = 4096
 
+// maxServerIterations is the most PBKDF2 iterations a chunkdb server issues
+// in a login.
+const maxServerIterations = 1000000
+
 const (
 	// verifierSaltBytes is the size of the random salt of a new verifier.
 	verifierSaltBytes = 16
@@ -134,8 +138,10 @@ func (s scramLogin) clientFinal(password, serverFirst string) (message, serverSi
 	if err != nil || iterations <= 0 {
 		return "", "", malformed("the iteration count is not a positive integer")
 	}
-	if iterations < DefaultVerifierIterations {
-		return "", "", malformed(fmt.Sprintf("%d iterations, fewer than the %d SCRAM-SHA-256 needs", iterations, DefaultVerifierIterations))
+	// A chunkdb server issues counts in this range; a larger one would hold
+	// the login in PBKDF2, which no context or deadline interrupts.
+	if iterations < DefaultVerifierIterations || iterations > maxServerIterations {
+		return "", "", malformed(fmt.Sprintf("%d iterations; a chunkdb server issues %d to %d", iterations, DefaultVerifierIterations, maxServerIterations))
 	}
 
 	keys, err := deriveScramKeys(password, salt, iterations)

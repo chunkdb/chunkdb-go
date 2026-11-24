@@ -163,6 +163,9 @@ func TestReadReplyRejectsBadInput(t *testing.T) {
 		"bad boolean":      "#x\r\n",
 		"bad null":         "_x\r\n",
 		"deep nesting":     strings.Repeat("*1\r\n", maxReplyDepth+2) + ":1\r\n",
+		"nested error":     "*2\r\n:1\r\n-ERR INTERNAL boom\r\n",
+		"error map value":  "%1\r\n+k\r\n-ERR INTERNAL boom\r\n",
+		"error in push":    ">2\r\n+change\r\n-ERR INTERNAL boom\r\n",
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
