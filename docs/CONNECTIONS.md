@@ -103,6 +103,7 @@ Idle connections do not reserve server workers.
 | `ErrServer`, `ErrClosed` | Server rejection or a closed client. |
 
 Use `errors.Is` for classification and `errors.As` for typed details.
+`IsCode(err, code)` tests a server code, such as `CodeNoTable`; every server code has a `Code...` constant and a retry class.
 `Error` carries Phase, Command, ServerCode, and ServerMessage; specialized errors add structured fields.
 `MigrationError` wraps the failed step's cause.
 Common first-run errors end with a next step: the URI form, `chunk://` versus `chunks://`, `Describe` for an unknown column, or the range of a column type.

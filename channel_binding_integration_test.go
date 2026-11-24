@@ -95,7 +95,7 @@ func TestIntegrationChannelBinding(t *testing.T) {
 			t.Fatalf("bound login on TLS 1.2: %v", err)
 		}
 		_, err := Connect(ctx, as("bound", "bound-password", ChannelBindingOff))
-		if !errors.Is(err, ErrAuth) || !isServerCode(err, CodeAuthFailed) {
+		if !errors.Is(err, ErrAuth) || !IsCode(err, CodeAuthFailed) {
 			t.Fatalf("got %v, want AUTH_FAILED for an unbound login", err)
 		}
 

@@ -133,7 +133,7 @@ func setChunkMetadata(ctx context.Context, s session, table string, x, y int64, 
 		if isWrongSize(err) || isNoColumn(err) || errors.Is(err, ErrSchemaMismatch) {
 			return Reply{}, &staleSchemaError{err: err}
 		}
-		if isServerCode(err, CodeBadRequest) {
+		if IsCode(err, CodeBadRequest) {
 			s.forgetSchema(name)
 		}
 		return reply, err
