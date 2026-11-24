@@ -20,18 +20,24 @@ type SlotOptions struct {
 	Owner string
 }
 
-func feedFilterClause(command string, area *Area, area3D *Area3D, columns []string, noBefore, chunks bool) (string, error) {
+func feedFilterClause(command string, areas []Area, areas3D []Area3D, columns []string, noBefore, chunks bool) (string, error) {
 	clause := ""
-	if area != nil && area3D != nil {
+	if len(areas) > 0 && len(areas3D) > 0 {
 		return "", requestErrorf(command, "AREA needs either two or three dimensions")
 	}
-	if area3D != nil {
+	for _, area3D := range areas3D {
+		if len(clause) > 0 {
+			clause += ","
+		}
 		if area3D.CX0 > area3D.CX1 || area3D.CY0 > area3D.CY1 || area3D.CZ0 > area3D.CZ1 {
 			return "", requestErrorf(command, "inverted area")
 		}
 		clause += " AREA " + areaRange3D(area3D.CX0, area3D.CY0, area3D.CZ0, area3D.CX1, area3D.CY1, area3D.CZ1)
 	}
-	if area != nil {
+	for _, area := range areas {
+		if len(clause) > 0 {
+			clause += ","
+		}
 		if area.CX0 > area.CX1 || area.CY0 > area.CY1 {
 			return "", requestErrorf(command, "inverted area")
 		}
@@ -75,7 +81,7 @@ func (c *Client) CreateSlotWithOptions(ctx context.Context, table, name string, 
 	if err != nil {
 		return err
 	}
-	filters, err := feedFilterClause(command, opts.Area, opts.Area3D, opts.Columns, opts.NoBefore, opts.Chunks)
+	filters, err := feedFilterClause(command, optionalArea(opts.Area), optionalArea(opts.Area3D), opts.Columns, opts.NoBefore, opts.Chunks)
 	if err != nil {
 		return err
 	}
@@ -100,4 +106,11 @@ func (c *Client) CreateSlotWithOptions(ctx context.Context, table, name string, 
 // CreateSlotWithOptions runs Client.CreateSlotWithOptions on a leased client.
 func (p *Pool) CreateSlotWithOptions(ctx context.Context, table, name string, opts SlotOptions) error {
 	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.CreateSlotWithOptions(ctx, table, name, opts) })
+}
+
+func optionalArea[T any](area *T) []T {
+	if area == nil {
+		return nil
+	}
+	return []T{*area}
 }

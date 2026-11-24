@@ -29,7 +29,13 @@ type WatchOptions struct {
 	Area *Area
 	// Area3D selects an explicit three-axis box and cannot be combined with Area.
 	Area3D *Area3D
-	After  *Position
+	// Areas selects up to 64 two-dimensional areas; a change inside any of
+	// them is delivered. It adds to Area. A slot watch accepts several
+	// areas only when each repeats the slot area.
+	Areas []Area
+	// Areas3D is the three-dimensional form of Areas and adds to Area3D.
+	Areas3D []Area3D
+	After   *Position
 	// Columns selects block columns in order; nil inherits slot filters.
 	Columns  []string
 	NoBefore bool
@@ -150,7 +156,7 @@ func (c *Client) Watch(ctx context.Context, table string, opts WatchOptions) (*W
 		}
 		statement += " SLOT '" + opts.Slot + "'"
 	}
-	filters, err := feedFilterClause("WATCH", opts.Area, opts.Area3D, opts.Columns, opts.NoBefore, opts.Chunks)
+	filters, err := feedFilterClause("WATCH", append(optionalArea(opts.Area), opts.Areas...), append(optionalArea(opts.Area3D), opts.Areas3D...), opts.Columns, opts.NoBefore, opts.Chunks)
 	if err != nil {
 		return nil, err
 	}

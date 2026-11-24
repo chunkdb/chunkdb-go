@@ -71,6 +71,18 @@ The reply describes each table's cut; different tables need not share one simult
 After connection failure, inspect the server-side result before assuming completion.
 See [Backup](https://github.com/chunkdb/chunkdb/blob/main/docs/BACKUP.md) for verification and restore.
 
+`Backup(ctx, destination)` runs BACKUP TO and returns `BackupResult` with counts and one `BackupCut` per table.
+`RestoreTable(ctx, backup, table, RestoreOptions{As: name})` restores a table under a new name and returns its epoch and parent position.
+Restore never replaces a table; `SwapTables(ctx, a, b)` then exchanges the two names atomically.
+
+## Table maintenance
+
+- `Migrations` lists applied migrations within your rights; `User` is empty without MANAGES USERS.
+- `TableStats` returns the epoch, completed revision (nil on a read-only server), dimensions, retained tombstones and retained-deletion floor.
+- `CompactTombstones(ctx, table, before)` forgets retained tombstones below revision `before` and returns the new floor; watches that resume below it receive `RESYNC_REQUIRED`.
+- `RecoverTable` returns a fenced table to service.
+- `ReloadTLS` makes new connections use the certificate and key files read again; open connections keep theirs.
+
 ## Durability and metrics
 
 <!-- go-example: ExampleClient_FlushWAL -->

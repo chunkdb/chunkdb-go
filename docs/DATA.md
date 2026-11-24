@@ -94,6 +94,25 @@ Typed area methods admit at most 4194304 combined block-column and chunk-metadat
 Select fewer columns or request smaller pages when this limit is exceeded.
 Use `Do` with a bounded GET AREA page to retain checked raw forms without dense typed decoding.
 
+## Aggregates
+
+```go
+selector := chunkdb.ChunkSelector{Area: &chunkdb.Area{CX0: 0, CY0: 0, CX1: 1, CY1: 1}}
+result, err := client.Aggregate(ctx, "world_go", selector, chunkdb.CountAll(), chunkdb.MaxOf("tile"))
+if err != nil {
+	log.Fatal(err)
+}
+count, _ := result.Value("count(*)")
+fmt.Println("blocks:", count)
+```
+
+- `Aggregate` runs AGGREGATE over one `ChunkSelector` field: `Chunk`, `Area`, `Around` or their 3D forms.
+- Functions are `CountAll()`, `SumOf`, `MinOf`, `MaxOf` and `AvgOf`; each appears at most once.
+- `AggregateResult.Values` follow the function order; `Value` looks a result up by its server name, such as `sum(height)`.
+- A value is `nil` when no block has one, `int64`, `*big.Int` for integers outside the int64 range, or `float64`.
+- `AggregateByChunk` returns one `AggregateRow` per chunk with a present block, in coordinate order; `CZ` is zero for 2D tables.
+- A selector covers at most `max_area_chunks` chunk cells; split larger areas and combine COUNT, SUM, MIN and MAX in your code.
+
 ## Three-dimensional tables
 
 Set `TableSpec.ChunkDepth` to a positive side length when creating a three-dimensional table.
