@@ -1,8 +1,4 @@
-	dropped := catalogEntryOf(t, watch, "table", "catalog_before")
-	if schema, err := dropped.TableSchema(); *dropped.Action != "drop" || schema != nil || err != nil {
-		t.Fatalf("%+v %+v %v", dropped, schema, err)	slotEntry := catalogEntryOf(t, watch, "slot", "consumer")
-	slot, err := slotEntry.SlotData()
-	if err != nil || *slotEntry.Action != "create" || *slotEntry.Table != "catalog_after" || slot.Filters == nil {package chunkdb
+package chunkdb
 
 import (
 	"context"
