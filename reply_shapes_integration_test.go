@@ -3,7 +3,8 @@ package chunkdb
 import "testing"
 
 // A downsampled 3D area read with a projection keeps the chunk columns and
-// numbers samples like blocks with each side divided by the factor.
+// numbers samples like blocks with each side divided by the factor. Area
+// pages always name their columns, so every form is projected.
 func TestIntegrationDownsampledThreeDimensionalArea(t *testing.T) {
 	server := startServer(t, serverConfig{})
 	client := connectIntegration(t, server, nil)
@@ -43,7 +44,7 @@ func TestIntegrationDownsampledThreeDimensionalArea(t *testing.T) {
 	if err != nil || len(first.Chunks) != 1 {
 		t.Fatalf("%+v %v", first, err)
 	}
-	if whole := first.Chunks[0].Chunk; whole.Width != 1 || whole.Depth != 1 || whole.Projected || whole.Block3D(0, 0, 0)["h"] != uint64(3) || whole.Block3D(0, 0, 0)["kind"] != uint64(1) {
+	if whole := first.Chunks[0].Chunk; whole.Width != 1 || whole.Depth != 1 || whole.Block3D(0, 0, 0)["h"] != uint64(3) || whole.Block3D(0, 0, 0)["kind"] != uint64(1) {
 		t.Fatalf("%+v", whole)
 	}
 }
