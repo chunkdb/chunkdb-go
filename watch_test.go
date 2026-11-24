@@ -366,3 +366,64 @@ func TestWatchCloseCancelsSchemaHandshake(t *testing.T) {
 		t.Fatal("Close left Next blocked in HELLO")
 	}
 }
+
+// A push taken from the stream cannot be put back, so the caller's
+// cancellation during its schema lookup neither loses it nor ends the watch.
+func TestWatchNextCancellationDuringSchemaLookupKeepsTheStream(t *testing.T) {
+	col := []string{fakeColumn(1, "v", "i8", false, false, respNull)}
+	looking := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	var mu sync.Mutex
+	describes := 0
+	server := newFakeServer(t, withHello(func(_ *fakeServer, cn net.Conn, command string) {
+		switch verbOf(command) {
+		case "DESCRIBE":
+			mu.Lock()
+			describes++
+			n := describes
+			mu.Unlock()
+			if n == 2 {
+				close(looking)
+				<-release
+			}
+			writeRaw(cn, describeReply("world", int64(n), col))
+		case "WATCH":
+			writeRaw(cn, "+OK "+watchEpoch+" 10\r\n"+changePush(2, respNull, respArray(respInt(-4))))
+		case "UNWATCH":
+			writeSimple(cn, "OK")
+		}
+	}))
+	c := newTestClient(t, server, nil)
+	w, err := c.Watch(t.Context(), "world", WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	type next struct {
+		event Event
+		err   error
+	}
+	result := make(chan next, 1)
+	go func() {
+		event, err := w.Next(ctx)
+		result <- next{event, err}
+	}()
+	select {
+	case <-looking:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the schema lookup did not start")
+	}
+	cancel()
+	once.Do(func() { close(release) })
+	got := <-result
+	change, ok := got.event.(*ChangeEvent)
+	if got.err != nil || !ok || change.Blocks[0].After["v"] != int64(-4) {
+		t.Fatalf("got %v, %v; want the change", got.event, got.err)
+	}
+	if err := w.conn.terminalError(); err != nil {
+		t.Fatalf("the watch ended: %v", err)
+	}
+}

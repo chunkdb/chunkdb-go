@@ -133,7 +133,10 @@ func (w *Watch) eventSchema(ctx context.Context, epoch string, version uint64) (
 			return &Schema{Epoch: key.epoch, Version: version, Dims: 2, Columns: columns}, nil
 		}
 	}
-	schema, err := w.describe(ctx)
+	// The push is already taken from the stream, so the caller's cancellation
+	// must not end the lookup and with it the stream; the command timeout and
+	// Close still do.
+	schema, err := w.describe(context.WithoutCancel(ctx))
 	if err != nil {
 		return nil, err
 	}

@@ -909,7 +909,7 @@ func TestClientDropsTheConnectionWhenTheServerCloses(t *testing.T) {
 		{"bad request", "ERR BAD_REQUEST line too long", false, true},
 		{"no table with parameters", "ERR NO_TABLE table 'x' does not exist", true, true},
 		{"syntax with parameters", "ERR SYNTAX column 5: a parameter is $ followed by its number", true, true},
-		{"unknown column with parameters", "ERR INVALID_ARGUMENT the table has no column x", true, true},
+		{"invalid argument with parameters", "ERR INVALID_ARGUMENT the table has no column x", true, false},
 		{"no table without parameters", "ERR NO_TABLE table 'x' does not exist", false, false},
 		{"wrong size", "ERR INVALID_ARGUMENT $1 for column a (u8) must be 8 bytes, got 1", true, false},
 	}
@@ -1413,5 +1413,186 @@ func TestResolveTimeout(t *testing.T) {
 	}
 	if got := resolveTimeout(time.Second); got != time.Second {
 		t.Fatalf("got %v, want 1s", got)
+	}
+}
+
+func TestClientLostReplyIsAnUnknownOutcome(t *testing.T) {
+	server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, command string) {
+		switch commandOf(command) {
+		case "SET BLOCK":
+			_ = conn.Close()
+		case "PING":
+			// No reply: the command timeout ends the call.
+		default:
+			genericHandler(s, conn, command)
+		}
+	}))
+	client := newTestClient(t, server, func(o *Options) { o.CommandTimeout = 200 * time.Millisecond })
+	var typed *Error
+	_, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world id = 1")
+	if !errors.As(err, &typed) || typed.RetryClass != RetryUnknownOutcome || !errors.Is(err, ErrConnection) ||
+		typed.Command != "SET BLOCK" || !strings.Contains(err.Error(), "the outcome is unknown") {
+		t.Fatalf("lost connection: %v", err)
+	}
+	err = client.Ping(t.Context())
+	if !errors.As(err, &typed) || typed.RetryClass != RetryUnknownOutcome || !errors.Is(err, ErrTimeout) {
+		t.Fatalf("command timeout: %v", err)
+	}
+}
+
+func TestClientRequestsBehindAClosingReplyWereNotExecuted(t *testing.T) {
+	for _, reply := range []string{
+		"ERR AUTH_REQUIRED reason=user_dropped the user was dropped",
+		"ERR BUSY reason=input_budget input byte budget is full",
+		"ERR KILLED reason=killed the connection was killed",
+	} {
+		t.Run(reply, func(t *testing.T) {
+			var mu sync.Mutex
+			var pending net.Conn
+			received := make(chan struct{})
+			server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, statement string) {
+				switch commandOf(statement) {
+				case "HELLO":
+					writeRaw(conn, foundationHelloReply())
+				case "SET BLOCK":
+					// The reply waits until the PING behind it arrived.
+					mu.Lock()
+					pending = conn
+					mu.Unlock()
+					close(received)
+				case "PING":
+					mu.Lock()
+					if pending == conn {
+						// The server would close the connection now, but the
+						// client must not rely on that.
+						writeServerError(conn, reply)
+						pending = nil
+						mu.Unlock()
+						return
+					}
+					mu.Unlock()
+					writeSimple(conn, "PONG")
+				}
+			})
+			client := newTestClient(t, server, func(o *Options) { o.PipelineDepth = 2 })
+			set := make(chan error, 1)
+			go func() {
+				_, err := client.Do(t.Context(), "SET BLOCK 0 0 IN world id = 1")
+				set <- err
+			}()
+			<-received
+			err := client.Ping(t.Context())
+			var typed *Error
+			if !errors.As(err, &typed) || !errors.Is(err, ErrConnection) || !errors.Is(err, errNotExecuted) || typed.RetryClass != "" ||
+				!strings.Contains(err.Error(), "this request was not executed") {
+				t.Fatalf("PING behind the closing reply: %v", err)
+			}
+			if err := <-set; !errors.Is(err, ErrServer) {
+				t.Fatalf("SET BLOCK: %v", err)
+			}
+			// The next call uses a new connection.
+			if err := client.Ping(t.Context()); err != nil {
+				t.Fatalf("Ping: %v", err)
+			}
+			if got := server.acceptedConns(); got != 2 {
+				t.Fatalf("got %d connections, want 2", got)
+			}
+		})
+	}
+}
+
+func TestFoundationClosingReplies(t *testing.T) {
+	reply := func(code, reason string) Reply {
+		return Reply{Kind: ReplyError, Code: code, Keys: map[string]string{"reason": reason}}
+	}
+	big := maxBlockParameterBytes + 1
+	cases := []struct {
+		reply   Reply
+		command string
+		bytes   int
+		closes  bool
+	}{
+		{reply(CodeProtocol, "protocol"), "PING", 0, true},
+		{reply(CodeBadRequest, "bad_request"), "PING", 0, true},
+		{reply(CodeKilled, "killed"), "PING", 0, true},
+		{reply(CodeAuthRequired, "user_dropped"), "PING", 0, true},
+		{reply(CodeAuthRequired, "channel_binding"), "PING", 0, false},
+		{reply(CodeBusy, "input_budget"), "SET BLOCK", 0, true},
+		{reply(CodeBusy, "large_chunk_cache_full"), "SET BLOCK", 0, false},
+		{reply(CodeInvalidArgument, "invalid_argument"), "SET BLOCK", big, true},
+		{reply(CodeInvalidArgument, "invalid_argument"), "DELETE BLOCK", big, true},
+		{reply(CodeInvalidArgument, "invalid_argument"), "SET BLOCK", maxBlockParameterBytes, false},
+		{reply(CodeInvalidArgument, "invalid_argument"), "SET CHUNK", big, false},
+		{reply(CodeSyntax, "syntax"), "SET BLOCK", 1, false},
+	}
+	for _, tc := range cases {
+		if got := foundationCloses(tc.reply, tc.command, tc.bytes); got != tc.closes {
+			t.Errorf("%s %s to %s: got %v, want %v", tc.reply.Code, tc.reply.Keys["reason"], tc.command, got, tc.closes)
+		}
+	}
+}
+
+func TestUnknownOutcomeMarksOnlyLostRequestsThatMayApply(t *testing.T) {
+	lost := connectionErrorf("", nil, "connection closed: EOF")
+	marked, ok := unknownOutcome(lost, "SET BLOCK").(*Error)
+	if !ok || marked.RetryClass != RetryUnknownOutcome || marked.Command != "SET BLOCK" || lost.RetryClass != "" {
+		t.Fatalf("got %+v; the original is %+v", marked, lost)
+	}
+	for _, err := range []*Error{
+		connectionErrorf("SET BLOCK", errNotExecuted, "the server closed the connection"),
+		protocolErrorf("PING", "malformed reply"),
+		newError(KindServer, PhaseResponse, "PING", "busy", nil),
+	} {
+		if got := unknownOutcome(err, "PING"); got != error(err) {
+			t.Errorf("%v was marked: %v", err, got)
+		}
+	}
+	for command, want := range map[string]bool{"HELLO": false, "AUTH": false, "BEGIN": false, "ROLLBACK": false, "COMMIT": true, "SET BLOCK": true, "PING": true} {
+		if got := mayApply(command, false); got != want {
+			t.Errorf("%s outside a transaction: got %v", command, got)
+		}
+	}
+	if mayApply("SET BLOCK", true) || !mayApply("COMMIT", true) {
+		t.Error("inside a transaction only COMMIT may apply")
+	}
+}
+
+func TestClientDoesNotRerunWithAnUnchangedSchema(t *testing.T) {
+	var mu sync.Mutex
+	describes, sets := 0, 0
+	server := newFakeServer(t, withHello(func(_ *fakeServer, conn net.Conn, command string) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch commandOf(command) {
+		case "DESCRIBE":
+			describes++
+			writeRaw(conn, describeReply("world", 1, []string{
+				fakeColumn(1, "id", "u10", false, false, respNull),
+				fakeColumn(2, "h", "f32", false, false, respNull),
+			}))
+		case "SET BLOCK":
+			sets++
+			writeServerError(conn, "ERR INVALID_ARGUMENT reason=invalid_argument h is out of range")
+		}
+	}))
+	client := newTestClient(t, server, nil)
+	if _, err := client.SetBlock(t.Context(), "world", 0, 0, Record{"h": 1.5}); !IsCode(err, CodeInvalidArgument) {
+		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// The schema is fetched again, and the same version runs nothing again.
+	if describes != 2 || sets != 1 {
+		t.Fatalf("got %d DESCRIBE and %d SET BLOCK, want 2 and 1", describes, sets)
+	}
+}
+
+func TestClientHelloKeepsAKeyedProtocolError(t *testing.T) {
+	server := newFakeServer(t, func(_ *fakeServer, conn net.Conn, _ string) {
+		writeServerError(conn, "ERR PROTOCOL reason=protocol expected HELLO 2")
+	})
+	_, err := Connect(t.Context(), Options{URI: server.uri("")})
+	if !IsCode(err, CodeProtocol) || strings.Contains(err.Error(), "older chunkdb protocol") {
+		t.Fatalf("got %v, want the server's PROTOCOL error", err)
 	}
 }

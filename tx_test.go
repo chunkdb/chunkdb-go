@@ -605,3 +605,39 @@ func TestTransactionCommitNotSentDropsTheConnection(t *testing.T) {
 		t.Fatalf("got %q, want PING on a new connection", got)
 	}
 }
+
+func TestTransactionLostReplyIsUnknownOnlyForCommit(t *testing.T) {
+	for _, lost := range []string{"SET BLOCK", "COMMIT"} {
+		t.Run(lost, func(t *testing.T) {
+			server := newFakeServer(t, withHello(func(s *fakeServer, conn net.Conn, statement string) {
+				switch commandOf(statement) {
+				case lost:
+					_ = conn.Close()
+				case "BEGIN":
+					writeSimple(conn, "OK")
+				case "SET BLOCK":
+					writeRaw(conn, respNull)
+				default:
+					genericHandler(s, conn, statement)
+				}
+			}))
+			client := newTestClient(t, server, nil)
+			_, err := client.Transaction(t.Context(), func(tx *Tx) error {
+				_, err := tx.call(t.Context(), "SET BLOCK 0 0 IN world id = $1", [][]byte{{1}})
+				return err
+			})
+			var typed *Error
+			if !errors.As(err, &typed) || !errors.Is(err, ErrConnection) {
+				t.Fatalf("got %v, want ErrConnection", err)
+			}
+			// Before COMMIT the server rolls the transaction back.
+			want := RetryClass("")
+			if lost == "COMMIT" {
+				want = RetryUnknownOutcome
+			}
+			if typed.RetryClass != want {
+				t.Fatalf("got retry class %q, want %q: %v", typed.RetryClass, want, err)
+			}
+		})
+	}
+}

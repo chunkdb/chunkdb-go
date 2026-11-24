@@ -151,7 +151,7 @@ func getArea3D(ctx context.Context, s session, table, area string, withSchemaVer
 		var responseControl *areaResponseControl
 		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withSchemaVersion, response: &responseControl})
 		if err != nil {
-			if isNoColumn(err) {
+			if isStaleInvalidArgument(err) {
 				return AreaRead3D{}, &staleSchemaError{err: err}
 			}
 			return AreaRead3D{}, err
