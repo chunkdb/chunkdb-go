@@ -60,7 +60,7 @@ tile: 6
 - `ResyncEvent` requests rebuilding local state; ParentEpoch and ForkRevision identify available lineage.
 - `SchemaEvent` supplies Dims, Columns and ChunkColumns for its schema version.
 
-Use [Slots](SLOTS.md) to resume a durable consumer.
+Use [Slots](SLOTS.md) to resume a durable consumer, and [Catalog](CATALOG.md) to follow table, user and slot changes.
 
 Idle Next waits use the context without a command timeout; cancelling that wait keeps the watch open.
 A schema lookup for a received event runs to its end, bounded by CommandTimeout and Close, even when the context of Next ends, so the event is not lost.
@@ -75,17 +75,16 @@ See [Change feed](https://github.com/chunkdb/chunkdb/blob/main/docs/CHANGE_FEED.
 ProgressEvent reports a completed position when filters omit changes or while idle.
 It may arrive before a mutation or between schema and mutation events.
 Use one bounded context for the whole expected-event wait; handle resync explicitly.
-The example waits for its own write and leaves reserved catalog events as unexpected future input.
+The example waits for its own write.
 Persist that position before acknowledging it.
 Unknown push kinds are fully decoded and ignored without consuming an ordinary reply or advancing acknowledgements.
 Known event prefixes accept trailing extensions while validating their known fields.
 
 ChangeEvent exposes nullable Tag and Txn, plus ChunkChanges for chunk-column rows.
-ChunksEvent carries raw forms or nil deletion forms; CatalogEvent decodes the reserved catalog envelope.
-Decoding these envelopes does not advertise WATCH CATALOG or other unavailable features.
+ChunksEvent carries raw forms or nil deletion forms.
 Txn is a nullable exact uint64; empty tags remain distinct from nil tags.
 
 A fully written ChunksEvent returned by Next is ACK-eligible like a ChangeEvent.
 Queued events are not yet application-delivered and cannot raise the ACK ceiling.
 Change and chunks mutations start the oldest unacknowledged mutation deadline; progress never starts or refreshes it.
-Reserved catalog, schema, resync and unknown events never raise that ceiling.
+Schema, resync and unknown events never raise that ceiling.

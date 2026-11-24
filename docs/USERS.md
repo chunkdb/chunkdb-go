@@ -51,6 +51,7 @@ Use TLS over an untrusted network.
 | `SetManagesUsers`, `DropUser`, `Users` | Require MANAGES USERS. |
 | `SetPassword` | Changes your password; another user's requires MANAGES USERS. |
 | `RequiresChannelBinding`, `SetRequiresChannelBinding` | The user logs in only with a login bound to its TLS connection; an unbound login fails like a wrong password. |
+| `SetUserLimits` | Sets `MaxConnections` and `StatementsPerSec` (ALTER USER ... LIMIT); a nil field keeps its limit and zero disables it. Requires MANAGES USERS. |
 
 ## Rotate a password
 
@@ -77,6 +78,8 @@ if err := client.DropOldVerifier(ctx, "bot"); err != nil {
 
 `User.Verifiers` is 2 between `AddVerifier` and `DropOldVerifier`.
 `ComputeVerifier` picks a new salt, so its verifiers fit `SetPassword` but not `AddVerifier`.
+A client logged in as the user can call `client.RotatePassword(ctx, "new-password")` instead: it computes the verifier with the salt and iterations its login received, runs ADD VERIFIER, and logs in with the new password from then on.
+Run `DropOldVerifier` once every other client, pool and watch has moved.
 
 The last manager cannot be dropped or lose that capability.
 Already authenticated connections remain logged in after password changes.

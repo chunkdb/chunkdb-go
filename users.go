@@ -2,6 +2,7 @@ package chunkdb
 
 import (
 	"context"
+	"strconv"
 	"strings"
 )
 
@@ -131,6 +132,37 @@ func (c *Client) SetRequiresChannelBinding(ctx context.Context, name string, req
 	return c.userStatement(ctx, statement, nil)
 }
 
+// UserLimits are the limits of [Client.SetUserLimits]. A nil field keeps its
+// limit; zero disables it.
+type UserLimits struct {
+	// MaxConnections bounds the user's logged-in connections. Lowering it
+	// leaves open connections open and refuses new logins until fewer remain.
+	MaxConnections *uint64
+	// StatementsPerSec bounds the user's statements in a rolling second, at
+	// most 65536; a statement over it fails with RATE_LIMITED.
+	StatementsPerSec *uint64
+}
+
+// SetUserLimits sets the connection and statement limits of a user (ALTER
+// USER ... LIMIT). It needs MANAGES USERS and at least one limit.
+func (c *Client) SetUserLimits(ctx context.Context, name string, limits UserLimits) error {
+	const command = "ALTER USER"
+	if err := checkNames(command, "user", name); err != nil {
+		return err
+	}
+	var settings []string
+	if limits.MaxConnections != nil {
+		settings = append(settings, "max_connections = "+strconv.FormatUint(*limits.MaxConnections, 10))
+	}
+	if limits.StatementsPerSec != nil {
+		settings = append(settings, "statements_per_sec = "+strconv.FormatUint(*limits.StatementsPerSec, 10))
+	}
+	if len(settings) == 0 {
+		return requestErrorf(command, "LIMIT needs max_connections or statements_per_sec")
+	}
+	return c.userStatement(ctx, "ALTER USER "+name+" LIMIT "+strings.Join(settings, ", "), nil)
+}
+
 // DropUser drops a user. The last user who manages users cannot be dropped.
 func (c *Client) DropUser(ctx context.Context, name string) error {
 	if err := checkNames("DROP USER", "user", name); err != nil {
@@ -168,49 +200,58 @@ func (c *Client) Users(ctx context.Context) ([]User, error) {
 	}
 	users := make([]User, 0, len(reply.Array))
 	for _, item := range reply.Array {
-		if item.Kind != ReplyMap {
-			return nil, protocolErrorf(command, "expected a map per user, got a reply of kind %d", item.Kind)
-		}
-		name, _ := item.Lookup("name")
-		manages, _ := item.Lookup("manages_users")
-		grants, _ := item.Lookup("grants")
-		if name.Kind != ReplyBulk || manages.Kind != ReplyBoolean || grants.Kind != ReplyMap {
-			return nil, protocolErrorf(command, "a user needs name, manages_users and grants")
-		}
-		user := User{Name: string(name.Bulk), ManagesUsers: manages.Bool, Grants: make(map[string]Right, len(grants.Map))}
-		if requires, ok := item.Lookup("requires_channel_binding"); ok {
-			if requires.Kind != ReplyBoolean {
-				return nil, protocolErrorf(command, "requires_channel_binding of user %s is not a boolean", user.Name)
-			}
-			user.RequiresChannelBinding = requires.Bool
-		}
-		for _, grant := range grants.Map {
-			if grant.Key.Kind != ReplyBulk || grant.Value.Kind != ReplyBulk {
-				return nil, protocolErrorf(command, "the grants of user %s are not table names and rights", user.Name)
-			}
-			user.Grants[string(grant.Key.Bulk)] = Right(grant.Value.Bulk)
-		}
-		if rights, ok := item.Lookup("server_rights"); ok {
-			if rights.Kind != ReplyArray {
-				return nil, protocolErrorf(command, "server_rights of user %s is not a list", user.Name)
-			}
-			for _, right := range rights.Array {
-				if right.Kind != ReplyBulk {
-					return nil, protocolErrorf(command, "server_rights of user %s holds a non-text right", user.Name)
-				}
-				user.ServerRights = append(user.ServerRights, Right(right.Bulk))
-			}
-		}
-		if verifiers, ok := item.Lookup("verifiers"); ok {
-			n, valid := verifiers.Uint64()
-			if !valid || n < 1 || n > 2 {
-				return nil, protocolErrorf(command, "verifiers of user %s is not 1 or 2", user.Name)
-			}
-			user.Verifiers = int(n)
+		user, err := parseUser(command, item)
+		if err != nil {
+			return nil, err
 		}
 		users = append(users, user)
 	}
 	return users, nil
+}
+
+// parseUser decodes one SHOW USERS map, which catalog user entries also carry.
+func parseUser(command string, item Reply) (User, error) {
+	if item.Kind != ReplyMap {
+		return User{}, protocolErrorf(command, "expected a map per user, got a reply of kind %d", item.Kind)
+	}
+	name, _ := item.Lookup("name")
+	manages, _ := item.Lookup("manages_users")
+	grants, _ := item.Lookup("grants")
+	if name.Kind != ReplyBulk || manages.Kind != ReplyBoolean || grants.Kind != ReplyMap {
+		return User{}, protocolErrorf(command, "a user needs name, manages_users and grants")
+	}
+	user := User{Name: string(name.Bulk), ManagesUsers: manages.Bool, Grants: make(map[string]Right, len(grants.Map))}
+	if requires, ok := item.Lookup("requires_channel_binding"); ok {
+		if requires.Kind != ReplyBoolean {
+			return User{}, protocolErrorf(command, "requires_channel_binding of user %s is not a boolean", user.Name)
+		}
+		user.RequiresChannelBinding = requires.Bool
+	}
+	for _, grant := range grants.Map {
+		if grant.Key.Kind != ReplyBulk || grant.Value.Kind != ReplyBulk {
+			return User{}, protocolErrorf(command, "the grants of user %s are not table names and rights", user.Name)
+		}
+		user.Grants[string(grant.Key.Bulk)] = Right(grant.Value.Bulk)
+	}
+	if rights, ok := item.Lookup("server_rights"); ok {
+		if rights.Kind != ReplyArray {
+			return User{}, protocolErrorf(command, "server_rights of user %s is not a list", user.Name)
+		}
+		for _, right := range rights.Array {
+			if right.Kind != ReplyBulk {
+				return User{}, protocolErrorf(command, "server_rights of user %s holds a non-text right", user.Name)
+			}
+			user.ServerRights = append(user.ServerRights, Right(right.Bulk))
+		}
+	}
+	if verifiers, ok := item.Lookup("verifiers"); ok {
+		n, valid := verifiers.Uint64()
+		if !valid || n < 1 || n > 2 {
+			return User{}, protocolErrorf(command, "verifiers of user %s is not 1 or 2", user.Name)
+		}
+		user.Verifiers = int(n)
+	}
+	return user, nil
 }
 
 func (c *Client) rightStatement(ctx context.Context, verb string, right Right, table, preposition, user string) error {

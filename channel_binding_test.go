@@ -88,7 +88,8 @@ func TestScramChannelBinding(t *testing.T) {
 		if got, want := login.clientFirst(), testCase.first+"n=user,r="+rfcClientNonce; got != want {
 			t.Fatalf("got client-first %q, want %q", got, want)
 		}
-		final, signature, err := login.clientFinal(rfcPassword, serverFirst)
+		answer, err := login.clientFinal(rfcPassword, serverFirst)
+		final, signature := answer.message, answer.serverSignature
 		if err != nil {
 			t.Fatalf("clientFinal: %v", err)
 		}
@@ -107,7 +108,8 @@ func TestScramChannelBinding(t *testing.T) {
 
 	// Other binding data gives another proof.
 	login := newScramLogin(rfcUser, rfcClientNonce, scramBinding{kind: "tls-exporter", data: data})
-	final, _, _ := login.clientFinal(rfcPassword, serverFirst)
+	answer, _ := login.clientFinal(rfcPassword, serverFirst)
+	final := answer.message
 	other := scramBinding{kind: "tls-exporter", data: bytes.Repeat([]byte{0x5a}, 32)}
 	attribute := "c=" + base64.StdEncoding.EncodeToString(append([]byte(other.header()), other.data...))
 	if _, ok := (&fakeLogin{user: rfcUser, password: rfcPassword}).check(login.firstBare, serverFirst, attribute, final); ok {

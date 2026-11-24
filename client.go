@@ -182,6 +182,12 @@ type Client struct {
 	// schemas caches DESCRIBE replies by table name.
 	schemaMu sync.Mutex
 	schemas  map[string]*Schema
+
+	// loginMu guards opts.uri.Password, which RotatePassword replaces, and
+	// the salt and iterations of the verifier the most recent login used.
+	loginMu         sync.Mutex
+	loginSalt       []byte
+	loginIterations int
 }
 
 // NewClient builds a client without connecting. The connection is opened on
@@ -225,6 +231,8 @@ func ConnectURI(ctx context.Context, uri string) (*Client, error) {
 // one was configured. Note that [URI.String] renders the user and password
 // into the userinfo component.
 func (c *Client) URI() URI {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
 	return c.opts.uri
 }
 
@@ -436,16 +444,16 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 // triggered the dial.
 func (c *Client) helloOn(ctx context.Context, established *conn) error {
 	var (
-		reply     Reply
-		signature string
-		err       error
+		reply  Reply
+		answer scramFinal
+		err    error
 	)
 	if c.opts.uri.User == "" {
 		statement, params := helloOptions("HELLO 3", nil, c.opts.sessionOptions)
 		reply, err = c.execOn(ctx, established, "HELLO", statement, params)
 		err = c.helloError(err)
 	} else {
-		reply, signature, err = c.login(ctx, established)
+		reply, answer, err = c.login(ctx, established)
 	}
 	if err != nil {
 		return err
@@ -454,9 +462,14 @@ func (c *Client) helloOn(ctx context.Context, established *conn) error {
 	if err != nil {
 		return err
 	}
-	if c.opts.uri.User != "" && !hmac.Equal([]byte(info.ServerSignature), []byte(signature)) {
-		return newError(KindConnection, PhaseAuth, "HELLO",
-			"the server could not prove it knows the password: its SCRAM signature does not match", nil)
+	if c.opts.uri.User != "" {
+		if !hmac.Equal([]byte(info.ServerSignature), []byte(answer.serverSignature)) {
+			return newError(KindConnection, PhaseAuth, "HELLO",
+				"the server could not prove it knows the password: its SCRAM signature does not match", nil)
+		}
+		c.loginMu.Lock()
+		c.loginSalt, c.loginIterations = answer.salt, answer.iterations
+		c.loginMu.Unlock()
 	}
 	established.info = info
 	c.helloMu.Lock()
@@ -467,38 +480,42 @@ func (c *Client) helloOn(ctx context.Context, established *conn) error {
 
 // login runs the SCRAM-SHA-256 exchange: HELLO 3 USER with the client-first
 // message, then AUTH with the client-final message. It returns the HELLO
-// reply and the server signature that reply must carry. Under
-// [Options.ChannelBinding] the login is bound to the TLS connection, whose
-// handshake dial completed; a login that fails is not tried again unbound.
-func (c *Client) login(ctx context.Context, established *conn) (Reply, string, error) {
+// reply and the client's answer, whose server signature that reply must
+// carry. Under [Options.ChannelBinding] the login is bound to the TLS
+// connection, whose handshake dial completed; a login that fails is not tried
+// again unbound.
+func (c *Client) login(ctx context.Context, established *conn) (Reply, scramFinal, error) {
 	binding, err := channelBindingOf(c.opts.channelBinding, established.netConn)
 	if err != nil {
-		return Reply{}, "", err
+		return Reply{}, scramFinal{}, err
 	}
 	nonce, err := newScramNonce()
 	if err != nil {
-		return Reply{}, "", err
+		return Reply{}, scramFinal{}, err
 	}
 	exchange := newScramLogin(c.opts.uri.User, nonce, binding)
 	statement, params := helloOptions("HELLO 3 USER "+c.opts.uri.User+" $1", [][]byte{[]byte(exchange.clientFirst())}, c.opts.sessionOptions)
 	reply, err := c.execOn(ctx, established, "HELLO", statement, params)
 	if err != nil {
-		return Reply{}, "", c.helloError(err)
+		return Reply{}, scramFinal{}, c.helloError(err)
 	}
 	serverFirst, ok := strings.CutPrefix(reply.Text, "SCRAM ")
 	if reply.Kind != ReplySimple || !ok {
-		return Reply{}, "", protocolErrorf("HELLO", "expected +SCRAM <server-first message>, got a reply of kind %d %q",
+		return Reply{}, scramFinal{}, protocolErrorf("HELLO", "expected +SCRAM <server-first message>, got a reply of kind %d %q",
 			reply.Kind, reply.Text)
 	}
-	final, signature, err := exchange.clientFinal(c.opts.uri.Password, serverFirst)
+	c.loginMu.Lock()
+	password := c.opts.uri.Password
+	c.loginMu.Unlock()
+	answer, err := exchange.clientFinal(password, serverFirst)
 	if err != nil {
-		return Reply{}, "", err
+		return Reply{}, scramFinal{}, err
 	}
-	reply, err = c.execOn(ctx, established, "AUTH", "AUTH $1", [][]byte{[]byte(final)})
+	reply, err = c.execOn(ctx, established, "AUTH", "AUTH $1", [][]byte{[]byte(answer.message)})
 	if err != nil {
-		return Reply{}, "", err
+		return Reply{}, scramFinal{}, err
 	}
-	return reply, signature, nil
+	return reply, answer, nil
 }
 
 // helloError reports a server of an older protocol as such, judged by the
