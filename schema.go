@@ -47,6 +47,8 @@ type Schema struct {
 	LargeHeight int
 	LargeDepth  int
 	Options     TableOptions
+	// Checks are the table's CHECK constraints; nil without any.
+	Checks []Check
 }
 
 // Column returns the column called name.
@@ -161,7 +163,7 @@ func parseSchema(reply Reply) (*Schema, error) {
 		return bad("version")
 	}
 
-	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns"} {
+	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns", "checks"} {
 		value, exists := reply.Lookup(key)
 		if !exists {
 			continue
@@ -187,6 +189,18 @@ func parseSchema(reply Reply) (*Schema, error) {
 				return bad(key)
 			}
 			schema.Dims = int(n)
+		case "checks":
+			if value.Kind != ReplyArray {
+				return bad(key)
+			}
+			for _, entry := range value.Array {
+				name, _ := entry.Lookup("name")
+				expression, _ := entry.Lookup("expression")
+				if name.Kind != ReplyBulk || expression.Kind != ReplyBulk {
+					return bad(key)
+				}
+				schema.Checks = append(schema.Checks, Check{Name: string(name.Bulk), Expression: string(expression.Bulk)})
+			}
 		case "chunk_columns":
 			if value.Kind != ReplyArray {
 				return bad(key)

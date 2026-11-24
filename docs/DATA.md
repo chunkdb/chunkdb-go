@@ -72,6 +72,7 @@ tile is already at the limit
 - A computed value outside its column returns `OUT_OF_RANGE`; `If` excludes `IfVersion`.
 - `DeleteBlock`, the 3D writes and `Tx` block writes take `If` and `WithArgs` too; a transaction refuses `IfVersion`.
 - `Expr` is taken only as a `SetBlock` value; chunk forms, chunk columns and arguments refuse it.
+- `SetBlockReturning` and `DeleteBlockReturning` add RETURNING: a `WriteResult` with `Applied`, the chunk `Version` and the returned rows; a refused condition or version returns `Applied` false instead of an error. `Returning{Old: true}` returns the block before the write, which DELETE requires.
 
 ## Chunks and areas
 
@@ -208,6 +209,9 @@ Standalone encoding uses the supplied schema's configured budget.
 | `Tables`, `Describe`, `Schema` | List tables, refresh a schema, or use the cached schema. |
 | `CreateTable`, `DropTable` | Create an explicit table or remove it. |
 | `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` | Change columns; narrowing conversions require a supported `Conversion`. |
+| `SetColumnDefault`, `DropColumnDefault`, `SetColumnNull`, `SetColumnRequired` | Change a column's default, NULL and REQUIRED attributes. |
+| `AddCheck`, `DropCheck` | Add or drop a CHECK constraint; `Schema.Checks` lists them, and a write that breaks one fails with `CodeCheckFailed`. |
+| `RenameTable` | Rename a table; its specific grants move to the new name. |
 | `SetTableOption` | Change runtime options; chunk geometry stays fixed. |
 
 Scans across several requests do not share a snapshot.

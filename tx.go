@@ -23,7 +23,15 @@ const (
 type TxOption func(*txOptions)
 
 type txOptions struct {
-	retries int
+	retries  int
+	readOnly bool
+}
+
+// TxReadOnly runs the transaction as BEGIN READ ONLY: it reads one snapshot
+// without a read set, so --txn-max-read-chunks does not bound it and it
+// cannot conflict, and the server refuses its writes. COMMIT returns zero.
+func TxReadOnly() TxOption {
+	return func(o *txOptions) { o.readOnly = true }
 }
 
 // TxRetries sets how many times [Client.Transaction] runs the transaction
@@ -59,7 +67,7 @@ func (c *Client) Transaction(ctx context.Context, fn func(tx *Tx) error, opts ..
 	defer release()
 
 	for attempt := 0; ; attempt++ {
-		version, err := c.runTransaction(ctx, fn)
+		version, err := c.runTransaction(ctx, fn, options.readOnly)
 		var conflict *ConflictError
 		if !errors.As(err, &conflict) || attempt >= options.retries {
 			return version, err
@@ -86,12 +94,16 @@ func txBackoff(ctx context.Context, attempt int) error {
 
 // runTransaction runs fn once, from BEGIN to COMMIT or ROLLBACK. A returned
 // [*ConflictError] means the transaction ended with CONFLICT and may run again.
-func (c *Client) runTransaction(ctx context.Context, fn func(tx *Tx) error) (uint64, error) {
+func (c *Client) runTransaction(ctx context.Context, fn func(tx *Tx) error, readOnly bool) (uint64, error) {
 	established, err := c.connection(ctx)
 	if err != nil {
 		return 0, err
 	}
-	reply, err := c.execOn(ctx, established, "BEGIN", "BEGIN", nil)
+	begin := "BEGIN"
+	if readOnly {
+		begin = "BEGIN READ ONLY"
+	}
+	reply, err := c.execOn(ctx, established, "BEGIN", begin, nil)
 	if err == nil {
 		err = expectSimple(reply, "BEGIN", "OK")
 	}
