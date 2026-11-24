@@ -413,7 +413,7 @@ func TestIntegrationTypedBlocks(t *testing.T) {
 	}
 
 	// A REQUIRED column must be given for a new block.
-	if _, err := client.SetBlock(ctx, "", 1, 0, Record{"small": 1}); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.SetBlock(ctx, "", 1, 0, Record{"small": 1}); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
 	// A value the column cannot take fails before it is sent.
@@ -679,7 +679,7 @@ func TestIntegrationAreasAndScans(t *testing.T) {
 	if err != nil || len(around) != 3 || len(around[0].Chunk.Columns) != 1 {
 		t.Fatalf("GetAreaAround: %+v, %v", around, err)
 	}
-	if _, err := client.GetArea(ctx, "", 0, 0, int64(client.ServerInfo().MaxAreaChunks), 0); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.GetArea(ctx, "", 0, 0, int64(client.ServerInfo().MaxAreaChunks), 0); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT for a too large area", err)
 	}
 
@@ -702,7 +702,7 @@ func TestIntegrationAreasAndScans(t *testing.T) {
 		t.Fatalf("got %v, want %v", all, chunks)
 	}
 	for _, err := range client.AllChunks(ctx, "nowhere", 0) {
-		if !isServerCode(err, CodeNoTable) {
+		if !IsCode(err, CodeNoTable) {
 			t.Fatalf("got %v, want NO_TABLE", err)
 		}
 	}
@@ -717,7 +717,7 @@ func TestIntegrationTables(t *testing.T) {
 	spec.LargeWidth, spec.LargeHeight = 2, 2
 	spec.Options = TableOptions{DurabilityMode: "fsync-wal", VarMaxChunkBytes: 4096, FeedBufferBytes: 2 << 20, SlotMaxBytes: 4 << 20}
 	createTable(t, client, "land", spec)
-	if err := client.CreateTable(ctx, "land", spec); !isServerCode(err, CodeTableExists) {
+	if err := client.CreateTable(ctx, "land", spec); !IsCode(err, CodeTableExists) {
 		t.Fatalf("got %v, want TABLE_EXISTS", err)
 	}
 
@@ -761,7 +761,7 @@ func TestIntegrationTables(t *testing.T) {
 	if err := client.SetTableOption(ctx, "land", "checkpoint_updates", 64); err != nil {
 		t.Fatalf("SetTableOption: %v", err)
 	}
-	if err := client.SetTableOption(ctx, "land", "nope", 1); !isServerCode(err, CodeInvalidArgument) {
+	if err := client.SetTableOption(ctx, "land", "nope", 1); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
 	schema, err = client.Schema(ctx, "land")
@@ -779,7 +779,7 @@ func TestIntegrationTables(t *testing.T) {
 	if _, err := client.SetBlock(ctx, "land", 0, 0, Record{"id": 1, "small": 200, "label": "x"}); err != nil {
 		t.Fatalf("SetBlock after ALTER: %v", err)
 	}
-	if err := client.AlterColumnType(ctx, "land", "small", TypeUint(4), ConvertNone); !isServerCode(err, CodeInvalidArgument) {
+	if err := client.AlterColumnType(ctx, "land", "small", TypeUint(4), ConvertNone); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT for a value that does not fit", err)
 	}
 	if err := client.AlterColumnType(ctx, "land", "small", TypeUint(4), ConvertClamp); err != nil {
@@ -799,10 +799,10 @@ func TestIntegrationTables(t *testing.T) {
 	if err := client.DropTable(ctx, "land"); err != nil {
 		t.Fatalf("DropTable: %v", err)
 	}
-	if _, err := client.GetBlock(ctx, "land", 0, 0); !isServerCode(err, CodeNoTable) {
+	if _, err := client.GetBlock(ctx, "land", 0, 0); !IsCode(err, CodeNoTable) {
 		t.Fatalf("got %v, want NO_TABLE", err)
 	}
-	if err := client.DropTable(ctx, "land"); !isServerCode(err, CodeNoTable) {
+	if err := client.DropTable(ctx, "land"); !IsCode(err, CodeNoTable) {
 		t.Fatalf("got %v, want NO_TABLE", err)
 	}
 }
@@ -913,7 +913,7 @@ func TestIntegrationSchemaChanges(t *testing.T) {
 
 	// A statement with parameters naming a column the table does not have
 	// makes the server close the connection; the client reconnects.
-	if _, err := client.Do(ctx, "SET BLOCK 0 0 IN things nope = $1", []byte{1}); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.Do(ctx, "SET BLOCK 0 0 IN things nope = $1", []byte{1}); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
 	if err := client.Ping(ctx); err != nil {
@@ -942,10 +942,10 @@ func TestIntegrationDo(t *testing.T) {
 	}
 	// A wrong-size parameter is an ordinary error and leaves the connection
 	// usable.
-	if _, err := client.Do(ctx, "SET BLOCK 0 0 IN raw a = $1", []byte{1}); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.Do(ctx, "SET BLOCK 0 0 IN raw a = $1", []byte{1}); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 	}
-	if _, err := client.Do(ctx, "GET NOTHING"); !isServerCode(err, CodeSyntax) {
+	if _, err := client.Do(ctx, "GET NOTHING"); !IsCode(err, CodeSyntax) {
 		t.Fatalf("got %v, want SYNTAX", err)
 	}
 	if err := client.Ping(ctx); err != nil {
@@ -1105,7 +1105,7 @@ func TestIntegrationUsers(t *testing.T) {
 		t.Fatalf("SetPassword: %v", err)
 	}
 	_ = connectIntegration(t, server, func(o *Options) { o.URI = server.uriAs("bot", "new password") }).Close()
-	if _, err := Connect(ctx, Options{URI: server.uriAs("bot", "bot:p@ss")}); !isServerCode(err, CodeAuthFailed) {
+	if _, err := Connect(ctx, Options{URI: server.uriAs("bot", "bot:p@ss")}); !IsCode(err, CodeAuthFailed) {
 		t.Fatalf("got %v, want the old password refused", err)
 	}
 
@@ -1119,7 +1119,7 @@ func TestIntegrationUsers(t *testing.T) {
 	if err := admin.Revoke(ctx, RightRead, "world", "bot"); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
-	if _, err := bot.GetBlock(ctx, "", 1, 1); !isServerCode(err, CodeNoTable) {
+	if _, err := bot.GetBlock(ctx, "", 1, 1); !IsCode(err, CodeNoTable) {
 		t.Fatalf("got %v, want NO_TABLE after REVOKE READ", err)
 	}
 
@@ -1135,7 +1135,7 @@ func TestIntegrationUsers(t *testing.T) {
 	if err := admin.DropUser(ctx, "bot"); err != nil {
 		t.Fatalf("DropUser: %v", err)
 	}
-	if _, err := Connect(ctx, Options{URI: server.uriAs("bot", "new password")}); !isServerCode(err, CodeAuthFailed) {
+	if _, err := Connect(ctx, Options{URI: server.uriAs("bot", "new password")}); !IsCode(err, CodeAuthFailed) {
 		t.Fatalf("got %v, want a dropped user refused", err)
 	}
 	if err := admin.Grant(ctx, RightRead, AllTables, "nobody"); !errors.Is(err, ErrServer) {
@@ -1497,10 +1497,10 @@ func TestIntegrationTransactionRollback(t *testing.T) {
 		if err := tx.SetBlock(ctx, "", 0, 0, Record{"id": 1, "small": 8}); !errors.Is(err, ErrProtocol) {
 			t.Errorf("got %v, want a request error", err)
 		}
-		if err := tx.SetBlock(ctx, "", 0, 0, Record{"small": 1}); !isServerCode(err, CodeInvalidArgument) {
+		if err := tx.SetBlock(ctx, "", 0, 0, Record{"small": 1}); !IsCode(err, CodeInvalidArgument) {
 			t.Errorf("got %v, want INVALID_ARGUMENT for a missing REQUIRED column", err)
 		}
-		if _, err := tx.GetBlock(ctx, "others", 0, 0); !isServerCode(err, CodeInvalidArgument) {
+		if _, err := tx.GetBlock(ctx, "others", 0, 0); !IsCode(err, CodeInvalidArgument) {
 			t.Errorf("got %v, want INVALID_ARGUMENT for another table", err)
 		}
 		return tx.SetBlock(ctx, "", 0, 0, Record{"id": 3})
@@ -1549,7 +1549,7 @@ func TestIntegrationTransactionRefusedStatements(t *testing.T) {
 		if step.code == "" && err != nil {
 			t.Fatalf("%s: %v", step.statement, err)
 		}
-		if step.code != "" && !isServerCode(err, step.code) {
+		if step.code != "" && !IsCode(err, step.code) {
 			t.Fatalf("%s: got %v, %v; want %s", step.statement, reply, err, step.code)
 		}
 	}
@@ -1560,7 +1560,7 @@ func TestIntegrationTransactionRefusedStatements(t *testing.T) {
 	if got, _ := client.GetBlock(ctx, "things", 0, 0, "id"); got["id"] != uint64(4) {
 		t.Fatalf("got %v", got)
 	}
-	if _, err := client.Do(ctx, "COMMIT"); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := client.Do(ctx, "COMMIT"); !IsCode(err, CodeInvalidArgument) {
 		t.Fatalf("COMMIT without a transaction: got %v", err)
 	}
 	if reply, err := client.Do(ctx, "ROLLBACK"); err != nil || reply.Text != "OK" {

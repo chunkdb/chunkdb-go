@@ -128,7 +128,7 @@ func TestTransactionDoesNotReconnectAfterAClosingErrorReply(t *testing.T) {
 	attempts := 0
 	_, err := client.Transaction(t.Context(), func(tx *Tx) error {
 		attempts++
-		if _, err := tx.call(t.Context(), "SET BLOCK 0 0 IN world nope = $1", [][]byte{{1}}); !isServerCode(err, CodeInvalidArgument) {
+		if _, err := tx.call(t.Context(), "SET BLOCK 0 0 IN world nope = $1", [][]byte{{1}}); !IsCode(err, CodeInvalidArgument) {
 			t.Fatalf("got %v, want INVALID_ARGUMENT", err)
 		}
 		err := tx.DeleteBlock(t.Context(), "world", 1, 1)
@@ -221,7 +221,7 @@ func TestTransactionDoesNotRetryMigrationMismatch(t *testing.T) {
 			var migration *MigrationError
 			var mismatch *Error
 			var transaction *ConflictError
-			if attempts != 1 || !isServerCode(err, CodeMigrationMismatch) || errors.Is(err, ErrConflict) || !errors.As(err, &mismatch) || mismatch.RetryClass != RetryFatal || !errors.As(err, &migration) || errors.As(err, &transaction) {
+			if attempts != 1 || !IsCode(err, CodeMigrationMismatch) || errors.Is(err, ErrConflict) || !errors.As(err, &mismatch) || mismatch.RetryClass != RetryFatal || !errors.As(err, &migration) || errors.As(err, &transaction) {
 				t.Fatal(attempts, err)
 			}
 			want := []string{"BEGIN", "ROLLBACK"}

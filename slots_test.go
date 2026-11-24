@@ -141,7 +141,7 @@ func TestSlotWatchAckNoReplyAndRecoverableError(t *testing.T) {
 	if got := <-commands; got != "ACK 11" {
 		t.Fatal(got)
 	}
-	if _, err := w.Next(t.Context()); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := w.Next(t.Context()); !IsCode(err, CodeInvalidArgument) {
 		t.Fatal(err)
 	}
 	if nextWatch(t, w).GetPosition().Revision != 12 {
@@ -275,7 +275,7 @@ func TestSlotWatchStartupInvalidArgument(t *testing.T) {
 		}
 	}))
 	c := newTestClient(t, s, nil)
-	if _, err := c.Watch(t.Context(), "world", WatchOptions{Slot: "consumer"}); !isServerCode(err, CodeInvalidArgument) {
+	if _, err := c.Watch(t.Context(), "world", WatchOptions{Slot: "consumer"}); !IsCode(err, CodeInvalidArgument) {
 		t.Fatal(err)
 	}
 }

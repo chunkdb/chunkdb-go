@@ -286,7 +286,7 @@ func (c *Client) fetchSchema(ctx context.Context, table string) (*Schema, error)
 // keepSchema parses the reply to DESCRIBE table and caches the schema.
 func (c *Client) keepSchema(table string, reply Reply, err error) (*Schema, error) {
 	if err != nil {
-		if isServerCode(err, CodeNoTable) {
+		if IsCode(err, CodeNoTable) {
 			c.forgetSchema(table)
 		}
 		return nil, err
@@ -456,7 +456,7 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 			if isWrongSize(err) || isNoColumn(err) {
 				return Reply{}, &staleSchemaError{err: err}
 			}
-			if isServerCode(err, CodeBadRequest) {
+			if IsCode(err, CodeBadRequest) {
 				// A frame longer than its column holds: the connection is
 				// closed, so the write is not sent again, but the next
 				// statement uses a fresh schema.
