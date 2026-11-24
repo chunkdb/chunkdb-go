@@ -78,7 +78,7 @@ Restore never replaces a table; `SwapTables(ctx, a, b)` then exchanges the two n
 ## Table maintenance
 
 - `Migrations` lists applied migrations within your rights; `User` is empty without MANAGES USERS.
-- `TableStats` returns the epoch, completed revision (nil on a read-only server), dimensions, retained tombstones and retained-deletion floor.
+- `TableStats` returns the epoch, completed revision (nil on a read-only server), dimensions, retained tombstones and retained-deletion floor, and the counts `Chunks`, `LoadedChunks`, `Files`, `DiskBytes`, `Slots` and `Watches`; `Files` and `DiskBytes` list the table's directory, so their cost grows with its file count.
 - `CompactTombstones(ctx, table, before)` forgets retained tombstones below revision `before` and returns the new floor; watches that resume below it receive `RESYNC_REQUIRED`.
 - `RecoverTable` returns a fenced table to service.
 - `ReloadTLS` makes new connections use the certificate and key files read again; open connections keep theirs.
@@ -117,6 +117,7 @@ Activation is idempotent and monotonic; it cannot disable a feature.
 Unknown names return `INVALID_ARGUMENT reason=unknown_feature`.
 
 `Status(ctx)` reports enabled directory and table storage features and raw Compat, ReadOnlyCompat and Incompat masks.
+It also reports the server `Version`, `UptimeMS` and `ReadOnly`, each table's `State` (`ok` or `fenced`) and fence `Reason`, and in `Fenced` the fenced tables whose features cannot be read.
 It requires ADMIN on `*` and exposes ActivationPending from the protected activation state.
 Unknown names and fields remain available; these storage features are separate from HELLO capabilities.
 A recovery error is returned when an unhealthy server cannot provide a truthful snapshot.

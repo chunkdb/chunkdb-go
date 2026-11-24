@@ -16,14 +16,31 @@ type FeatureStatus struct {
 // TableFeatureStatus reports one table's enabled storage features.
 type TableFeatureStatus struct {
 	Name string
+	// State is "ok" or "fenced"; Reason is the fence reason, nil when the
+	// table is not fenced. Both are empty for servers that do not report them.
+	State  string
+	Reason *string
 	FeatureStatus
+}
+
+// FencedTable is a fenced table whose features cannot be read, because its
+// store is not open or its feed cleanup failed.
+type FencedTable struct {
+	Name, Reason string
 }
 
 // ServerStatus is a protected storage feature and activation snapshot.
 // An unhealthy server returns its recovery error instead of a guessed snapshot.
 type ServerStatus struct {
+	// Version is the server version HELLO reports, UptimeMS the time since
+	// the server started, and ReadOnly whether it runs with --read-only.
+	// They are zero for servers that do not report them.
+	Version           string
+	UptimeMS          uint64
+	ReadOnly          bool
 	Directory         FeatureStatus
 	Tables            []TableFeatureStatus
+	Fenced            []FencedTable
 	ActivationPending bool
 	Fields            map[string]Reply
 }
@@ -105,7 +122,55 @@ func parseStatus(r Reply) (ServerStatus, error) {
 		if err != nil {
 			return status, err
 		}
-		status.Tables = append(status.Tables, TableFeatureStatus{Name: string(name.Bulk), FeatureStatus: features})
+		table := TableFeatureStatus{Name: string(name.Bulk), FeatureStatus: features}
+		if state, exists := entry.Lookup("state"); exists {
+			if state.Kind != ReplyBulk || (string(state.Bulk) != "ok" && string(state.Bulk) != "fenced") {
+				return status, protocolErrorf("SHOW STATUS", "invalid table state")
+			}
+			table.State = string(state.Bulk)
+			reason, _ := entry.Lookup("reason")
+			if reason.Kind == ReplyBulk {
+				text := string(reason.Bulk)
+				table.Reason = &text
+			} else if reason.Kind != ReplyNull {
+				return status, protocolErrorf("SHOW STATUS", "invalid table reason")
+			}
+			if (table.State == "fenced") != (table.Reason != nil) {
+				return status, protocolErrorf("SHOW STATUS", "table state and reason disagree")
+			}
+		}
+		status.Tables = append(status.Tables, table)
+	}
+	if version, exists := r.Lookup("version"); exists {
+		if version.Kind != ReplyBulk || !utf8.Valid(version.Bulk) {
+			return status, protocolErrorf("SHOW STATUS", "invalid version")
+		}
+		status.Version = string(version.Bulk)
+	}
+	if uptime, exists := r.Lookup("uptime_ms"); exists {
+		var ok bool
+		if status.UptimeMS, ok = uptime.Uint64(); !ok {
+			return status, protocolErrorf("SHOW STATUS", "invalid uptime_ms")
+		}
+	}
+	if readOnly, exists := r.Lookup("read_only"); exists {
+		if readOnly.Kind != ReplyBoolean {
+			return status, protocolErrorf("SHOW STATUS", "invalid read_only")
+		}
+		status.ReadOnly = readOnly.Bool
+	}
+	if fenced, exists := r.Lookup("fenced"); exists {
+		if fenced.Kind != ReplyArray {
+			return status, protocolErrorf("SHOW STATUS", "invalid fenced tables")
+		}
+		for _, entry := range fenced.Array {
+			name, _ := entry.Lookup("name")
+			reason, _ := entry.Lookup("reason")
+			if name.Kind != ReplyBulk || !isName(string(name.Bulk)) || reason.Kind != ReplyBulk || !utf8.Valid(reason.Bulk) {
+				return status, protocolErrorf("SHOW STATUS", "invalid fenced table")
+			}
+			status.Fenced = append(status.Fenced, FencedTable{Name: string(name.Bulk), Reason: string(reason.Bulk)})
+		}
 	}
 	return status, nil
 }

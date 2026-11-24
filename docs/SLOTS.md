@@ -66,6 +66,8 @@ After a crash, skip already applied revisions; an ACK alone cannot prevent dupli
 AFTER selects a later starting point without acknowledging it.
 Slots replay durable archived changes, including in relaxed durability mode.
 `Slots(ctx, "")` lists visible tables; empty table arguments elsewhere require Options.Table or a URI table path.
+`SlotsWithPrefix` lists only slots whose names start with a prefix.
+Each slot reports `Revision`, the durable revision recorded for its table, `LagRevisions`, how far `Acked` is below it, and `Attached`, true while a watch holds it.
 A lost slot returns `CodeSlotLost`.
 Rebuild your consumer state, drop the lost slot, and create it again before resuming.
 
