@@ -1,6 +1,9 @@
 package chunkdb
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // Slot is one durable consumer position returned by SHOW SLOTS.
 type Slot struct {
@@ -19,8 +22,14 @@ type Slot struct {
 	// recorded owner, when the viewer is neither that user nor a user who
 	// manages users on a server that requires logins, or for servers that do
 	// not report owners.
-	Owner  *string
-	Fields map[string]Reply
+	// Revision is the durable revision recorded for the table's slots,
+	// LagRevisions how far Acked is below it, and Attached whether a watch
+	// holds the slot. They are zero for servers that do not report them.
+	Revision     uint64
+	LagRevisions uint64
+	Attached     bool
+	Owner        *string
+	Fields       map[string]Reply
 }
 
 func slotName(command, name string) error {
@@ -60,6 +69,12 @@ func (c *Client) slotStatement(ctx context.Context, command, table, name string)
 // Slots lists durable slots, including lost ones. An empty table lists all
 // tables visible to the user; otherwise it runs SHOW SLOTS ON table.
 func (c *Client) Slots(ctx context.Context, table string) ([]Slot, error) {
+	return c.SlotsWithPrefix(ctx, table, "")
+}
+
+// SlotsWithPrefix is [Client.Slots] listing only slots whose names start with
+// prefix (SHOW SLOTS ... PREFIX); an empty prefix lists every slot.
+func (c *Client) SlotsWithPrefix(ctx context.Context, table, prefix string) ([]Slot, error) {
 	const command = "SHOW SLOTS"
 	statement := command
 	if table != "" {
@@ -68,6 +83,12 @@ func (c *Client) Slots(ctx context.Context, table string) ([]Slot, error) {
 			return nil, err
 		}
 		statement += " ON " + name
+	}
+	if prefix != "" {
+		if err := slotName(command, prefix); err != nil {
+			return nil, err
+		}
+		statement += " PREFIX '" + prefix + "'"
 	}
 	reply, err := c.call(ctx, statement, nil)
 	if err != nil {
@@ -126,6 +147,20 @@ func (c *Client) Slots(ctx context.Context, table string) ([]Slot, error) {
 		if hasFilters != hasReason {
 			return nil, protocolErrorf(command, "incomplete slot metadata")
 		}
+		if revision, has := item.Lookup("revision"); has {
+			lag, _ := item.Lookup("lag_revisions")
+			attached, _ := item.Lookup("attached")
+			var okRevision, okLag bool
+			slot.Revision, okRevision = revision.Uint64()
+			slot.LagRevisions, okLag = lag.Uint64()
+			if !okRevision || !okLag || attached.Kind != ReplyBoolean {
+				return nil, protocolErrorf(command, "invalid revision, lag_revisions or attached")
+			}
+			slot.Attached = attached.Bool
+		}
+		if prefix != "" && !strings.HasPrefix(slot.Name, prefix) {
+			return nil, protocolErrorf(command, "slot %s does not start with the prefix", slot.Name)
+		}
 		if owner, hasOwner := item.Lookup("owner"); hasOwner {
 			if owner.Kind == ReplyBulk && isName(string(owner.Bulk)) {
 				name := string(owner.Bulk)
@@ -152,4 +187,9 @@ func (p *Pool) DropSlot(ctx context.Context, table, name string) error {
 // Slots runs Client.Slots on a leased client.
 func (p *Pool) Slots(ctx context.Context, table string) ([]Slot, error) {
 	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]Slot, error) { return c.Slots(ctx, table) })
+}
+
+// SlotsWithPrefix runs Client.SlotsWithPrefix on a leased client.
+func (p *Pool) SlotsWithPrefix(ctx context.Context, table, prefix string) ([]Slot, error) {
+	return withPooledClient(ctx, p, func(ctx context.Context, c *Client) ([]Slot, error) { return c.SlotsWithPrefix(ctx, table, prefix) })
 }
