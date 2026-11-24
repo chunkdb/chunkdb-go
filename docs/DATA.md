@@ -210,7 +210,7 @@ Standalone encoding uses the supplied schema's configured budget.
 | `CreateTable`, `DropTable` | Create an explicit table or remove it. |
 | `AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumnType` | Change columns; narrowing conversions require a supported `Conversion`. |
 | `SetColumnDefault`, `DropColumnDefault`, `SetColumnNull`, `SetColumnRequired` | Change a column's default, NULL and REQUIRED attributes. |
-| `AddCheck`, `DropCheck` | Add or drop a CHECK constraint; `Schema.Checks` lists them, and a write that breaks one fails with `CodeCheckFailed`. |
+| `AddCheck`, `DropCheck` | Add or drop a CHECK constraint; `Schema.Checks` lists them, and a write that breaks one fails with `CodeCheckFailed`. The condition is CQL text: never build it from untrusted input. |
 | `RenameTable` | Rename a table; its specific grants move to the new name. |
 | `SetTableOption` | Change runtime options; chunk geometry stays fixed. |
 

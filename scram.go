@@ -109,44 +109,55 @@ func (s scramLogin) clientFirst() string {
 	return s.binding.header() + s.firstBare
 }
 
-// clientFinal answers the server-first message: it returns the client-final
-// message AUTH carries and the server signature (v=...) the server must reply
-// with to prove it holds the user's verifier.
-func (s scramLogin) clientFinal(password, serverFirst string) (message, serverSignature string, err error) {
+// scramFinal is the client's answer to a server-first message.
+type scramFinal struct {
+	// message is the client-final message AUTH carries.
+	message string
+	// serverSignature (v=...) is what the server must reply with to prove it
+	// holds the user's verifier.
+	serverSignature string
+	// salt and iterations are those of the user's verifier, which a verifier
+	// added with ADD VERIFIER must share.
+	salt       []byte
+	iterations int
+}
+
+// clientFinal answers the server-first message.
+func (s scramLogin) clientFinal(password, serverFirst string) (scramFinal, error) {
 	malformed := func(why string) error {
 		return protocolErrorf("HELLO", "malformed SCRAM server-first message %q: %s", serverFirst, why)
 	}
 	// r=<nonce>,s=<salt>,i=<iterations>[,<extensions>]
 	parts := strings.Split(serverFirst, ",")
 	if len(parts) < 3 {
-		return "", "", malformed("expected r=, s= and i=")
+		return scramFinal{}, malformed("expected r=, s= and i=")
 	}
 	nonce, okNonce := strings.CutPrefix(parts[0], "r=")
 	saltText, okSalt := strings.CutPrefix(parts[1], "s=")
 	iterationsText, okIterations := strings.CutPrefix(parts[2], "i=")
 	if !okNonce || !okSalt || !okIterations {
-		return "", "", malformed("expected r=, s= and i=")
+		return scramFinal{}, malformed("expected r=, s= and i=")
 	}
 	if !strings.HasPrefix(nonce, s.nonce) || len(nonce) == len(s.nonce) {
-		return "", "", malformed("the nonce does not continue the client nonce")
+		return scramFinal{}, malformed("the nonce does not continue the client nonce")
 	}
 	salt, err := base64.StdEncoding.DecodeString(saltText)
 	if err != nil || len(salt) == 0 {
-		return "", "", malformed("the salt is not base64")
+		return scramFinal{}, malformed("the salt is not base64")
 	}
 	iterations, err := strconv.Atoi(iterationsText)
 	if err != nil || iterations <= 0 {
-		return "", "", malformed("the iteration count is not a positive integer")
+		return scramFinal{}, malformed("the iteration count is not a positive integer")
 	}
 	// A chunkdb server issues counts in this range; a larger one would hold
 	// the login in PBKDF2, which no context or deadline interrupts.
 	if iterations < DefaultVerifierIterations || iterations > maxServerIterations {
-		return "", "", malformed(fmt.Sprintf("%d iterations; a chunkdb server issues %d to %d", iterations, DefaultVerifierIterations, maxServerIterations))
+		return scramFinal{}, malformed(fmt.Sprintf("%d iterations; a chunkdb server issues %d to %d", iterations, DefaultVerifierIterations, maxServerIterations))
 	}
 
 	keys, err := deriveScramKeys(password, salt, iterations)
 	if err != nil {
-		return "", "", annotate("HELLO", err)
+		return scramFinal{}, annotate("HELLO", err)
 	}
 	// c= carries the GS2 header and the channel binding data, so the proof
 	// and the server signature cover the binding; unbound, it is c=biws.
@@ -157,7 +168,10 @@ func (s scramLogin) clientFinal(password, serverFirst string) (message, serverSi
 	for i := range proof {
 		proof[i] ^= keys.clientKey[i]
 	}
-	message = withoutProof + ",p=" + base64.StdEncoding.EncodeToString(proof)
-	serverSignature = "v=" + base64.StdEncoding.EncodeToString(hmacSHA256(keys.serverKey, authMessage))
-	return message, serverSignature, nil
+	return scramFinal{
+		message:         withoutProof + ",p=" + base64.StdEncoding.EncodeToString(proof),
+		serverSignature: "v=" + base64.StdEncoding.EncodeToString(hmacSHA256(keys.serverKey, authMessage)),
+		salt:            salt,
+		iterations:      iterations,
+	}, nil
 }

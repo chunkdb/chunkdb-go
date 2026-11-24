@@ -55,6 +55,7 @@ A revision orders committed changes within a table's change feed.
 - [Transactions](docs/TRANSACTIONS.md): publish several writes together.
 - [Users](docs/USERS.md): grant table access.
 - [Change feed](docs/CHANGE_FEED.md) and [Slots](docs/SLOTS.md): live changes and durable consumers.
+- [Catalog](docs/CATALOG.md): follow table, user and slot changes.
 - [Journal example](examples/journal/main.go): store every slot change and schema description in a file before acknowledging it; see [Event journal](https://github.com/chunkdb/chunkdb/blob/main/docs/EVENT_JOURNAL.md) for rebuilds and retention.
 - [Operations](docs/OPERATIONS.md): migrations, backup and restore, table maintenance, durability, and metrics.
 - [Connections](docs/CONNECTIONS.md): authentication, TLS, channel binding, pooling, timeouts, and errors.

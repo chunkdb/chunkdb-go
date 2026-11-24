@@ -26,7 +26,8 @@ func TestScramRFC7677(t *testing.T) {
 	if got := login.clientFirst(); got != "n,,n=user,r=rOprNGfwEbeRWgbNEkqO" {
 		t.Fatalf("got client-first %q", got)
 	}
-	final, signature, err := login.clientFinal(rfcPassword, rfcServerFirst)
+	answer, err := login.clientFinal(rfcPassword, rfcServerFirst)
+	final, signature := answer.message, answer.serverSignature
 	if err != nil {
 		t.Fatalf("clientFinal: %v", err)
 	}
@@ -36,10 +37,14 @@ func TestScramRFC7677(t *testing.T) {
 	if signature != rfcSignature {
 		t.Fatalf("got server signature %q, want %q", signature, rfcSignature)
 	}
+	// The verifier parameters a rotation reuses are those of the server-first.
+	if salt, _ := base64.StdEncoding.DecodeString("W22ZaJ0SNY7soEsUEjb6gQ=="); !bytes.Equal(answer.salt, salt) || answer.iterations != 4096 {
+		t.Fatalf("got salt %x and %d iterations", answer.salt, answer.iterations)
+	}
 
 	// Another password gives another proof.
-	if other, _, err := login.clientFinal("pencil2", rfcServerFirst); err != nil || other == rfcClientFinal {
-		t.Fatalf("got %q, %v", other, err)
+	if other, err := login.clientFinal("pencil2", rfcServerFirst); err != nil || other.message == rfcClientFinal {
+		t.Fatalf("got %q, %v", other.message, err)
 	}
 }
 
@@ -61,7 +66,7 @@ func TestScramRejectsBadServerFirst(t *testing.T) {
 		"mandatory extras": "m=ext,r=rOprNGfwEbeRWgbNEkqOabc,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, _, err := login.clientFinal(rfcPassword, serverFirst); !errors.Is(err, ErrProtocol) {
+			if _, err := login.clientFinal(rfcPassword, serverFirst); !errors.Is(err, ErrProtocol) {
 				t.Fatalf("got %v, want ErrProtocol", err)
 			}
 		})
