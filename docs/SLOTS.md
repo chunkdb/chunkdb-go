@@ -89,7 +89,7 @@ WatchOptions.AckTimeout takes positive whole milliseconds; zero disables that wa
 The deadline starts with the first unacknowledged change or chunks mutation and is not refreshed by later mutations or progress.
 
 The example tolerates periodic progress and schema events while waiting for its exact write revision.
-It uses the same bounded ctx for the whole wait and treats resync or reserved catalog events as unexpected.
+It uses the same bounded ctx for the whole wait and treats resync events as unexpected.
 Next must return a progress event before Ack can cover its revision.
 Schema, resync and unknown events never raise that bound.
 Takeover resumes from the persisted ACK, so unacknowledged events remain replayable.

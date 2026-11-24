@@ -44,7 +44,7 @@ Use TLS over an untrusted network.
 | `RightAdmin` | Includes `RightWrite`, which includes `RightRead`. |
 | `AllTables` | Grants a right on all tables, including future tables. |
 | Prefix grant | `Grant(ctx, right, "tenant1_*", user)` covers every table whose name starts with `tenant1_`, future tables included; it stays when a table is dropped. |
-| `RightMonitor`, `RightBackup`, `RightReplication` | Server rights, granted on `AllTables` only: MONITOR reads metrics, status, every connection and every table's stats and slots; BACKUP takes backups; REPLICATION follows every table's feed. `User.ServerRights` lists them. |
+| `RightMonitor`, `RightBackup`, `RightReplication` | Server rights, granted on `AllTables` only: MONITOR reads metrics, status, every connection, every table's stats and slots, and the catalog watch; BACKUP takes backups and restores a table under a name it has ADMIN on; REPLICATION is stored and listed, and no statement requires it. `User.ServerRights` lists them. |
 | Table-specific grant | Disappears when that table is dropped. |
 | `Revoke` | Removes the named right and rights above it. |
 | MANAGES USERS | Permits user administration and grants, independently of table rights. |

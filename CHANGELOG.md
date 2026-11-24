@@ -36,6 +36,7 @@ uses protocol 3 (CQL); see the engine's
 - An out-of-range integer or `f32` value error names the range of the column type.
 
 ### Documentation
+- Follow the server's rights: `Status` needs MONITOR or ADMIN on `*`, backups take BACKUP or MANAGES USERS, SHOW MIGRATIONS lists the records within your rights, MONITOR lists every connection and REPLICATION gates no statement; `RATE_LIMITED` also names `auth_ban`, and `RESYNC_REQUIRED` after COMPACT TOMBSTONES answers scans with `Since` (chunkdb/chunkdb#151).
 - CONNECTIONS.md: a TLS proxy that opens its own TLS connection to the server gets `AUTH_FAILED` with reason `channel_binding`, and one that forwards plain TCP gets `INVALID_ARGUMENT`. (#40)
 - The README runs the world example with `go run github.com/chunkdb/chunkdb-go/v2/examples/world@latest`, without a clone, and shows its `Migrate` call.
 - A runnable `examples/journal` stores every slot change and schema description in a synced file before acknowledging it, and resumes after the last stored change without duplicates.
