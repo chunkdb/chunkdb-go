@@ -44,7 +44,7 @@ func TestIntegrationDownsampledThreeDimensionalArea(t *testing.T) {
 	if err != nil || len(first.Chunks) != 1 {
 		t.Fatalf("%+v %v", first, err)
 	}
-	if whole := first.Chunks[0].Chunk; whole.Width != 1 || whole.Depth != 1 || whole.Block3D(0, 0, 0)["h"] != uint64(3) || whole.Block3D(0, 0, 0)["kind"] != uint64(1) {
+	if whole := first.Chunks[0].Chunk; whole.Width != 1 || whole.Depth != 1 || whole.UnknownSections != nil || whole.Block3D(0, 0, 0)["h"] != uint64(3) || whole.Block3D(0, 0, 0)["kind"] != uint64(1) {
 		t.Fatalf("%+v", whole)
 	}
 }

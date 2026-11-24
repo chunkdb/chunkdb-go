@@ -9,7 +9,7 @@ uses protocol 3 (CQL); see the engine's
 ## Unreleased
 
 ### Added
-- `Schema.Fenced` reports the reason DESCRIBE gives for a fenced table, and `ConnectionInfo.Progress` the files and bytes a running RESTORE TABLE copied (chunkdb/chunkdb#151).
+- `Schema.Fenced` reports the reason DESCRIBE gives for a fenced table, and `ConnectionInfo.Progress` the files and bytes a running RESTORE TABLE copied; a downsampled chunk no longer lists its scale section in `UnknownSections` (chunkdb/chunkdb#151).
 - `SetBlockReturning` and `DeleteBlockReturning` (and 3D forms) send RETURNING and decode `{applied, version, rows}`; `TxReadOnly` runs BEGIN READ ONLY; `SetColumnDefault`, `DropColumnDefault`, `SetColumnNull`, `SetColumnRequired`, `AddCheck`, `DropCheck` and `RenameTable` run the ALTER TABLE forms, and `Schema.Checks` lists CHECK constraints (chunkdb/chunkdb#151).
 - `ComputeVerifierWithSalt`, `ParseVerifier`, `AddVerifier` and `DropOldVerifier` rotate a password with two verifiers; `User` reports `Verifiers` and `ServerRights`; `RightMonitor`, `RightBackup` and `RightReplication` are server rights; `Grant` and `Revoke` take prefixes such as `tenant1_*`; `PermissionDeniedError.Rights` lists alternatives such as MONITOR or ADMIN (chunkdb/chunkdb#151).
 - `ServerStatus` reports `Version`, `UptimeMS`, `ReadOnly`, table `State` and `Reason`, and `Fenced`; `TableStats` reports `Chunks`, `LoadedChunks`, `Files`, `DiskBytes`, `Slots` and `Watches`; `Slot` reports `Revision`, `LagRevisions` and `Attached`, and `SlotsWithPrefix` runs SHOW SLOTS ... PREFIX (chunkdb/chunkdb#151).

@@ -91,6 +91,9 @@ func TestDownsampledThreeDimensionalProjectedForm(t *testing.T) {
 	if read.Metadata["biome"] != uint64(5) {
 		t.Fatalf("metadata %+v", read.Metadata)
 	}
+	if read.UnknownSections != nil {
+		t.Fatalf("the scale section kept as unknown: %v", read.UnknownSections)
+	}
 	if _, err := decodeAreaChunk(full, scaled, nil, 2, ReduceFirst); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("a projected form read as a full one: %v", err)
 	}

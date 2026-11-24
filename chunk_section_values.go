@@ -291,7 +291,8 @@ func decodeChunkForm(schema *Schema, data []byte, scaled bool, columns []string)
 		return bad("combined variable data exceeds its hard byte limit")
 	}
 	for _, section := range form.sections {
-		if section.kind < sectionPresence || section.kind > sectionBlockSpans {
+		// Section 7 is known: Scale and Reduction hold it.
+		if (section.kind < sectionPresence || section.kind > sectionBlockSpans) && section.kind != sectionScale {
 			if chunk.UnknownSections == nil {
 				chunk.UnknownSections = make(map[uint16][]byte)
 			}
