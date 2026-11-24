@@ -114,6 +114,9 @@ chunks: 1
 
 `GetAreaPage` accepts the same rectangle followed by `AreaPageOptions{Limit, After}` and optional column names.
 `GetAreaAroundPage` selects a disc; `GetAreaPage3D` and `GetAreaAroundPage3D` use `AreaPageOptions3D` for boxes and balls.
+`Scale` and `Reduction` in the page options read each chunk downsampled, as `GET AREA ... SCALE k USING`: every `Scale` blocks on each axis become one sample, and `ReduceMax`, `ReduceMin`, `ReduceMode`, `ReduceFirst` or `ReduceAny` picks its values from the group's present blocks.
+A downsampled `Chunk` has `Scale` and `Reduction` set and `Width`, `Height` and `Depth` counted in samples; `Scale` must divide every chunk side, the server must offer `area_scale`, and `SetChunk` refuses such a chunk.
+See the server's [downsampled areas](https://github.com/chunkdb/chunkdb/blob/main/docs/reference/CHUNKS.md#downsampled-areas) for the reductions' column types and NULL handling.
 Client, Pool and Tx expose these methods and require the advertised `area_paging` feature.
 Each page contains `Chunks`, `SchemaVersion`, `More` and `After`; pass its cursor with the same selector and projection to continue.
 Limit zero uses the negotiated maximum.

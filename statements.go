@@ -787,7 +787,7 @@ func getAreaWithSchema(ctx context.Context, s session, table, area string, withM
 				if !okX || !okY || err != nil {
 					return AreaRead{}, protocolErrorf(command, "expected [cx, cy, chunk] entries")
 				}
-				chunk, err := decodeAreaChunk(schema, form, names)
+				chunk, err := decodeAreaChunk(schema, form, names, 0, "")
 				if err != nil {
 					return AreaRead{}, err
 				}

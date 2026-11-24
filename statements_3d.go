@@ -193,7 +193,7 @@ func getArea3D(ctx context.Context, s session, table, area string, withSchemaVer
 				if !okX || !okY || !okZ || err != nil {
 					return AreaRead3D{}, protocolErrorf(command, "expected [cx, cy, cz, chunk] entries")
 				}
-				chunk, err := decodeAreaChunk(schema, form, names)
+				chunk, err := decodeAreaChunk(schema, form, names, 0, "")
 				if err != nil {
 					return AreaRead3D{}, err
 				}
