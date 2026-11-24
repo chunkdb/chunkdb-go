@@ -28,6 +28,7 @@ block (0,0): tile=1 label=grass
 change (0,0): tile=2 label=water
 ```
 
+A URI path such as `/world` selects the table for calls that pass an empty table; `Options.Table` overrides it.
 `CHUNKDB_PASSWORD` holds the administrator password from Quick start; URI-escape reserved characters in other passwords.
 The [example](examples/world/main.go) creates its table with a named migration, writes 16 blocks, reads them back and watches one change:
 
