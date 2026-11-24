@@ -58,6 +58,7 @@ After a crash, skip already applied revisions; an ACK alone cannot prevent dupli
 |---|---|
 | Slot names | `[a-z_][a-z0-9_]*`, at most 63 bytes. |
 | Create or drop | ADMIN on the table. |
+| Guards | `SlotOptions.IfNotExists` for creation, `DropSlot(ctx, table, name, chunkdb.IfExists)` to skip an absent slot of an existing table. |
 | Watch | READ for the slot's owner; another user also needs ADMIN on `*`. |
 | Active watches | One per slot; another receives `CodeSlotBusy`. |
 | Retention | Table's `slot_max_bytes`; exceeded history makes the slot lost. |

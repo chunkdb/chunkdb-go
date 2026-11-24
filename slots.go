@@ -42,16 +42,23 @@ func slotName(command, name string) error {
 // CreateSlot creates a durable slot at the table's current frontier. An empty
 // table uses the default table. This needs ADMIN on the table.
 func (c *Client) CreateSlot(ctx context.Context, table, name string) error {
-	return c.slotStatement(ctx, "CREATE SLOT", table, name)
+	return c.slotStatement(ctx, "CREATE SLOT", "", table, name)
 }
 
 // DropSlot removes a slot and invalidates its active watch. An empty table
-// uses the default table. This needs ADMIN on the table.
-func (c *Client) DropSlot(ctx context.Context, table, name string) error {
-	return c.slotStatement(ctx, "DROP SLOT", table, name)
+// uses the default table. This needs ADMIN on the table. With [IfExists] an
+// absent slot is not an error; the table must exist.
+func (c *Client) DropSlot(ctx context.Context, table, name string, guard ...Guard) error {
+	clause, err := guardClause("DROP SLOT", IfExists, guard)
+	if err != nil {
+		return err
+	}
+	return c.slotStatement(ctx, "DROP SLOT", clause, table, name)
 }
 
-func (c *Client) slotStatement(ctx context.Context, command, table, name string) error {
+// slotStatement sends command, then guard (a guard clause or ""), the slot
+// name and its table.
+func (c *Client) slotStatement(ctx context.Context, command, guard, table, name string) error {
 	if err := slotName(command, name); err != nil {
 		return err
 	}
@@ -59,7 +66,7 @@ func (c *Client) slotStatement(ctx context.Context, command, table, name string)
 	if err != nil {
 		return err
 	}
-	reply, err := c.call(ctx, command+" '"+name+"' ON "+table, nil)
+	reply, err := c.call(ctx, command+guard+" '"+name+"' ON "+table, nil)
 	if err != nil {
 		return err
 	}
@@ -180,8 +187,8 @@ func (p *Pool) CreateSlot(ctx context.Context, table, name string) error {
 }
 
 // DropSlot runs Client.DropSlot on a leased client.
-func (p *Pool) DropSlot(ctx context.Context, table, name string) error {
-	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.DropSlot(ctx, table, name) })
+func (p *Pool) DropSlot(ctx context.Context, table, name string, guard ...Guard) error {
+	return p.withTableClient(ctx, table, func(ctx context.Context, c *Client) error { return c.DropSlot(ctx, table, name, guard...) })
 }
 
 // Slots runs Client.Slots on a leased client.

@@ -30,10 +30,15 @@ func (c *Client) Tables(ctx context.Context) ([]string, error) {
 
 // CreateTable creates table ("" is the default table). Its chunk and
 // large-chunk sizes are fixed once it exists; its columns and options change
-// with the ALTER methods.
-func (c *Client) CreateTable(ctx context.Context, table string, spec TableSpec) error {
+// with the ALTER methods. With [IfNotExists] an existing table of that name
+// is left as it is, whatever its definition.
+func (c *Client) CreateTable(ctx context.Context, table string, spec TableSpec, guard ...Guard) error {
 	const command = "CREATE TABLE"
 	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	clause, err := guardClause(command, IfNotExists, guard)
 	if err != nil {
 		return err
 	}
@@ -59,7 +64,7 @@ func (c *Client) CreateTable(ctx context.Context, table string, spec TableSpec) 
 		}
 		definitions = append(definitions, definition)
 	}
-	statement := "CREATE TABLE " + name + " (" + strings.Join(definitions, ", ") + ") CHUNK " +
+	statement := "CREATE TABLE" + clause + " " + name + " (" + strings.Join(definitions, ", ") + ") CHUNK " +
 		strconv.Itoa(spec.ChunkWidth) + " x " + strconv.Itoa(spec.ChunkHeight)
 	if spec.ChunkDepth > 0 {
 		statement += " x " + strconv.Itoa(spec.ChunkDepth)
@@ -137,10 +142,15 @@ func optionAssignments(options TableOptions) []string {
 
 // AddColumn adds a column to table ("" is the default table). A REQUIRED
 // column needs a default when the table has present blocks. Chunks written
-// before take its default, or NULL.
-func (c *Client) AddColumn(ctx context.Context, table string, column ColumnDef) error {
+// before take its default, or NULL. With [IfNotExists] an existing column of
+// that name is left as it is.
+func (c *Client) AddColumn(ctx context.Context, table string, column ColumnDef, guard ...Guard) error {
 	const command = "ALTER TABLE"
 	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	clause, err := guardClause(command, IfNotExists, guard)
 	if err != nil {
 		return err
 	}
@@ -148,21 +158,26 @@ func (c *Client) AddColumn(ctx context.Context, table string, column ColumnDef) 
 	if err != nil {
 		return annotate(command, err)
 	}
-	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" ADD COLUMN "+definition)
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" ADD COLUMN"+clause+" "+definition)
 }
 
 // DropColumn drops a column of table ("" is the default table). The last
-// fixed-width column cannot be dropped.
-func (c *Client) DropColumn(ctx context.Context, table, column string) error {
+// fixed-width column cannot be dropped. With [IfExists] an absent column is
+// not an error.
+func (c *Client) DropColumn(ctx context.Context, table, column string, guard ...Guard) error {
 	const command = "ALTER TABLE"
 	name, err := c.tableName(command, table)
+	if err != nil {
+		return err
+	}
+	clause, err := guardClause(command, IfExists, guard)
 	if err != nil {
 		return err
 	}
 	if err := checkNames(command, "column", column); err != nil {
 		return err
 	}
-	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" DROP COLUMN "+column)
+	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" DROP COLUMN"+clause+" "+column)
 }
 
 // RenameColumn renames a column of table ("" is the default table).
@@ -232,13 +247,18 @@ func (c *Client) SetTableOption(ctx context.Context, table, option string, value
 	return c.tableStatement(ctx, name, "ALTER TABLE "+name+" SET "+option+" = "+text)
 }
 
-// DropTable drops table ("" is the default table) and its data.
-func (c *Client) DropTable(ctx context.Context, table string) error {
+// DropTable drops table ("" is the default table) and its data. With
+// [IfExists] an absent table is not an error.
+func (c *Client) DropTable(ctx context.Context, table string, guard ...Guard) error {
 	name, err := c.tableName("DROP TABLE", table)
 	if err != nil {
 		return err
 	}
-	return c.tableStatement(ctx, name, "DROP TABLE "+name)
+	clause, err := guardClause("DROP TABLE", IfExists, guard)
+	if err != nil {
+		return err
+	}
+	return c.tableStatement(ctx, name, "DROP TABLE"+clause+" "+name)
 }
 
 // tableStatement sends a statement that changes table and drops the cached
