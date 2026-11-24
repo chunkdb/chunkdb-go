@@ -9,6 +9,7 @@ uses protocol 3 (CQL); see the engine's
 ## Unreleased
 
 ### Added
+- `ComputeVerifierWithSalt`, `ParseVerifier`, `AddVerifier` and `DropOldVerifier` rotate a password with two verifiers; `User` reports `Verifiers` and `ServerRights`; `RightMonitor`, `RightBackup` and `RightReplication` are server rights; `Grant` and `Revoke` take prefixes such as `tenant1_*`; `PermissionDeniedError.Rights` lists alternatives such as MONITOR or ADMIN (chunkdb/chunkdb#151).
 - `ServerStatus` reports `Version`, `UptimeMS`, `ReadOnly`, table `State` and `Reason`, and `Fenced`; `TableStats` reports `Chunks`, `LoadedChunks`, `Files`, `DiskBytes`, `Slots` and `Watches`; `Slot` reports `Revision`, `LagRevisions` and `Attached`, and `SlotsWithPrefix` runs SHOW SLOTS ... PREFIX (chunkdb/chunkdb#151).
 - `AreaPageOptions.Scale` and `Reduction` read downsampled areas with `GET AREA ... SCALE k USING`; `Chunk.Scale` and `Chunk.Reduction` describe a form with section 7, which only such reads accept and `SetChunk` refuses (chunkdb/chunkdb#151).
 - `If` and `WithArgs` write options and `Expr` values run SET BLOCK and DELETE BLOCK with an IF condition and computed values, on the client, the pool and in transactions; a false condition returns `CONDITION_FAILED` (chunkdb/chunkdb#151).
