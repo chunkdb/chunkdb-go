@@ -128,6 +128,7 @@ The `statement_timeout` feature advertises server deadline support, and effectiv
 Options not implemented by the server appear in NotApplied with `implementation_pending`; unknown options use `unknown_option`.
 
 `Client.ShowConnections` returns IDs, nullable user and statement text, peer addresses and state for visible live connections.
+`ConnectionInfo.Progress` counts the files and bytes a running `RestoreTable` copied, and is nil otherwise.
 `Client.Cancel(ctx, id)` cancels a target's current statement; false includes idle statements and work past its decision boundary.
 `Client.KillConnection(ctx, id)` closes the target safely; killing the calling connection is acknowledged before it closes.
 IDs are exact uint64 values and are not reused during a server run.

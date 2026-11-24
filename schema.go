@@ -49,6 +49,9 @@ type Schema struct {
 	Options     TableOptions
 	// Checks are the table's CHECK constraints; nil without any.
 	Checks []Check
+	// Fenced is the reason a fenced table is out of service until RECOVER
+	// TABLE, nil for a table in service; its Revision is then nil.
+	Fenced *string
 }
 
 // Column returns the column called name.
@@ -115,6 +118,10 @@ func (s *Schema) clone() *Schema {
 		revision := *s.Revision
 		out.Revision = &revision
 	}
+	if s.Fenced != nil {
+		reason := *s.Fenced
+		out.Fenced = &reason
+	}
 	out.ChunkColumns = cloneColumns(s.ChunkColumns)
 	out.Columns = make([]Column, len(s.Columns))
 	for i, column := range s.Columns {
@@ -163,7 +170,7 @@ func parseSchema(reply Reply) (*Schema, error) {
 		return bad("version")
 	}
 
-	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns", "checks"} {
+	for _, key := range []string{"epoch", "revision", "dims", "chunk_columns", "checks", "fenced"} {
 		value, exists := reply.Lookup(key)
 		if !exists {
 			continue
@@ -201,6 +208,12 @@ func parseSchema(reply Reply) (*Schema, error) {
 				}
 				schema.Checks = append(schema.Checks, Check{Name: string(name.Bulk), Expression: string(expression.Bulk)})
 			}
+		case "fenced":
+			if value.Kind != ReplyBulk {
+				return bad(key)
+			}
+			reason := string(value.Bulk)
+			schema.Fenced = &reason
 		case "chunk_columns":
 			if value.Kind != ReplyArray {
 				return bad(key)

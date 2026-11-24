@@ -253,6 +253,7 @@ Client, Tx and Pool expose these helpers.
 Rows and requested metadata share the server's read boundary; area reads retain their existing consistency across chunks.
 DESCRIBE supplies Schema.Epoch, Revision, Dims and ChunkColumns independently of Schema.Version.
 Revision is a nullable completed frontier; nil means the server could not establish it.
+`Schema.Fenced` is the reason of a fenced table, out of service until `RecoverTable`; its Revision is then nil.
 A numeric zero is a known frontier; never substitute zero for nil.
 
 Unknown column types retain their type name and decode row/default values as raw bytes.
