@@ -289,7 +289,7 @@ func aggregate(ctx context.Context, c *Client, table string, selector ChunkSelec
 			return Reply{}, err
 		}
 		reply, err := c.call(ctx, statement, params)
-		if isWrongSize(err) || isNoColumn(err) {
+		if isStaleInvalidArgument(err) {
 			return Reply{}, &staleSchemaError{err: err}
 		}
 		return reply, err

@@ -59,7 +59,7 @@ func setChunkColumns(ctx context.Context, s session, table string, x, y int64, c
 			return Reply{}, err
 		}
 		reply, err := s.call(ctx, "SET CHUNK "+coordinatePoint(x, y, z...)+" IN "+name+columnsClause(columns)+" $1"+clause, [][]byte{form})
-		if errors.Is(err, ErrSchemaMismatch) || isNoColumn(err) {
+		if errors.Is(err, ErrSchemaMismatch) || isStaleInvalidArgument(err) {
 			return Reply{}, &staleSchemaError{err: err}
 		}
 		return reply, err
@@ -130,7 +130,7 @@ func setChunkMetadata(ctx context.Context, s session, table string, x, y int64, 
 		}
 		statement.WriteString(clause)
 		reply, err := s.call(ctx, statement.String(), parameters)
-		if isWrongSize(err) || isNoColumn(err) || errors.Is(err, ErrSchemaMismatch) {
+		if isStaleInvalidArgument(err) || errors.Is(err, ErrSchemaMismatch) {
 			return Reply{}, &staleSchemaError{err: err}
 		}
 		if IsCode(err, CodeBadRequest) {

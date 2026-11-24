@@ -265,7 +265,8 @@ func (p *Pool) Watch(ctx context.Context, table string, opts WatchOptions) (*Wat
 // Start returns the position established when the subscription opens.
 func (w *Watch) Start() Position { return w.start }
 
-// Next waits for an event. Cancellation while waiting leaves the stream open;
+// Next waits for an event. Cancellation while waiting leaves the stream open,
+// and a schema lookup for an event runs to its end whatever ctx does;
 // lookup or decoding failures end it. Idle watches have no command timeout.
 func (w *Watch) Next(ctx context.Context) (Event, error) {
 	if err := ctx.Err(); err != nil {

@@ -51,7 +51,9 @@ Use TLS over an untrusted network because authentication does not encrypt subseq
 - A Client supports concurrent use; PipelineDepth defaults to one request at a time.
 - Failed requests are never replayed; the next ordinary request reconnects after transport failure.
 - Cancelling an in-flight request closes the connection; queued requests may also fail.
-- A failed write can have succeeded before its reply was lost.
+- A request whose connection is lost, or whose deadline or context ends, after it was sent fails with `ErrConnection`, `ErrTLS` or `ErrTimeout` and `Error.RetryClass` `unknown_outcome`: it may have applied, so check before repeating it.
+- Inside a transaction only COMMIT fails that way; the server rolls back the statements before it when the connection closes.
+- Requests pipelined behind a reply after which the server closes the connection (PROTOCOL, BAD_REQUEST, KILLED, `AUTH_REQUIRED` with reason `user_dropped`, `BUSY` with reason `input_budget`, or INVALID_ARGUMENT to SET BLOCK or DELETE BLOCK parameters over 67117056 bytes together) fail with `ErrConnection` and no retry class: the server did not execute them.
 
 ## TLS
 
@@ -137,7 +139,7 @@ Control an in-flight request from a separate client connection; pooled controls 
 `RATE_LIMITED` identifies `max_connections` or `statements_per_sec` in its reason and can include `retry_after_ms`.
 
 `Error.ServerKeys` preserves structured keys, including unknown keys and opaque malformed escapes.
-`Error.Metadata` exposes checked numeric fields; `Error.RetryClass` depends only on ServerCode.
+`Error.Metadata` exposes checked numeric fields; `Error.RetryClass` depends only on ServerCode, except `unknown_outcome` on a lost reply.
 The classes are `reread`, `rerun`, `backoff`, `unknown_outcome`, and `fatal`.
 Unknown codes are fatal; never replay a write blindly after `OUTCOME_UNKNOWN`.
 

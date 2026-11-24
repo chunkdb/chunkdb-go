@@ -449,7 +449,7 @@ func getAreaPage(ctx context.Context, s session, table string, request areaPageR
 		var responseControl *areaResponseControl
 		reply, err := s.call(ctx, statement, nil, areaReplyOptions{knownShape: true, page: true, withSchema: true, limit: limit, response: &responseControl})
 		if err != nil {
-			if isNoColumn(err) {
+			if isStaleInvalidArgument(err) {
 				return AreaPage3D{}, &staleSchemaError{err: err}
 			}
 			return AreaPage3D{}, err

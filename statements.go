@@ -5,7 +5,6 @@ import (
 	"errors"
 	"iter"
 	"maps"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -164,19 +163,13 @@ func expectBulk(reply Reply, command string) ([]byte, error) {
 	return reply.Bulk, nil
 }
 
-// wrongSizeMessage is the server's message for a parameter frame whose size
-// does not fit its column, which a cached schema older than the table causes.
-var wrongSizeMessage = regexp.MustCompile(`^\$\d+ for column \S+ \(\S+\) must be \d+ bytes, got \d+$`)
-
-func isWrongSize(err error) bool {
+// isStaleInvalidArgument reports INVALID_ARGUMENT, which a schema older than
+// the table causes for a column it no longer has or a value of another size.
+// It is judged by the code alone; withSchema runs the call again only when
+// the schema fetched after it is newer.
+func isStaleInvalidArgument(err error) bool {
 	var typed *Error
-	return errors.As(err, &typed) && typed.ServerCode == CodeInvalidArgument && wrongSizeMessage.MatchString(typed.ServerMessage)
-}
-
-func isNoColumn(err error) bool {
-	var typed *Error
-	return errors.As(err, &typed) && typed.ServerCode == CodeInvalidArgument &&
-		strings.HasPrefix(typed.ServerMessage, "the table has no column ")
+	return errors.As(err, &typed) && typed.ServerCode == CodeInvalidArgument
 }
 
 // isMalformed reports a reply that does not fit the schema it was decoded
@@ -243,8 +236,13 @@ func withSchema[T any](ctx context.Context, s session, table string, fn func(*Sc
 	if fresh && stale.local {
 		return value, stale.err
 	}
+	used := schema
 	if schema, err = s.refetchSchema(ctx, table, stale.err); err != nil {
 		return value, err
+	}
+	// The same schema again would fail the same way.
+	if schema.Epoch == used.Epoch && schema.Version == used.Version {
+		return value, stale.err
 	}
 	value, err = fn(schema)
 	if errors.As(err, &stale) {
@@ -353,7 +351,7 @@ func getBlockWithOptions(ctx context.Context, s session, table string, x, y int6
 		names := columnNames(schema, indexes)
 		reply, err := s.call(ctx, "GET BLOCK "+coordinatePoint(x, y, z...)+" FROM "+name+columnsClause(names)+opts.clauses(), nil)
 		if err != nil {
-			if isNoColumn(err) {
+			if isStaleInvalidArgument(err) {
 				return BlockRead{}, &staleSchemaError{err: err}
 			}
 			return BlockRead{}, err
@@ -466,7 +464,7 @@ func setBlock(ctx context.Context, s session, table string, x, y int64, values R
 		statement.WriteString(clause.text)
 		reply, err := s.call(ctx, statement.String(), params)
 		if err != nil {
-			if isWrongSize(err) || isNoColumn(err) {
+			if isStaleInvalidArgument(err) {
 				return Reply{}, &staleSchemaError{err: err}
 			}
 			if IsCode(err, CodeBadRequest) {
@@ -512,7 +510,7 @@ func deleteBlock(ctx context.Context, s session, table string, x, y int64, claus
 			return Reply{}, err
 		}
 		reply, err := s.call(ctx, statement, params)
-		if isWrongSize(err) || isNoColumn(err) {
+		if isStaleInvalidArgument(err) {
 			return Reply{}, &staleSchemaError{err: err}
 		}
 		return reply, err
@@ -545,7 +543,7 @@ func getChunk(ctx context.Context, s session, table string, cx, cy int64, column
 		names := columnNames(schema, indexes)
 		reply, err := s.call(ctx, "GET CHUNK "+coordinatePoint(cx, cy, z...)+" FROM "+name+columnsClause(names), nil)
 		if err != nil {
-			if isNoColumn(err) {
+			if isStaleInvalidArgument(err) {
 				return nil, &staleSchemaError{err: err}
 			}
 			return nil, err
@@ -746,7 +744,7 @@ func getAreaWithSchema(ctx context.Context, s session, table, area string, withM
 		var responseControl *areaResponseControl
 		reply, err := s.call(ctx, "GET AREA "+area+" FROM "+name+columnsClause(names)+clause, nil, areaReplyOptions{knownShape: true, withSchema: withMetadata, response: &responseControl})
 		if err != nil {
-			if isNoColumn(err) {
+			if isStaleInvalidArgument(err) {
 				return AreaRead{}, &staleSchemaError{err: err}
 			}
 			return AreaRead{}, err

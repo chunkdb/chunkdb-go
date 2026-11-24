@@ -63,6 +63,7 @@ tile: 6
 Use [Slots](SLOTS.md) to resume a durable consumer.
 
 Idle Next waits use the context without a command timeout; cancelling that wait keeps the watch open.
+A schema lookup for a received event runs to its end, bounded by CommandTimeout and Close, even when the context of Next ends, so the event is not lost.
 Lookup or decoding failures end the stream, including unavailable schemas with `ErrProtocol`.
 When DESCRIBE provides an epoch, cached layouts are bound to that epoch and schema version.
 A mismatched fallback description ends decoding with `ErrProtocol`; resume or rebuild state.

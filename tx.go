@@ -102,6 +102,10 @@ func (c *Client) runTransaction(ctx context.Context, fn func(tx *Tx) error) (uin
 		return 0, err
 	}
 
+	// Until COMMIT a lost reply leaves nothing applied: the server rolls the
+	// transaction back when the connection closes.
+	established.inTransaction.Store(true)
+	defer established.inTransaction.Store(false)
 	tx := &Tx{client: c, conn: established, tables: make(map[string]bool)}
 	err = tx.run(fn)
 	var conflict *ConflictError

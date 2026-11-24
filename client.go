@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -500,21 +501,22 @@ func (c *Client) login(ctx context.Context, established *conn) (Reply, string, e
 	return reply, signature, nil
 }
 
-// helloError reports a server of an older protocol as such. A server of
-// protocol 2 answers "-ERR PROTOCOL expected HELLO 2"; a 1.x server does not
-// know HELLO, or, when it requires a token, answers AUTH_REQUIRED although
-// HELLO named a user, with no reason key. A protocol 3 server gives every error
-// a reason key, so its AUTH_REQUIRED to a login with a user, such as
-// reason=channel_binding from a server that requires channel binding, stays
-// the server's error. Otherwise the server error is not wrapped, so the
-// result matches ErrProtocol and not ErrServer.
+// helloError reports a server of an older protocol as such, judged by the
+// code and keys alone. A server of protocol 2 answers PROTOCOL without a
+// reason key; a 1.x server does not know HELLO, or, when it requires a token,
+// answers AUTH_REQUIRED although HELLO named a user, with no reason key. A
+// protocol 3 server gives every error a reason key, so its PROTOCOL, or its
+// AUTH_REQUIRED to a login with a user, such as reason=channel_binding from a
+// server that requires channel binding, stays the server's error. Otherwise
+// the server error is not wrapped, so the result matches ErrProtocol and not
+// ErrServer.
 func (c *Client) helloError(err error) error {
 	var typed *Error
 	if !errors.As(err, &typed) {
 		return err
 	}
 	_, hasReason := typed.ServerKeys["reason"]
-	if (typed.ServerCode == CodeProtocol && strings.Contains(typed.ServerMessage, "HELLO 2")) ||
+	if (typed.ServerCode == CodeProtocol && !hasReason) ||
 		typed.ServerCode == "UNKNOWN_COMMAND" || (typed.ServerCode == CodeAuthRequired && c.opts.uri.User != "" && !hasReason) {
 		return protocolErrorf("HELLO",
 			"the server speaks an older chunkdb protocol (it replied %q); this client needs a server of protocol 3",
@@ -696,13 +698,17 @@ func (c *Client) execOn(ctx context.Context, established *conn, command, stateme
 		}
 		closes := closesConnection(reply, len(params) > 0)
 		if established.info.Supports("protocol_foundation") {
-			closes = reply.Code == CodeProtocol || reply.Code == CodeBadRequest || reply.Code == CodeKilled
+			total := 0
+			for _, param := range params {
+				total += len(param)
+			}
+			closes = foundationCloses(reply, command, total)
 		}
 		if closes {
 			// The server closes the connection after this reply; requests
 			// pipelined behind it were not executed.
-			_ = established.shutdown(connectionErrorf(command, nil,
-				"the server closed the connection after %s to an earlier request", reply.Code))
+			_ = established.shutdown(connectionErrorf(command, errNotExecuted,
+				"the server closed the connection after %s to an earlier request; this request was not executed", reply.Code))
 		}
 		return Reply{}, replyError(phase, command, reply)
 	}
@@ -741,6 +747,10 @@ type conn struct {
 	// give up when its context ends.
 	writeTurn chan struct{}
 
+	// inTransaction is set while a transaction holds the connection between
+	// BEGIN and COMMIT or ROLLBACK.
+	inTransaction atomic.Bool
+
 	mu           sync.Mutex
 	queue        []*pending
 	failed       bool
@@ -752,7 +762,14 @@ type conn struct {
 	info *ServerInfo
 }
 
+// roundTrip writes one request and waits for its reply. A connection, TLS or
+// timeout error after the write began reports an unknown outcome when the
+// request may apply.
 func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaReplyLimits) (Reply, error) {
+	written := func(err error) error { return err }
+	if mayApply(deadline.command, cn.inTransaction.Load()) {
+		written = func(err error) error { return unknownOutcome(err, deadline.command) }
+	}
 	waiter := &pending{command: deadline.command, ch: make(chan result, 1)}
 	if len(limits) != 0 {
 		waiter.limits = limits[0]
@@ -800,13 +817,13 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaRep
 			wrapped = newError(KindConnection, PhaseRequest, deadline.command, "write request: "+err.Error(), err)
 		}
 		_ = cn.shutdown(wrapped)
-		return Reply{}, wrapped
+		return Reply{}, written(wrapped)
 	}
 
 	select {
 	case res := <-waiter.ch:
 		if res.err != nil {
-			return Reply{}, res.err
+			return Reply{}, written(res.err)
 		}
 		return res.reply, nil
 	case <-deadline.ctx.Done():
@@ -815,7 +832,7 @@ func (cn *conn) roundTrip(deadline callDeadline, wire []byte, limits ...*areaRep
 		// response. Dropping the connection is the only safe recovery.
 		err := deadline.err()
 		_ = cn.shutdown(err)
-		return Reply{}, err
+		return Reply{}, written(err)
 	}
 }
 

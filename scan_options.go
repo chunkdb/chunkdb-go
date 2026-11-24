@@ -178,7 +178,7 @@ func scanChunksChecked(ctx context.Context, s session, table string, dims int, a
 			statement += " WITH DATA" + columnsClause(columns)
 		}
 		reply, err := s.call(ctx, statement, params)
-		if isWrongSize(err) || isNoColumn(err) {
+		if isStaleInvalidArgument(err) {
 			return ChunkScanPage3D{}, &staleSchemaError{err: err}
 		}
 		if err != nil {

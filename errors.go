@@ -187,6 +187,9 @@ type Error struct {
 	ServerMessage string
 	// ServerKeys retains all structured keys, including unknown ones.
 	ServerKeys map[string]string
+	// RetryClass classifies ServerCode. A connection, TLS or timeout error of
+	// a request lost after it was sent has [RetryUnknownOutcome]: the request
+	// may have applied.
 	RetryClass RetryClass
 	Metadata   ErrorMetadata
 	Err        error
@@ -421,20 +424,82 @@ func replyError(phase Phase, command string, reply Reply) error {
 	return &VersionMismatchError{Current: current, Err: base}
 }
 
-// closesConnection reports an error reply after which the server closes the
-// connection: BAD_REQUEST always, and for a statement with parameters, whose
-// frames the server then does not read, SYNTAX, NO_TABLE, and
-// INVALID_ARGUMENT for an unknown column.
+// closesConnection reports an error reply after which a server without
+// protocol_foundation closes the connection: BAD_REQUEST always, and SYNTAX
+// and NO_TABLE for a statement with parameters, whose frames the server then
+// does not read. It judges by the code alone, so an INVALID_ARGUMENT, which
+// such a server sends both with and without closing, is not counted: a
+// connection it closes fails the requests behind it as lost.
 func closesConnection(reply Reply, withParams bool) bool {
 	switch reply.Code {
 	case CodeBadRequest:
 		return true
 	case CodeSyntax, CodeNoTable:
 		return withParams
-	case CodeInvalidArgument:
-		return withParams && strings.HasPrefix(reply.Message, "the table has no column ")
 	}
 	return false
+}
+
+// maxBlockParameterBytes bounds the summed parameter frames of SET BLOCK and
+// DELETE BLOCK on the server; a request over it closes the connection.
+const maxBlockParameterBytes = 67117056
+
+// foundationCloses reports an error reply after which a protocol_foundation
+// server closes the connection, judged by the code and reason key and by the
+// size of the request's parameters: PROTOCOL, BAD_REQUEST and KILLED,
+// AUTH_REQUIRED reason=user_dropped, BUSY reason=input_budget, and
+// INVALID_ARGUMENT to a SET BLOCK or DELETE BLOCK whose parameterBytes exceed
+// their bound.
+func foundationCloses(reply Reply, command string, parameterBytes int) bool {
+	switch reply.Code {
+	case CodeProtocol, CodeBadRequest, CodeKilled:
+		return true
+	case CodeAuthRequired:
+		return reply.Keys["reason"] == "user_dropped"
+	case CodeBusy:
+		return reply.Keys["reason"] == "input_budget"
+	case CodeInvalidArgument:
+		return (command == "SET BLOCK" || command == "DELETE BLOCK") && parameterBytes > maxBlockParameterBytes
+	}
+	return false
+}
+
+// errNotExecuted is the cause of the error of requests pipelined behind a
+// reply after which the server closed the connection: it did not execute them.
+var errNotExecuted = errors.New("the server did not execute the request")
+
+// mayApply reports whether a request of command can apply when its reply is
+// lost: not the login, BEGIN or ROLLBACK, nor a statement of a transaction
+// before COMMIT, which the server rolls back when the connection closes.
+func mayApply(command string, inTransaction bool) bool {
+	switch command {
+	case "HELLO", "AUTH", "BEGIN", "ROLLBACK":
+		return false
+	case "COMMIT":
+		return true
+	}
+	return !inTransaction
+}
+
+// unknownOutcome reports a connection, TLS or timeout error of a request
+// that was written as an unknown outcome: the request may have applied, so
+// its RetryClass is [RetryUnknownOutcome]. Requests the server did not
+// execute keep their error.
+func unknownOutcome(err error, command string) error {
+	typed, ok := err.(*Error)
+	if !ok || typed.RetryClass != "" || errors.Is(err, errNotExecuted) {
+		return err
+	}
+	switch typed.Kind {
+	case KindConnection, KindTimeout, KindTLS:
+	default:
+		return err
+	}
+	marked := *typed
+	marked.Command = command
+	marked.RetryClass = RetryUnknownOutcome
+	marked.Message += "; the outcome is unknown: the request was sent and may have applied"
+	return &marked
 }
 
 func closedError(command string) *Error {

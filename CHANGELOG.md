@@ -22,6 +22,10 @@ uses protocol 3 (CQL); see the engine's
 - `SlotOptions.Owner` creates a slot for a named user with `CREATE SLOT ... OWNER`, and `Slot.Owner` reports the owner from SHOW SLOTS when the server shows it.
 
 ### Changed
+- A request whose connection is lost, or whose deadline or context ends, after it was sent fails with `RetryClass` `unknown_outcome`, since it may have applied; inside a transaction only COMMIT does. (#40)
+- Under protocol_foundation `AUTH_REQUIRED reason=user_dropped`, `BUSY reason=input_budget` and INVALID_ARGUMENT to SET BLOCK or DELETE BLOCK parameters over their bound close the connection as PROTOCOL, BAD_REQUEST and KILLED do; requests pipelined behind such a reply fail with `ErrConnection` as not executed. (#40)
+- Errors are classified by code and `reason` only: a PROTOCOL reply without a `reason` key names an older server, an INVALID_ARGUMENT no longer counts as closing the connection of a server without protocol_foundation, and a typed call refetches the schema after INVALID_ARGUMENT and runs again only when the schema changed. (#40)
+- Cancelling the context of `Watch.Next` during the schema lookup of an event no longer ends the watch; the lookup runs to its end and the event is returned. (#40)
 - A login refuses a SCRAM server-first message whose iteration count is outside 4096 to 1000000, the range a chunkdb server issues, with `ErrProtocol`. (#40)
 - An error reply nested inside an array or map is refused with `ErrProtocol` instead of being returned as data. (#40)
 - A user without a password returns `ErrConnection` before dialing, with the URI form to use, instead of failing at the server with `AUTH_FAILED`.
